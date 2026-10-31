@@ -1,6 +1,7 @@
 node_modules/
 dist/
 release/
+release-build/
 release-package/
 coverage/
 video.mp4

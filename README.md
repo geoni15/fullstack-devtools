@@ -38,6 +38,15 @@ El video recorre el flujo completo sobre una aplicación local: selección del e
 - El proyecto a inspeccionar debe servirse en un origen local (`localhost`, `127.0.0.1` o `::1`) o en un origen añadido a la lista permitida.
 - Desarrollado y probado en Windows 10/11. Electron permite macOS y Linux, pero esta versión no se ha verificado allí.
 
+## Descarga
+
+Binarios para Windows x64 en [Releases](https://github.com/geoni15/fullstack-devtools/releases/latest):
+
+- [Instalador](https://github.com/geoni15/fullstack-devtools/releases/download/v0.1.0/Backend-DevTools-Desktop-0.1.0-setup.exe): instala por usuario y permite elegir la carpeta.
+- [Versión portable](https://github.com/geoni15/fullstack-devtools/releases/download/v0.1.0/Backend-DevTools-Desktop-0.1.0-portable.exe): un solo ejecutable, sin instalación.
+
+Los binarios no están firmados; Windows SmartScreen puede mostrar una advertencia.
+
 ## Instalación y uso
 
 ```bash
@@ -47,7 +56,7 @@ npm install
 npm run dev
 ```
 
-Para ejecutar la versión compilada usa `npm start`. Para empaquetar la aplicación en una carpeta de Windows usa `npm run package:dir`.
+Para ejecutar la versión compilada usa `npm start`. Para empaquetar en Windows usa `npm run package:win`, que genera el instalador NSIS y el ejecutable portable en `release/`; `npm run package:dir` genera solo la carpeta sin empaquetar.
 
 Flujo de trabajo:
 

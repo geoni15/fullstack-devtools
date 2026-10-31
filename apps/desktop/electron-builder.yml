@@ -10,4 +10,18 @@ npmRebuild: false
 afterPack: scripts/after-pack-fuses.cjs
 win:
   target:
-    - dir
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  artifactName: Backend-DevTools-Desktop-${version}-setup.${ext}
+portable:
+  artifactName: Backend-DevTools-Desktop-${version}-portable.${ext}

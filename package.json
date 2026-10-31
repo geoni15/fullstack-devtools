@@ -36,6 +36,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "package:dir": "npm run build && cd apps/desktop && electron-builder --dir --win",
+    "package:win": "npm run build && cd apps/desktop && electron-builder --win nsis portable --publish never",
     "verify": "npm run typecheck && npm run lint && npm run format:check && npm test"
   },
   "devDependencies": {
