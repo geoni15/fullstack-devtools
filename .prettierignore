@@ -1,0 +1,7 @@
+node_modules/
+dist/
+release/
+coverage/
+package-lock.json
+BACKEND_DEVTOOLS_DESKTOP_SPEC.md
+docs/

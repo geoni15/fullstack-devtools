@@ -1,0 +1,58 @@
+{
+  "name": "backend-devtools-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "IDE de escritorio para inspeccionar la cadena frontend-backend de proyectos locales.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/geoni15/fullstack-devtools.git"
+  },
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/core/*",
+    "packages/browser/*",
+    "packages/analysis/*"
+  ],
+  "overrides": {
+    "dompurify": "3.4.17"
+  },
+  "scripts": {
+    "dev": "npm run build:main && concurrently -k -n vite,app -c cyan,magenta \"npm:dev:renderer\" \"npm:dev:app\"",
+    "dev:renderer": "vite --config apps/desktop/vite.config.ts",
+    "dev:app": "wait-on tcp:127.0.0.1:5173 && node apps/desktop/scripts/run-electron.mjs --dev",
+    "build:main": "node apps/desktop/scripts/build-main.mjs",
+    "build:renderer": "vite build --config apps/desktop/vite.config.ts",
+    "build": "npm run build:main && npm run build:renderer",
+    "start": "npm run build && node apps/desktop/scripts/run-electron.mjs",
+    "typecheck": "tsc -p packages/core/protocol/tsconfig.json && tsc -p packages/browser/network-capture/tsconfig.json && tsc -p packages/analysis/routes/tsconfig.json && tsc -p packages/analysis/sql-analyzer/tsconfig.json && tsc -p apps/desktop/tsconfig.main.json && tsc -p apps/desktop/tsconfig.preload.json && tsc -p apps/desktop/tsconfig.renderer.json && tsc -p apps/desktop/tsconfig.e2e.json",
+    "test": "vitest run",
+    "test:e2e": "npm run build && playwright test",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "package:dir": "npm run build && cd apps/desktop && electron-builder --dir --win",
+    "verify": "npm run typecheck && npm run lint && npm run format:check && npm test"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.64.1",
+    "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "concurrently": "10.0.6",
+    "dompurify": "3.4.17",
+    "electron": "45.1.0",
+    "eslint": "10.14.0",
+    "playwright": "1.64.1",
+    "prettier": "3.9.10",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.72.1",
+    "vitest": "5.0.5",
+    "wait-on": "9.5.1"
+  }
+}

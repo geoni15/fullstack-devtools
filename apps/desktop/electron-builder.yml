@@ -1,0 +1,13 @@
+appId: com.backenddevtools.desktop
+productName: Backend DevTools Desktop
+directories:
+  output: ../../release
+files:
+  - dist/**/*
+  - package.json
+asar: true
+npmRebuild: false
+afterPack: scripts/after-pack-fuses.cjs
+win:
+  target:
+    - dir

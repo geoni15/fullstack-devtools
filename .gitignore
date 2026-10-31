@@ -1,0 +1,11 @@
+node_modules/
+dist/
+release/
+release-package/
+coverage/
+video.mp4
+playwright-report/
+test-results/
+*.log
+.DS_Store
+Thumbs.db

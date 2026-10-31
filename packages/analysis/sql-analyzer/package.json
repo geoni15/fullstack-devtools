@@ -1,0 +1,16 @@
+{
+  "name": "@bdt/sql-analyzer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Análisis estático acotado de consultas SQL (MySQL, PostgreSQL y SQLite).",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "node-sql-parser": "5.4.0"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "@bdt/routes-index",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Extracción estática acotada de rutas backend (Express, Fastify, FastAPI y Flask).",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "tree-sitter-javascript": "0.25.0",
+    "tree-sitter-python": "0.25.0",
+    "web-tree-sitter": "0.27.1"
+  }
+}
