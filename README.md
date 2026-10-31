@@ -10,11 +10,13 @@ Licencia MIT · v0.1.0 · Desarrollado y probado en Windows
 
 ## Demostración
 
-[![Panel de inspección de Fullstack DevTools](media/demo-poster.jpg)](media/demo.mp4)
+[![Vista previa animada de la inspección](media/demo-preview.gif)](media/demo.mp4)
 
-[Ver la demostración en video (69 s, MP4)](media/demo.mp4)
+[Ver el video completo (69 s, MP4, 4,9 MB)](media/demo.mp4)
 
-El video recorre el flujo completo sobre una aplicación local: selección del elemento, resolución del manejador del frontend, petición HTTP, ruta del backend, cuerpos JSON y consulta SQL. GitHub no incrusta video en el README; el enlace abre el reproductor del repositorio.
+El video recorre el flujo completo sobre una aplicación local: selección del elemento, resolución del manejador del frontend, petición HTTP, ruta del backend, cuerpos JSON y consulta SQL. La vista previa es un GIF de 8 s; GitHub no reproduce MP4 dentro del README ni en la vista de archivos, así que el enlace permite descargar el video completo.
+
+![Panel de inspección en modo JSON](media/demo-poster.jpg)
 
 ## Qué incluye
 
