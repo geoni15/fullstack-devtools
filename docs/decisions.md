@@ -702,3 +702,253 @@ también con la página desplazada, con zoom o dentro de shadow DOM abierto. La 
 depende del espacio de coordenadas ni del rectángulo dibujado. El script de página conserva una
 referencia al último elemento señalado hasta el siguiente movimiento o el fin del hover; es una
 referencia en la página inspeccionada, no un dato enviado ni almacenado por la app.
+
+## ADR-039 — Mapa de flujo global de la sesión
+
+**Contexto:** la inspección mostraba una tarjeta por clic y la reemplazaba con el siguiente; no había
+historial de clics, modelo de grafo ni forma de ver de conjunto la cadena elemento → frontend →
+petición → ruta → función → SQL → tabla/BD. El registro y el buffer conservan todo el tráfico, y el
+índice estático todas las rutas, pero el panel acoplado solo recibía la tarjeta actual. El usuario
+pidió «un diagrama de flujo de todo».
+**Decisión:** (1) **Vista Mapa en el panel acoplado:** se abre con un botón «Mapa» en la cabecera,
+ocupa el ancho completo del host, oculta la página y, al volver, restaura el split de 300–430 px. No
+es un sexto modo de inspección y no cambia el hover ni los cinco modos. (2) **Historial de trazas:**
+`FlowLedger` guarda una proyección mínima e ilimitada de cada tarjeta (elemento, manejador, peticiones
+`after-click`, ruta, SQL y ejecución), sin código ni cuerpos. Se actualiza en `updatePanel` y se vacía
+con «Limpiar», al desconectar y al cerrar. (3) **Snapshot agregado:** `buildFlowSnapshot` combina todas
+las trazas, todo el tráfico backend o que casa con una ruta, todas las rutas estáticas y las bases de
+datos detectadas; agrupa por IDs deterministas, fusiona evidencia STATIC/RUNTIME y ocurrencias, y se
+reconstruye con un throttle de 1 s solo mientras el mapa está abierto. (4) **Evidencia honesta:** las
+aristas afirman solo lo que el código puede probar: TRIGGERS, SENDS, MATCHES, HANDLES, QUERIES,
+READS/WRITES y USES. No hay aristas petición→SQL ni petición→función: la asociación de SQL y de la
+ejecución N2 es por ruta y ventana de 3 s. Las aristas sólidas son directas o exactas; las discontinuas
+son heurísticas. La base de datos se infiere del código o del dialecto SQL y no se verifica.
+(5) **Sin recortes en los datos:** el ledger y el snapshot conservan todos los clics, peticiones y rutas;
+los filtros de búsqueda, de evento y de alcance solo atenúan. Las peticiones externas y preflight se
+excluyen del dibujo pero se cuentan en el pie. (6) **UI propia:** SVG generado con `createElementNS` y
+`textContent`, layout por capas con orden por baricentro, pan/zoom y ajuste; sin librerías nuevas ni
+`innerHTML`. (7) **Cadena de tecnologías:** el snapshot incluye `stack` con el frontend detectado en la
+página (React, Vue, Angular, Svelte, Astro, Solid, Remix, Next.js o Nuxt), el backend de las rutas
+indexadas (Express, Fastify, FastAPI o Flask) y el motor de base de datos inferido de las pistas y
+dialectos SQL. El mapa
+muestra una tira fija HTML → frontend → backend → base de datos con flechas que solo se encienden con
+evidencia RUNTIME, y las capas del SVG repiten la tecnología detectada. Si falta el backend, la tira
+distingue entre «sin proyecto abierto» y «sin rutas indexadas». (8) **Inventario de página:** al
+abrir el mapa, un script de solo lectura en el mundo principal enumera todos los controles
+interactivos del documento y de las shadow roots abiertas —botones, enlaces, campos, formularios,
+`details`/`summary`, `contenteditable` y el documento— con selector, `href` y `action` sin query ni
+hash, formulario al que pertenecen, estado y manejadores declarados. Cada control es un nodo STATIC;
+sus destinos declarados (`href`, `action`/`formaction`) se dibujan como NAVIGATES/SUBMITS
+heurísticos aunque no haya tráfico, y sus manejadores declarados como TRIGGERS STATIC. (9) **Todas
+las interacciones:** el inspector registra clic, doble clic, menú contextual, envío, entrada,
+cambio, foco, pérdida de foco, teclas de control, hover y scroll sobre el control más cercano, y los
+cambios del DOM para refrescar el inventario. `InteractionLedger` agrega por control y evento sin
+límites; entrada y scroll se funden en ventanas de 200/500 ms y el hover nunca correlaciona
+peticiones. Las peticiones se asocian en el constructor al evento más prioritario ocurrido hasta 3 s
+antes o 500 ms después, y la nota de la arista lo declara heurístico. El mapa muestra el conteo de
+eventos por nodo, un rail de interacciones de la sesión y un filtro por evento que solo atenúa la
+vista. No se capturan valores de campos ni teclas pulsadas. (10) **Listas acotadas y búsqueda con
+enfoque:** cada apartado de lista del mapa —rail de interacciones, resultados del buscador y listas
+del detalle— renderiza como máximo 20 elementos y carga el siguiente bloque al llegar al final del
+scroll, sin descartar datos del snapshot. La búsqueda muestra resultados clicables; al pulsar un
+control se enfoca su subgrafo alcanzable (destinos declarados STATIC y tráfico observado RUNTIME),
+se ajusta la vista y el detalle enumera las rutas y peticiones alcanzables. El mapa tiene dos modos:
+«Todo el tráfico» y «Solo lo que interactuaste», que muestra solo el subgrafo alcanzable desde nodos
+con evidencia RUNTIME —el resto desaparece y el subgrafo se vuelve a apilar y ajustar—. El enfoque por
+búsqueda prevalece sobre el modo, restablece el filtro de evento y se quita con «Quitar enfoque» o con
+un clic en el vacío.
+**Consecuencia:** el mapa responde qué elemento dispara qué petición, qué ruta y función la atienden,
+y qué SQL y tablas toca, incluidas rutas sin tráfico. Con muchas rutas el primer build analiza el SQL
+de todo el índice y el SVG completo puede degradar; el throttle, el zoom y los filtros lo acotan sin
+descartar datos. El historial es de sesión y no persiste. La vista no prueba causalidad entre
+petición, función y SQL, ni la base de datos real; el detalle y la leyenda lo dicen. La detección del
+frontend ejecuta un script de solo lectura en el mundo principal de la página, con tiempo límite de
+1,5 s y caché por URL; no modifica el DOM ni envía datos. La cadena muestra tecnologías detectadas,
+no una topología completa de módulos ni de conexiones. El mapa ya no depende de que el usuario haga
+clic: todos los controles aparecen aunque no se hayan usado, y todas las interacciones de la sesión
+se agregan sin recortes, incluidas las que no generan tráfico. El inventario se refresca con un
+throttle de 800 ms solo mientras el mapa está abierto y se descarta al navegar; un control eliminado
+del DOM puede sobrevivir como nodo RUNTIME de la sesión. El inventario no desciende a iframes ni a
+shadow roots cerradas. El filtro por evento atenúa nodos y cadenas sin demostrar que ese evento las
+causara. El enfoque por búsqueda dibuja todas las rutas alcanzables desde el control —incluidas las
+declaradas sin tráfico—, pero no prueba que se ejecuten hasta que se interactúa con él. Las listas
+del mapa renderizan 20 filas por bloque y cargan más al desplazarse; el resto de datos permanece en
+el snapshot y los filtros no lo descartan.
+
+## ADR-040 — Procedencia de valores formateados y enfoque compacto del mapa
+
+**Contexto:** la procedencia de ADR-034/035 encontraba el texto si el JSON contenía exactamente lo
+visible, pero los precios y otros importes se renderizan en el cliente con moneda, separadores y
+decimales (`RD$ 1,500.00`, `1.500,00 €`). El cuerpo capturado solo contiene el número crudo
+(`sale_price: 1500`), de modo que el hover no podía decir de qué campo, petición y ruta salía el
+precio. Por separado, al pulsar un nodo del mapa los nodos ajenos solo se atenuaban y conservaban sus
+posiciones: la cadena enfocada quedaba dispersa entre nodos lejanos.
+**Decisión:** (1) **Coincidencia numérica con pistas de campo:** `findJsonTextMatches` acepta las
+rutas de los valores crudos que recibe el componente React/Vue (`props.filteredProducts[3].sale_price`)
+como pistas. Extrae la clave hoja, normaliza mayúsculas y separadores (`sale_price` = `salePrice`) y,
+si el texto visible contiene una moneda Unicode o un número con separadores, busca en respuestas y
+cuerpos enviados los valores numéricos o cadenas numéricas equivalentes al número formateado. La
+puntuación prioriza la clave hoja, luego la respuesta sobre el cuerpo enviado y la petición más
+reciente; las coincidencias numéricas se fusionan con las de datos del componente y se deduplican por
+petición, origen y ruta JSON. El tooltip de Frontend y JSON muestra el dato React/Vue que transporta
+el número, la ruta del backend, las tablas SQL leídas/escritas y la base de datos inferida; todo valor
+cuya representación difiere del JSON se rotula `(aprox.)` y el pie explica que la coincidencia es por
+valor. (2) **Enfoque compacto del mapa:** al pulsar un nodo, el alcance visible es la unión de sus
+ancestros y descendientes alcanzables. Se construye un snapshot parcial solo con esos nodos y las
+aristas cuyos dos extremos pertenecen al alcance, se ejecuta `layoutFlow` de nuevo y se dibuja y ajusta
+ese subgrafo; los nodos ajenos desaparecen en lugar de atenuarse y el espacio se recompone por capas.
+El detalle, el rail y el snapshot completo conservan todos los datos. «Quitar enfoque», el clic en el
+vacío y el cambio de modo restauran el layout completo. Los resultados del buscador conservan su
+semántica de rutas alcanzables hacia delante; el resto de clics usa ancestros y descendientes.
+**Consecuencia:** un precio formateado se puede rastrear hasta su campo numérico, su petición, la
+función del backend, las tablas SQL y la base de datos sin coincidencia literal en el JSON. La
+coincidencia sigue siendo aproximada: varios registros pueden compartir el mismo importe y la tarjeta
+enumera las alternativas en lugar de elegir una sola fuente como verdad. El mapa muestra una cadena
+compacta al enfocar, pero esa cadena no prueba causalidad ni ejecución: conserva las etiquetas
+STATIC/RUNTIME de cada nodo y arista. Recalcular el layout por clic es lineal respecto al subgrafo y
+no descarta datos del snapshot.
+
+## ADR-041 — Trazado en ejecución: identidad de respuesta, render y pila de la petición
+
+**Contexto:** ADR-040 resolvía precios formateados comparando el número visible con los cuerpos
+capturados y usando la ruta de la prop como pista, pero seguía siendo una coincidencia por valor: no
+decía qué función React devolvía el texto al HTML ni qué subfunción ejecutaba la petición, y dos
+campos con el mismo importe quedaban empatados. La herramienta es de uso general: el mecanismo no
+puede depender de nombres de campos ni de una aplicación concreta.
+**Decisión:** (1) **Hooks de red en el mundo principal:** `RUNTIME_NETWORK_SOURCE` parchea `fetch`,
+`Response.json/text/clone`, `XMLHttpRequest` y `JSON.parse`; cada cuerpo parseado se etiqueta en un
+`WeakMap` con la petición que lo entregó (método, ruta, host, estado, hora) y su ruta JSON. Los hooks
+se instalan con `Page.addScriptToEvaluateOnNewDocument` y se evalúan de inmediato antes de que la app
+cargue. (2) **Identidad del componente:** `RUNTIME_PROVENANCE_CALL` recorre los fibers React
+(`__reactFiber$`, props y hooks) o la cadena Vue (`__vueParentComponent`) desde el nodo bajo el mouse;
+los objetos etiquetados que aparecen en props o estado son las respuestas reales que alimentaron ese
+texto. Las claves de fila (fiber key, `id`/`data-*`, segmentos de `href`, parámetros `id`) seleccionan
+el registro exacto; sin ellas la tarjeta enumera las alternativas. (3) **Campo y petición:** el texto
+visible se compara con los valores del objeto (texto exacto, número y variantes con separadores) y cada
+campo encontrado conserva su ruta en el componente, su ruta JSON y la petición asociada. El vínculo es
+por identidad y parseo, no por coincidencia global en el búfer. (4) **Función de render:** cada fiber
+aporta el sitio JSX que lo creó. React 18 expone `_debugSource` (archivo, línea y columna 1-based);
+React 19.0 no expone ni `_debugSource` ni `_debugStack`; React 19.1 añadió `fiber._debugStack`, el
+`Error` que `jsxDEV` crea en cada llamada JSX, cuyo segundo marco es la función del usuario que invocó
+`jsxDEV`, es decir, la función que devolvió ese texto al árbol. Ese marco apunta al módulo transformado
+que sirve el bundler, no al fuente, así que el inspector lee el módulo con `Debugger.getScriptSource` y
+decodifica su source map inline (`sourceMappingURL` en `data:`), incluyendo VLQ y `sourcesContent`,
+para obtener archivo, línea, columna y texto originales. El mapeo se hace en el proceso principal, sin
+peticiones ni dependencias extra. La expresión JSX del nodo bajo el mouse pesa más que el cuerpo del
+componente al elegir el campo: la clave hoja que aparece en esa línea (`sale_price` ≡ `salePrice`) gana
+sobre otro campo con el mismo número (`average_cost`). También se leen las líneas de los fibers
+ancestros para resolver el caso en que el valor se formatea en un componente hijo. Cuando no hay
+archivo ni línea (producción minificada, source map externo, React 19.0), se busca la definición del
+componente en el workspace (`WorkspaceSymbols`) y se muestra como **Definición**, nunca como línea
+ejecutada. (5) **Pila de la petición:** al ejecutarse `fetch` o XHR se captura `new Error().stack` completa, con
+`Error.stackTraceLimit` elevado y sin recorte; los marcos http(s) se asocian a la respuesta etiquetada y
+se muestran como la subfunción que llamó al backend. (6) **Cadena:** el tooltip ordena Render → Código →
+Dato → Respuesta → Pila → Petición → Ruta → SQL → Base de datos. Si el cuerpo se sirvió antes de
+instalar los hooks, queda la coincidencia por valor de ADR-040 rotulada como respaldo. (7) **Mapa:**
+cada hover en un modo distinto de HTML registra en un ledger propio la cadena que mostró el tooltip:
+elemento, petición capturada (si existe), ruta resuelta (aunque no haya respuesta capturada), campo,
+componente, archivo y línea. El grafo la proyecta como arista `PROVENANCE` del elemento a su petición
+(RUNTIME, directa si el vínculo es por identidad, heurística si es por contenido del JSON) o, cuando no
+hay petición capturada, del elemento a la ruta ejecutada (STATIC + RUNTIME, directa), más `RENDERS` del
+componente que lo renderizó al elemento. La conexión usa la evidencia del hover, no la ventana de 3 s de
+un clic, de modo que la misma cadena del tooltip (componente → dato → petición → ruta → SQL → BD) se
+dibuja en el mapa para datos que llegaron al cargar la página.
+**Consecuencia:** un texto formateado se explica por lo que se ejecutó: un objeto parseado de una
+respuesta concreta dentro del componente que lo renderiza, la función y la línea JSX que lo pintan y la
+pila que originó la petición. No depende de nombres de campo ni de una app concreta. La línea original
+requiere un build de desarrollo que sirva source maps inline (Vite lo hace por defecto) y `sourcesContent`
+para mostrar el texto exacto; si el workspace contiene otra copia del proyecto, el texto servido manda y
+la copia no se presenta como si fuera la que se ejecuta. Cuando el mapeo no es posible, la identidad y la
+petición siguen verificadas y la definición del componente se rotula como tal. La ruta, el SQL y la base
+de datos se derivan del índice estático de la petición ejecutada: son evidencia estática de esa ruta, no
+SQL observado salvo captura N2 o de driver. Si varios registros comparten valores y no hay clave de fila,
+expresión identificable ni source map, la tarjeta enumera alternativas y lo advierte. Los hooks viven
+solo en memoria y no capturan valores de inputs ni cabeceras sensibles. En el mapa, la arista de
+procedencia se dibuja con la misma evidencia que el tooltip: identidad en ejecución, coincidencia de
+contenido o ruta ejecutada sin respuesta capturada, cada una rotulada con su correlación (directa o
+heurística); nunca una procedencia inventada.
+
+## ADR-042 — Resolución automática de controles y contención DOM en el mapa
+
+**Contexto:** ADR-041 conectaba en el mapa la cadena que mostraba el tooltip, pero solo después de un
+hover sobre el elemento. Los controles que aparecían por una interacción de contenedor —`<html>`,
+`<header>` y similares— quedaban como tarjetas sin flechas, y el resto del inventario solo mostraba sus
+destinos declarados. El usuario pidió que el diagrama completo se vea sin depender de que ocurra un
+evento.
+**Decisión:** (1) **Barrido sin interacción:** al abrir el mapa, el controlador programa una resolución
+secuencial en segundo plano (600 ms después del primer build, sin bloquear la UI) sobre todos los
+controles del inventario y todas las referencias de interacción, incluidos los contenedores; omite el
+documento. `ClickInspector.resolveRef(ref, true)` reconstruye el nodo desde su selector y su clave de
+página en el mundo aislado, lo re-resuelve en el mundo principal para que las props de React/Vue sean
+visibles y reutiliza el mismo `elementInfo`, `runtimeProvenance` y `findHandler` del hover. El barrido se
+cancela al cerrar el mapa, navegar, limpiar la sesión o desactivar la inspección; los controles ya
+resueltos se recuerdan por clave para no repetir el trabajo. (2) **Manejadores sin evento:** un nuevo
+`RuntimeHandlerLedger` guarda el manejador click/submit resuelto en el DOM, con su fuente, archivo y
+línea. El grafo lo proyecta como nodo `handler` y arista `TRIGGERS` RUNTIME directa desde el elemento; el
+manejador declarado STATIC equivalente se omite cuando ya hay resolución en ejecución. (3) **Cadena de
+procedencia sin evento:** el barrido registra en el ledger de procedencia la misma cadena del tooltip
+—identidad en ejecución, coincidencia de contenido o ruta ejecutada— de modo que `PROVENANCE` y
+`RENDERS` se dibujan para datos que llegaron antes de abrir el mapa. (4) **Manejador → petición por
+nombre:** si una petición capturada registra como función iniciadora el mismo nombre del manejador
+resuelto, se dibuja `SENDS` RUNTIME heurística; nunca sobrescribe una arista ya existente y la nota
+declara que la asociación es por nombre y sin evento registrado. (5) **Contención DOM:** los nodos de
+elemento que siguen sin ninguna arista se enlazan con `CONTAINS` al nodo de elemento conectado más
+cercano —el ancestro de selector más largo o, si no lo hay, el descendiente de selector más corto;
+`document` contiene a todos—. La arista es RUNTIME directa, recorre los aislados en orden de inserción
+para encadenar contenedores y su nota dice «Contención en el DOM; no implica flujo de datos». (6) **Modo
+«Solo lo que interactuaste»:** el alcance se siembra solo con elementos que tienen eventos o trazas,
+manejadores con trazas y el resto de nodos RUNTIME (peticiones, rutas ejecutadas, SQL observado). Los
+elementos resueltos únicamente por el barrido no cuentan como interactuados y no siembran el subgrafo,
+aunque sí pueden aparecer como alcanzables desde un control usado.
+**Consecuencia:** el mapa dibuja la cadena de cada control sin exigir hover ni clic, incluidos los
+contenedores que antes quedaban sueltos, y mantiene las etiquetas de evidencia y correlación del resto
+del grafo. El barrido consume CPU y CDP en proporción al número de controles y a los cuerpos capturados:
+en páginas grandes el dibujo se completa progresivamente y las listas siguen acotadas a 20 filas por
+bloque. La contención es jerarquía del documento, no flujo de datos, y puede dibujar curvas largas entre
+capas. El vínculo por nombre de función iniciadora es heurístico y puede reunir peticiones de la misma
+función ejecutadas en momentos distintos. El barrido no modifica la página ni captura valores de campos.
+
+## ADR-043 — Mapa en ventana propia, resaltado en página, cronología, recorte por visor y troncos
+
+**Contexto:** ADR-039 abrió el mapa dentro del panel acoplado, ocultando la página; al crecer el grafo,
+el SVG completo se montaba de una vez y las aristas convergentes se dibujaban una por origen. El usuario
+pidió (1) el mapa fuera de la ventana por defecto, (2) que al pulsar un nodo se resalte el elemento de la
+página como el hover, (3) orden cronológico con hora, minutos y segundos, (4) no renderizar lo que no está
+a la vista y (5) unir las líneas que van al mismo destino en un solo tronco para no sobrecargar la CPU.
+**Decisión:** (1) **Ventana propia:** `FlowMapWindow` crea un `BrowserWindow` separado con partición,
+preload y sesión endurecida propios, y carga solo el marcado del mapa. El controlador sigue siendo la
+única fuente de verdad: empuja el mismo `FlowMapState` a esa ventana y el panel conserva la tarjeta de
+inspección. «Mapa» en la cabecera y en la fila de modos abre la ventana; «Cerrar mapa», la X o `Escape`
+la cierran. Cerrar la ventana, desactivar la inspección, desconectar o limpiar la sesión detiene el
+refresco del inventario y la resolución automática. (2) **Resaltado en página:** al elegir un nodo, el
+mapa envía por IPC `{ key, selector }`; el proceso principal valida que venga de la ventana del mapa y lo
+evalúa en el mundo aislado del inspector con `__bdtMapHighlight`. El helper reutiliza el recuadro del
+hover (`bdt-hover-box`), resuelve la referencia por clave y selector y, si el nodo no es un elemento,
+sube por las aristas entrantes hasta el elemento con selector más cercano. Centra el elemento con
+`scrollIntoView` y lo ilumina con dos pulsos de 2,6 s. No modifica el DOM ni captura valores.
+(3) **Cronología:** `layoutFlow` ordena los nodos de cada capa por `firstSeen`; los nodos sin hora
+conocida (STATIC) van al final. Cada tarjeta muestra `HH:MM:SS` de primera aparición y el subtítulo se
+acorta para dejar sitio. Tooltips, rail de interacciones, rutas y peticiones del detalle usan el mismo
+reloj local y orden ascendente; el hover estampa `Visto` o el rango `Visto: inicio → fin`.
+(4) **Recorte por visor:** el SVG se divide en tres capas (ramas, troncos, nodos). En cada frame de
+pan/zoom/resize se calculan los límites del mundo visible a partir de la transformación y se añade un
+margen de 280 px de pantalla convertido a unidades del mundo; solo se montan los nodos y aristas que
+intersectan esos límites y se desmontan los que salen. Los `Map` de vistas montadas hacen O(1) el alta y
+la baja; un `requestAnimationFrame` agrupa los cambios y un `ResizeObserver` cubre el redimensionado de
+la ventana. Los filtros y la selección se guardan en caché y se reaplican al montar, de modo que ocultar
+o atenuar no recalcula el grafo. (5) **Troncos convergentes:** las aristas que avanzan hacia la derecha
+se agrupan por destino. Si un destino recibe varias fuentes, cada fuente dibuja una rama sin punta hasta
+un punto de unión situado 44 px a la izquierda del destino, a la altura media de las fuentes; desde ese
+punto sale una sola flecha con punta hacia el destino. Las aristas hacia atrás o dentro de la misma capa
+se dibujan por separado. Las ramas conservan su tooltip por arista y el tronco declara cuántos orígenes y
+conexiones agrupa, con evidencia fusionada y hora del último avistamiento.
+**Consecuencia:** la página y el mapa pueden verse a la vez; pulsar un nodo señala el control real sin
+cerrar el mapa. El orden y las horas hacen legible la secuencia de la sesión, y el recorte mantiene
+acotado el DOM aunque el snapshot crezca: solo se paga por lo visible más el margen. El tronco reduce
+drásticamente el número de trazos cuando muchas fuentes apuntan a la misma ruta o tabla. El recorte no
+descarta datos: nodos y aristas reaparecen al desplazar, alejar o redimensionar. El resaltado depende de
+que el elemento siga en la página y de que la inspección esté activa; si el selector ya no resuelve, no
+se resalta nada. La unión de líneas es una simplificación visual: comparte destino, no demuestra
+causalidad, y las etiquetas STATIC/RUNTIME y directa/heurística se conservan. El mapa ya no ocupa el
+panel; el botón «Mapa» abre una ventana que puede quedar detrás o delante de la del navegador según el
+gestor de ventanas.

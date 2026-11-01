@@ -1,6 +1,6 @@
 export { classifyUrl, normalizeOrigin, type ClassificationTargets } from './classify';
 export { isSensitiveHeader, maskHeaders, maskUrl } from './headers';
-export { findJsonTextMatches, type JsonTextMatch } from './json-provenance';
+export { findJsonTextMatches, type JsonDataHint, type JsonTextMatch } from './json-provenance';
 export { sanitizeJsonBody } from './json-body';
 export {
   normalizeInitiator,

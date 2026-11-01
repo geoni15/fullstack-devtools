@@ -1,5 +1,6 @@
 import type { Debugger as CdpDebugger } from 'electron';
 import type {
+  FlowInteractionEvent,
   HandlerSource,
   InspectionCodeBlock,
   InspectionElement,
@@ -7,10 +8,24 @@ import type {
   InspectionMode,
 } from '@bdt/protocol';
 import type { Logger } from '../logger';
+import {
+  PAGE_DOM_HELPERS_SOURCE,
+  isFlowInteractionEvent,
+  parseElementRef,
+  type PageElementRef,
+} from './page-inventory';
+import {
+  RUNTIME_NETWORK_SOURCE,
+  RUNTIME_PROVENANCE_CALL,
+  parseRuntimeProvenance,
+  type RuntimeProvenance,
+  type RuntimeRenderInfo,
+} from './runtime-provenance';
+import { mapGeneratedLocation, parseInlineSourceMap, type InlineSourceMap } from './source-maps';
 
 const WORLD_NAME = 'bdt-inspector-world';
 const BINDING_NAME = 'bdtInspectorClick';
-const MAX_SIGNAL_BYTES = 4096;
+const MAX_SIGNAL_BYTES = 16384;
 const MAX_HANDLER_SOURCE = 12000;
 const MAX_HANDLER_LINES = 80;
 const HANDLER_CONTEXT_LINES = 12;
@@ -28,6 +43,7 @@ const LISTENER_SOURCE = String.raw`
   if (globalThis.__bdtInspectorBound === true) return;
   if (typeof globalThis.bdtInspectorClick !== 'function') return;
   globalThis.__bdtInspectorBound = true;
+${PAGE_DOM_HELPERS_SOURCE}
   const emit = (payload) => {
     try {
       globalThis.bdtInspectorClick(JSON.stringify(payload));
@@ -151,6 +167,46 @@ const LISTENER_SOURCE = String.raw`
 
   const hideBox = () => {
     if (boxHost !== null) style(boxHost, 'display', 'none');
+  };
+
+  let mapHighlightTimers = [];
+  globalThis.__bdtMapHighlight = (key, selector, durationMs) => {
+    try {
+      if (typeof selector !== 'string' || selector === '') return false;
+      let target = null;
+      try {
+        target = globalThis.__bdtResolveRef ? globalThis.__bdtResolveRef(key, selector) : null;
+      } catch (error) {
+        target = null;
+      }
+      if (!(target instanceof Element)) {
+        try {
+          target = globalThis.__bdtResolveRef ? globalThis.__bdtResolveRef(null, selector) : null;
+        } catch (error) {
+          target = null;
+        }
+      }
+      if (!(target instanceof Element)) return false;
+      try {
+        target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+      } catch (error) {
+        void error;
+      }
+      for (const timer of mapHighlightTimers) clearTimeout(timer);
+      mapHighlightTimers = [];
+      const total =
+        typeof durationMs === 'number' && isFinite(durationMs)
+          ? Math.max(800, Math.min(12000, durationMs))
+          : 2600;
+      showBox(rectOf(target));
+      mapHighlightTimers.push(setTimeout(() => { hideBox(); }, Math.round(total * 0.32)));
+      mapHighlightTimers.push(setTimeout(() => { showBox(rectOf(target)); }, Math.round(total * 0.42)));
+      mapHighlightTimers.push(setTimeout(() => { hideBox(); }, total));
+      return true;
+    } catch (error) {
+      void error;
+      return false;
+    }
   };
 
   const ensureTip = () => {
@@ -343,6 +399,7 @@ const LISTENER_SOURCE = String.raw`
       docX: Math.round(window.scrollX + x),
       docY: Math.round(window.scrollY + y),
       rect: rectOf(target),
+      ref: refOfControl(target),
       element: describe(target),
     });
   };
@@ -355,6 +412,273 @@ const LISTENER_SOURCE = String.raw`
     globalThis.__bdtHoverTarget = hit;
     sendHover(hit, hoverX, hoverY);
   };
+
+  const inspectEnabled = () => globalThis.__BDT_INSPECT_ENABLED__ !== false;
+  const ownUi = (node) => {
+    if (node === null || node === undefined) return false;
+    if (node === tipHost || node === boxHost) return true;
+    if (!(node instanceof Element)) return false;
+    try {
+      return node.closest('bdt-hover-tip, bdt-hover-box') !== null;
+    } catch (error) {
+      void error;
+      return false;
+    }
+  };
+  const refCache = new WeakMap();
+  const refOfControl = (node) => {
+    if (node === null || node === undefined) return null;
+    if (node instanceof Element) {
+      const cached = refCache.get(node);
+      if (cached !== undefined && Date.now() - cached.at < 800) return cached.value;
+    }
+    try {
+      const control =
+        node.nodeType === 9 ? node : __bdtPage.closestInteractive(node) || node;
+      const ref = __bdtPage.refOf(control);
+      const value = ref !== null && ref.key !== '' ? ref : null;
+      if (node instanceof Element) refCache.set(node, { at: Date.now(), value });
+      if (control instanceof Element && control !== node) {
+        refCache.set(control, { at: Date.now(), value });
+      }
+      return value;
+    } catch (error) {
+      void error;
+      return null;
+    }
+  };
+  const sendInteraction = (event, node) => {
+    if (!inspectEnabled() || ownUi(node)) return;
+    const ref = refOfControl(node);
+    if (ref === null) return;
+    emit({ kind: 'interaction', event, at: Date.now(), ref });
+  };
+  globalThis.__bdtResolveRef = (key, selector) => {
+    try {
+      if (typeof selector !== 'string' || selector === '') return null;
+      if (selector === 'document') return document;
+      const tokens = selector.split('>');
+      let current = null;
+      let shadow = null;
+      for (let index = 0; index < tokens.length; index += 1) {
+        const token = tokens[index];
+        if (token === 'shadow') {
+          shadow = current && current.shadowRoot ? current.shadowRoot : null;
+          if (!shadow) return null;
+          current = null;
+          continue;
+        }
+        const scope = current === null ? shadow || document : current;
+        let match = null;
+        try {
+          match = scope.querySelector(':scope > ' + token);
+        } catch (error) {
+          void error;
+          match = null;
+        }
+        if (!match && scope === document) {
+          try {
+            match = document.querySelector(token);
+          } catch (error) {
+            void error;
+            match = null;
+          }
+        }
+        if (!match) return null;
+        current = match;
+        shadow = null;
+      }
+      if (!current || current.nodeType !== 1) return null;
+      if (typeof key === 'string' && key !== '' && __bdtPage.keyFor(current) !== key) return null;
+      return current;
+    } catch (error) {
+      void error;
+      return null;
+    }
+  };
+  const interactionNode = (target, x, y) => {
+    if (target === window || target === document) return document;
+    if (!(target instanceof Element) || ownUi(target)) return null;
+    let deep = target;
+    try {
+      let px = typeof x === 'number' ? x : 0;
+      let py = typeof y === 'number' ? y : 0;
+      if (px === 0 && py === 0) {
+        const rect = target.getBoundingClientRect();
+        px = rect.left + rect.width / 2;
+        py = rect.top + rect.height / 2;
+      }
+      deep = deepTarget(target, px, py);
+    } catch (error) {
+      void error;
+      deep = target;
+    }
+    try {
+      return __bdtPage.closestInteractive(deep) || deep;
+    } catch (error) {
+      void error;
+      return deep;
+    }
+  };
+
+  window.addEventListener('dblclick', (event) => {
+    const target = interactionNode(event.target, event.clientX, event.clientY);
+    if (target !== null) sendInteraction('dblclick', target);
+  }, true);
+  window.addEventListener('contextmenu', (event) => {
+    const target = interactionNode(event.target, event.clientX, event.clientY);
+    if (target !== null) sendInteraction('contextmenu', target);
+  }, true);
+  window.addEventListener('input', (event) => {
+    const target = interactionNode(event.target);
+    if (target !== null) sendInteraction('input', target);
+  }, true);
+  window.addEventListener('change', (event) => {
+    const target = interactionNode(event.target);
+    if (target !== null) sendInteraction('change', target);
+  }, true);
+  window.addEventListener('focusin', (event) => {
+    const target = interactionNode(event.target);
+    if (target !== null) sendInteraction('focus', target);
+  }, true);
+  window.addEventListener('focusout', (event) => {
+    const target = interactionNode(event.target);
+    if (target !== null) sendInteraction('blur', target);
+  }, true);
+  window.addEventListener('keydown', (event) => {
+    if (!__bdtPage.isControlKey(event.key)) return;
+    const target = interactionNode(event.target);
+    if (target !== null) sendInteraction('keydown', target);
+  }, true);
+
+  let hoverKey = null;
+  window.addEventListener('mouseover', (event) => {
+    if (!inspectEnabled()) return;
+    if (!(event.target instanceof Element) || ownUi(event.target)) return;
+    let control = null;
+    try {
+      let deep = event.target;
+      try {
+        deep = deepTarget(event.target, event.clientX, event.clientY);
+      } catch (error) {
+        void error;
+        deep = event.target;
+      }
+      control = __bdtPage.closestInteractive(deep) || deep;
+    } catch (error) {
+      void error;
+      control = null;
+    }
+    if (control === null) {
+      hoverKey = null;
+      return;
+    }
+    let key = '';
+    try {
+      key = __bdtPage.keyFor(control);
+    } catch (error) {
+      void error;
+      key = '';
+    }
+    if (key === '' || key === hoverKey) return;
+    hoverKey = key;
+    sendInteraction('hover', control);
+  }, true);
+  window.addEventListener('mouseout', (event) => {
+    if (event.relatedTarget === null) hoverKey = null;
+  }, true);
+
+  let scrollTimer = null;
+  let scrollTarget = null;
+  window.addEventListener('scroll', (event) => {
+    if (!inspectEnabled()) return;
+    const raw = event.target === document || event.target === window ? document : event.target;
+    if (!(raw instanceof Element) && raw !== document) return;
+    if (raw instanceof Element && ownUi(raw)) return;
+    scrollTarget = raw;
+    if (scrollTimer !== null) return;
+    scrollTimer = setTimeout(() => {
+      scrollTimer = null;
+      const target = scrollTarget;
+      scrollTarget = null;
+      if (target !== null) sendInteraction('scroll', target);
+    }, 200);
+  }, true);
+
+  let domTimer = null;
+  const observedRoots = new WeakSet();
+  let observer = null;
+  const observeRoot = (root) => {
+    if (!root || observedRoots.has(root)) return;
+    observedRoots.add(root);
+    try {
+      observer.observe(root, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: [
+          'class', 'style', 'hidden', 'disabled', 'role', 'aria-label',
+          'aria-disabled', 'href', 'action', 'method', 'type', 'name', 'id',
+        ],
+      });
+    } catch (error) {
+      void error;
+    }
+    let nodes = [];
+    try {
+      nodes = Array.from(root.querySelectorAll('*'));
+    } catch (error) {
+      void error;
+      nodes = [];
+    }
+    for (const node of nodes) {
+      try {
+        if (node.shadowRoot) observeRoot(node.shadowRoot);
+      } catch (error) {
+        void error;
+      }
+    }
+  };
+  const mutationRelevant = (records) => {
+    for (const record of records) {
+      if (record.target instanceof Element && ownUi(record.target)) continue;
+      if (record.type === 'childList' && record.removedNodes.length === 0) {
+        let onlyTool = record.addedNodes.length > 0;
+        for (const node of record.addedNodes) {
+          if (!(node instanceof Element)) {
+            onlyTool = false;
+            break;
+          }
+          const tag = typeof node.tagName === 'string' ? node.tagName.toLowerCase() : '';
+          if (tag.indexOf('bdt-') !== 0) {
+            onlyTool = false;
+            break;
+          }
+        }
+        if (onlyTool) continue;
+      }
+      return true;
+    }
+    return false;
+  };
+  observer = new MutationObserver((records) => {
+    if (!inspectEnabled() || !mutationRelevant(records)) return;
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        try {
+          if (node instanceof Element && node.shadowRoot) observeRoot(node.shadowRoot);
+        } catch (error) {
+          void error;
+        }
+      }
+    }
+    if (domTimer !== null) return;
+    domTimer = setTimeout(() => {
+      domTimer = null;
+      emit({ kind: 'dom-changed' });
+    }, 400);
+  });
+  observeRoot(document);
 
   window.addEventListener('mousemove', (event) => {
     if (globalThis.__BDT_INSPECT_ENABLED__ === false) return;
@@ -397,12 +721,15 @@ const LISTENER_SOURCE = String.raw`
     }
     const hit = deepTarget(event.target, x, y);
     globalThis.__bdtClickTarget = hit;
+    const ref = refOfControl(hit);
     emit({
       kind: 'click',
       x: Math.round(x),
       y: Math.round(y),
       docX: Math.round(docX),
       docY: Math.round(docY),
+      at: Date.now(),
+      ref,
       element: describe(hit),
     });
   }, true);
@@ -413,12 +740,21 @@ const LISTENER_SOURCE = String.raw`
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
     globalThis.__bdtClickTarget = event.target;
+    let submitter = null;
+    try {
+      if (event.submitter) submitter = refOfControl(event.submitter);
+    } catch (error) {
+      void error;
+    }
     emit({
       kind: 'submit',
       x: Math.round(x),
       y: Math.round(y),
       docX: Math.round(window.scrollX + x),
       docY: Math.round(window.scrollY + y),
+      at: Date.now(),
+      ref: refOfControl(event.target),
+      submitter,
       element: describe(event.target),
     });
   }, true);
@@ -974,6 +1310,9 @@ export interface InspectorClickSignal {
   docX: number;
   docY: number;
   contextId: number | null;
+  at: number;
+  ref: PageElementRef | null;
+  submitter: PageElementRef | null;
   element: InspectionElement;
 }
 
@@ -992,11 +1331,28 @@ export interface InspectorHoverSignal {
   docY: number;
   contextId: number | null;
   rect: InspectorRect | null;
+  ref: PageElementRef | null;
   element: InspectionElement;
 }
 
+export interface InspectorInteractionSignal {
+  kind: 'interaction';
+  event: FlowInteractionEvent;
+  at: number;
+  ref: PageElementRef;
+}
+
+export interface InspectorDomChangedSignal {
+  kind: 'dom-changed';
+}
+
 export type InspectorSignal =
-  InspectorClickSignal | InspectorHoverSignal | { kind: 'hover-end' } | { kind: 'escape' };
+  | InspectorClickSignal
+  | InspectorHoverSignal
+  | InspectorInteractionSignal
+  | InspectorDomChangedSignal
+  | { kind: 'hover-end' }
+  | { kind: 'escape' };
 
 export interface HoverTextProp {
   component: string;
@@ -1027,6 +1383,8 @@ export interface HoverElementInfo {
   dataValues: HoverDataValue[];
   form: { action: string; method: string } | null;
   link: string | null;
+  ref: PageElementRef | null;
+  runtime: RuntimeProvenance | null;
 }
 
 export interface HoverResolution {
@@ -1206,6 +1564,8 @@ function parseHoverElement(value: unknown): HoverElementInfo | null {
     dataValues,
     form,
     link: cleanString(record.link, 300),
+    ref: null,
+    runtime: null,
   };
 }
 
@@ -1231,6 +1591,21 @@ function parseSignal(raw: string, contextId: number | null): InspectorSignal | n
   if (record.kind === 'hover-end') {
     return { kind: 'hover-end' };
   }
+  if (record.kind === 'dom-changed') {
+    return { kind: 'dom-changed' };
+  }
+  if (record.kind === 'interaction') {
+    if (!isFlowInteractionEvent(record.event)) return null;
+    const ref = parseElementRef(record.ref);
+    if (ref === null) return null;
+    const at = finiteNumber(record.at);
+    return {
+      kind: 'interaction',
+      event: record.event,
+      at: at === null ? Date.now() : at,
+      ref,
+    };
+  }
   if (record.kind !== 'click' && record.kind !== 'submit' && record.kind !== 'hover') {
     return null;
   }
@@ -1242,6 +1617,7 @@ function parseSignal(raw: string, contextId: number | null): InspectorSignal | n
   const element = asRecord(record.element);
   const tag = element === null ? null : cleanString(element.tag, 32);
   if (element === null || tag === null) return null;
+  const ref = parseElementRef(record.ref);
   const parsedElement: InspectionElement = {
     tag: tag.toLowerCase(),
     text: cleanString(element.text, 120),
@@ -1259,9 +1635,20 @@ function parseSignal(raw: string, contextId: number | null): InspectorSignal | n
       docY: Math.round(docY),
       contextId,
       rect: parseRect(record.rect),
+      ref: parseElementRef(record.ref),
       element: parsedElement,
     };
   }
+  if (ref !== null) {
+    parsedElement.key = ref.key;
+    parsedElement.selector = ref.selector;
+    parsedElement.kind = ref.kind;
+    parsedElement.href = ref.href;
+    parsedElement.formAction = ref.formAction;
+    parsedElement.formMethod = ref.formMethod;
+    parsedElement.formKey = ref.formKey;
+  }
+  const at = finiteNumber(record.at);
   return {
     kind: record.kind,
     x: Math.round(x),
@@ -1269,6 +1656,9 @@ function parseSignal(raw: string, contextId: number | null): InspectorSignal | n
     docX: Math.round(docX),
     docY: Math.round(docY),
     contextId,
+    at: at === null ? Date.now() : at,
+    ref,
+    submitter: record.kind === 'submit' ? parseElementRef(record.submitter) : null,
     element: parsedElement,
   };
 }
@@ -1363,8 +1753,11 @@ export class ClickInspector {
   private nodeGroupSequence = 0;
   private readonly scriptInfos = new Map<string, ScriptInfo>();
   private readonly scriptSources = new Map<string, string>();
+  private readonly sourceMaps = new Map<string, InlineSourceMap | null>();
   private readonly worldContexts = new Set<number>();
+  private readonly mainContexts = new Map<string, number>();
   private primaryContextId: number | null = null;
+  private runtimeScriptId: string | null = null;
 
   constructor(
     private readonly onSignal: (signal: InspectorSignal) => void,
@@ -1377,6 +1770,7 @@ export class ClickInspector {
       await target.sendCommand('Runtime.enable');
       await target.sendCommand('Page.enable');
       await target.sendCommand('DOM.enable');
+      await this.installRuntimeHooks(target);
       this.installed = true;
       this.log.debug('Inspector de clics instalado');
     } catch (error) {
@@ -1385,6 +1779,31 @@ export class ClickInspector {
         message: error instanceof Error ? error.message : String(error),
       });
       throw error;
+    }
+  }
+
+  private async installRuntimeHooks(target: CdpDebugger): Promise<void> {
+    try {
+      const added = (await target.sendCommand('Page.addScriptToEvaluateOnNewDocument', {
+        source: RUNTIME_NETWORK_SOURCE,
+        runImmediately: true,
+      })) as { identifier?: string };
+      this.runtimeScriptId = typeof added.identifier === 'string' ? added.identifier : null;
+    } catch (error) {
+      this.runtimeScriptId = null;
+      this.log.debug('No se pudo instalar el enlace de red en el mundo principal', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+    try {
+      await target.sendCommand('Runtime.evaluate', {
+        expression: RUNTIME_NETWORK_SOURCE,
+        silent: true,
+      });
+    } catch (error) {
+      this.log.debug('No se pudo activar el enlace de red en el documento actual', {
+        message: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -1452,7 +1871,15 @@ export class ClickInspector {
       case 'Runtime.executionContextCreated': {
         const record = asRecord(params);
         const context = record === null ? null : asRecord(record.context);
-        if (context === null || context.name !== WORLD_NAME) return;
+        if (context === null) return;
+        const auxData = asRecord(context.auxData);
+        const frameId =
+          auxData !== null && typeof auxData.frameId === 'string' ? auxData.frameId : null;
+        const mainId = typeof context.id === 'number' ? context.id : null;
+        if (auxData !== null && auxData.isDefault === true && frameId !== null && mainId !== null) {
+          this.mainContexts.set(frameId, mainId);
+        }
+        if (context.name !== WORLD_NAME) return;
         const id = typeof context.id === 'number' ? context.id : null;
         if (id === null) return;
         this.worldContexts.add(id);
@@ -1469,12 +1896,16 @@ export class ClickInspector {
             : null;
         if (id !== null) {
           this.worldContexts.delete(id);
+          for (const [frameId, contextId] of this.mainContexts) {
+            if (contextId === id) this.mainContexts.delete(frameId);
+          }
           if (this.primaryContextId === id) this.primaryContextId = null;
         }
         break;
       }
       case 'Runtime.executionContextsCleared':
         this.worldContexts.clear();
+        this.mainContexts.clear();
         this.primaryContextId = null;
         break;
       case 'Page.frameNavigated': {
@@ -1534,9 +1965,11 @@ export class ClickInspector {
       if (primary === undefined) return null;
       const info = await this.elementInfo(target, primary);
       if (info === null) return null;
+      info.ref = signal.ref;
       if (!withHandler) {
         return { element: info, handler: null, handlerEvent: null, listeners: [] };
       }
+      info.runtime = await this.runtimeProvenance(target, primary, nodes.group);
 
       let listeners: string[] = [];
       let entries: EventListenerEntry[] = [];
@@ -1570,6 +2003,106 @@ export class ClickInspector {
     }
   }
 
+  async resolveRef(ref: PageElementRef, withHandler: boolean): Promise<HoverResolution | null> {
+    const target = this.target;
+    if (target === null || !this.installed || !this.enabled) return null;
+    const contextId = this.tooltipContext();
+    if (contextId === null) return null;
+    const group = `bdt-ref-${String(++this.nodeGroupSequence)}`;
+    try {
+      const evaluated = (await target.sendCommand('Runtime.evaluate', {
+        expression: `globalThis.__bdtResolveRef ? globalThis.__bdtResolveRef(${JSON.stringify(
+          ref.key,
+        )}, ${JSON.stringify(ref.selector)}) : null`,
+        contextId,
+        objectGroup: group,
+        silent: true,
+      })) as { result?: { objectId?: string } };
+      const primary = evaluated.result?.objectId;
+      if (primary === undefined) return null;
+
+      const ids: string[] = [primary];
+      try {
+        const described = (await target.sendCommand('DOM.describeNode', {
+          objectId: primary,
+        })) as { node?: { backendNodeId?: number; frameId?: string } };
+        const backendNodeId = described.node?.backendNodeId;
+        if (typeof backendNodeId === 'number') {
+          const frameId = described.node?.frameId;
+          const mainContextId = frameId === undefined ? undefined : this.mainContexts.get(frameId);
+          const resolvedMain = (await target.sendCommand('DOM.resolveNode', {
+            backendNodeId,
+            objectGroup: group,
+            ...(mainContextId === undefined ? {} : { executionContextId: mainContextId }),
+          })) as { object?: { objectId?: string } };
+          const mainObjectId = resolvedMain.object?.objectId;
+          if (mainObjectId !== undefined) ids.unshift(mainObjectId);
+        }
+      } catch (error) {
+        this.log.debug('No se pudo resolver el elemento indexado en el mundo principal', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      try {
+        const ancestors = (await target.sendCommand('Runtime.callFunctionOn', {
+          objectId: primary,
+          functionDeclaration: ANCESTORS_FUNCTION,
+          returnByValue: false,
+          objectGroup: group,
+        })) as { result?: { objectId?: string } };
+        const arrayId = ancestors.result?.objectId;
+        if (arrayId !== undefined) {
+          const properties = (await target.sendCommand('Runtime.getProperties', {
+            objectId: arrayId,
+            ownProperties: true,
+          })) as { result?: Array<{ name: string; value?: { objectId?: string } }> };
+          const entries = (properties.result ?? [])
+            .filter((entry) => /^\d+$/.test(entry.name))
+            .sort((left, right) => Number(left.name) - Number(right.name));
+          for (const entry of entries) {
+            const id = entry.value?.objectId;
+            if (id !== undefined) ids.push(id);
+          }
+        }
+      } catch (error) {
+        this.log.debug('No se pudieron leer los ancestros del elemento indexado', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+
+      const info = await this.elementInfo(target, primary);
+      if (info === null) return null;
+      info.ref = ref;
+      if (!withHandler) {
+        return { element: info, handler: null, handlerEvent: null, listeners: [] };
+      }
+      info.runtime = await this.runtimeProvenance(target, primary, group);
+      let handler: InspectionHandler | null = null;
+      let handlerEvent: 'click' | 'submit' | null = null;
+      try {
+        handler = await this.findHandler(target, ids, 'click');
+        handlerEvent = handler === null ? null : 'click';
+        if (handler === null && isSubmitLike(ref)) {
+          handler = await this.findHandler(target, ids, 'submit');
+          if (handler !== null) handlerEvent = 'submit';
+        }
+      } catch (error) {
+        this.log.debug('No se pudo resolver el manejador del elemento indexado', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      return { element: info, handler, handlerEvent, listeners: [] };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes(CANCELLED_ERROR)) {
+        this.log.debug('No se pudo resolver el elemento indexado', { message });
+      }
+      return null;
+    } finally {
+      await this.releaseGroup(target, group);
+    }
+  }
+
   showTooltip(tip: HoverTipData): void {
     if (!this.enabled) return;
     const target = this.target;
@@ -1596,6 +2129,22 @@ export class ClickInspector {
         silent: true,
       })
       .catch(() => undefined);
+  }
+
+  highlightRef(key: string | null, selector: string): void {
+    const target = this.target;
+    const contextId = this.tooltipContext();
+    if (target === null || contextId === null) return;
+    const expression = `if (globalThis.__bdtMapHighlight) { globalThis.__bdtMapHighlight(${JSON.stringify(
+      key,
+    )}, ${JSON.stringify(selector)}, 2600); }`;
+    void target
+      .sendCommand('Runtime.evaluate', { expression, contextId, silent: true })
+      .catch((error: unknown) => {
+        this.log.debug('No se pudo resaltar en la página el elemento elegido en el mapa', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
   }
 
   refreshHover(): void {
@@ -1644,14 +2193,146 @@ export class ClickInspector {
     }
   }
 
+  private async runtimeProvenance(
+    target: CdpDebugger,
+    objectId: string,
+    group: string,
+  ): Promise<RuntimeProvenance | null> {
+    try {
+      const described = (await target.sendCommand('DOM.describeNode', { objectId })) as {
+        node?: { backendNodeId?: number; frameId?: string };
+      };
+      const backendNodeId = described.node?.backendNodeId;
+      if (typeof backendNodeId !== 'number') return null;
+      const frameId = described.node?.frameId;
+      const mainContextId = frameId === undefined ? undefined : this.mainContexts.get(frameId);
+      const resolved = (await target.sendCommand('DOM.resolveNode', {
+        backendNodeId,
+        objectGroup: group,
+        ...(mainContextId === undefined ? {} : { executionContextId: mainContextId }),
+      })) as { object?: { objectId?: string } };
+      const mainObjectId = resolved.object?.objectId;
+      if (mainObjectId === undefined) return null;
+      const response = (await target.sendCommand('Runtime.callFunctionOn', {
+        objectId: mainObjectId,
+        functionDeclaration: RUNTIME_PROVENANCE_CALL,
+        returnByValue: true,
+        silent: true,
+      })) as { result?: { value?: unknown } };
+      const runtime = parseRuntimeProvenance(response.result?.value);
+      if (runtime === null) return null;
+      await this.mapRuntimeSources(target, runtime);
+      return runtime;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes(CANCELLED_ERROR)) {
+        this.log.debug('No se pudo leer la procedencia en tiempo de ejecución', { message });
+      }
+      return null;
+    }
+  }
+
+  private async mapRuntimeSources(target: CdpDebugger, runtime: RuntimeProvenance): Promise<void> {
+    if (runtime.framework !== 'react') return;
+    const entries: RuntimeRenderInfo[] = [];
+    if (runtime.render?.origin === 'stack') entries.push(runtime.render);
+    for (const source of runtime.renderSources) {
+      if (source.origin === 'stack') entries.push(source);
+    }
+    if (entries.length === 0) return;
+    const mapped = new Map<string, RuntimeRenderInfo | null>();
+    const keyOf = (entry: RuntimeRenderInfo): string =>
+      `${entry.file ?? ''}\u0000${String(entry.line ?? '')}\u0000${String(entry.column ?? '')}`;
+    for (const entry of entries) {
+      const key = keyOf(entry);
+      if (mapped.has(key)) continue;
+      mapped.set(key, await this.mapRuntimeSource(target, entry));
+    }
+    const lookup = (entry: RuntimeRenderInfo): RuntimeRenderInfo | null =>
+      mapped.get(keyOf(entry)) ?? null;
+    const fallback =
+      runtime.renderSources
+        .map((entry) => (entry.origin === 'stack' ? lookup(entry) : entry))
+        .find((entry) => entry !== null) ?? null;
+    if (runtime.render !== null && runtime.render.origin === 'stack') {
+      runtime.render = lookup(runtime.render) ?? fallback;
+    }
+    const sources: RuntimeRenderInfo[] = [];
+    const seen = new Set<string>();
+    for (const source of runtime.renderSources) {
+      const value = source.origin === 'stack' ? lookup(source) : source;
+      if (value === null) continue;
+      const key = keyOf(value);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      sources.push(value);
+    }
+    runtime.renderSources = sources;
+  }
+
+  private async mapRuntimeSource(
+    target: CdpDebugger,
+    entry: RuntimeRenderInfo,
+  ): Promise<RuntimeRenderInfo | null> {
+    if (entry.file === null || entry.line === null) return null;
+    const script = this.findScriptByUrl(entry.file);
+    if (script === null) return null;
+    let map = this.sourceMaps.get(script.scriptId);
+    if (map === undefined) {
+      const source = await this.scriptSource(target, script.scriptId);
+      map = source === null ? null : parseInlineSourceMap(source, script.url || entry.file);
+      if (this.sourceMaps.size >= 32) this.sourceMaps.clear();
+      this.sourceMaps.set(script.scriptId, map);
+    }
+    if (map === null) return null;
+    const location = mapGeneratedLocation(map, entry.line - script.startLine, entry.column ?? 1);
+    if (location === null) return null;
+    return {
+      component: entry.component,
+      file: location.file,
+      line: location.line,
+      column: location.column,
+      origin: 'stack',
+      code: location.code,
+    };
+  }
+
+  private findScriptByUrl(url: string): (ScriptInfo & { scriptId: string }) | null {
+    const target = url.split('?')[0]?.split('#')[0] ?? url;
+    let found: (ScriptInfo & { scriptId: string }) | null = null;
+    for (const [scriptId, script] of this.scriptInfos) {
+      if (script.url === '') continue;
+      const candidate = script.url.split('?')[0]?.split('#')[0] ?? script.url;
+      if (candidate !== target) continue;
+      found = { scriptId, ...script };
+    }
+    return found;
+  }
+
   dispose(): void {
     this.worldSequence += 1;
+    const target = this.target;
+    const scriptId = this.runtimeScriptId;
+    this.runtimeScriptId = null;
+    if (target !== null && scriptId !== null) {
+      try {
+        if (target.isAttached()) {
+          void target
+            .sendCommand('Page.removeScriptToEvaluateOnNewDocument', { identifier: scriptId })
+            .catch(() => undefined);
+        }
+      } catch {
+        // The debugger is already gone.
+      }
+    }
     this.target = null;
     this.installed = false;
     this.primaryContextId = null;
     this.worldContexts.clear();
+    this.mainContexts.clear();
     this.scriptInfos.clear();
     this.scriptSources.clear();
+    this.sourceMaps.clear();
   }
 
   private async evaluateInWorlds(

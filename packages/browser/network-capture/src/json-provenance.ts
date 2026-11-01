@@ -15,6 +15,11 @@ export interface JsonTextMatch {
   parentTruncated: boolean;
 }
 
+export interface JsonDataHint {
+  value: string;
+  path: string;
+}
+
 interface ScanState {
   query: string;
   foldedQuery: string;
@@ -97,6 +102,42 @@ function queryNumbers(query: string): Set<number> {
     for (const value of numericVariants(token)) numbers.add(value);
   }
   return numbers;
+}
+
+function hasFormattedNumber(value: string): boolean {
+  return /\p{Sc}/u.test(value) || /\d[.,\u00a0\u202f]\d/.test(value);
+}
+
+function pathLeafKey(path: string): string | null {
+  const match = /([A-Za-z_$][\w$]*)\s*\]?\s*$/.exec(path);
+  return match?.[1] ?? null;
+}
+
+function normalizeKey(value: string): string {
+  return value.replace(/[^A-Za-z0-9]/g, '').toLowerCase();
+}
+
+// React/Vue data paths expose the source field (sale_price, unitPrice…) even
+// when the rendered text is formatted beyond recognition in the JSON.
+function relevantHintKeys(query: string, hints: readonly JsonDataHint[]): Set<string> {
+  const keys = new Set<string>();
+  if (hints.length === 0) return keys;
+  const numbers = queryNumbers(query);
+  const foldedQuery = foldText(query);
+  for (const hint of hints) {
+    const key = pathLeafKey(hint.path);
+    if (key === null) continue;
+    const value = normalizeText(hint.value);
+    if (value.length < 2 || value === '[enmascarado]') continue;
+    const numericHit = numericVariants(value).some((candidate) => numbers.has(candidate));
+    const folded = foldText(value);
+    const textHit =
+      foldedQuery.length >= MIN_QUERY_CHARS &&
+      folded.length >= MIN_QUERY_CHARS &&
+      (foldedQuery.includes(folded) || folded.includes(foldedQuery));
+    if (numericHit || textHit) keys.add(normalizeKey(key));
+  }
+  return keys;
 }
 
 function childPath(base: string, key: string): string {
@@ -354,6 +395,159 @@ function walk(
     walk(entry[1], childPath(path, entry[0]), path, node, entry[0].slice(0, 80), depth + 1, state);
     if (state.exact.length >= MAX_EXACT) return;
   }
+}
+
+interface NumericCandidate {
+  match: JsonTextMatch;
+  score: number;
+  requestIndex: number;
+  order: number;
+}
+
+interface NumericScanState {
+  numbers: ReadonlySet<number>;
+  keys: ReadonlySet<string>;
+  candidates: NumericCandidate[];
+  requestId: string;
+  origin: 'response' | 'request';
+  bodyTruncated: boolean;
+  requestIndex: number;
+  order: number;
+}
+
+function walkNumeric(
+  node: unknown,
+  path: string,
+  parentPath: string,
+  parent: unknown,
+  key: string | null,
+  depth: number,
+  state: NumericScanState,
+): void {
+  if (typeof node === 'number' || typeof node === 'string') {
+    const raw =
+      typeof node === 'number'
+        ? Number.isFinite(node)
+          ? String(node)
+          : null
+        : normalizeText(node);
+    if (raw === null || raw === '' || raw === '[enmascarado]' || raw.length > MAX_VALUE_CHARS) {
+      return;
+    }
+    const hit =
+      typeof node === 'number'
+        ? state.numbers.has(node)
+        : numericVariants(node).some((candidate) => state.numbers.has(candidate));
+    if (!hit) return;
+    const keyHit = key !== null && state.keys.has(normalizeKey(key));
+    state.candidates.push({
+      match: buildMatch(
+        { requestId: state.requestId, origin: state.origin, bodyTruncated: state.bodyTruncated },
+        raw,
+        path,
+        parentPath,
+        key,
+        parent,
+        { partial: true, approximate: true, basis: 'text' },
+      ),
+      score: (keyHit ? 4 : 0) + (state.origin === 'response' ? 1 : 0),
+      requestIndex: state.requestIndex,
+      order: state.order,
+    });
+    state.order += 1;
+    return;
+  }
+  if (depth >= MAX_DEPTH || node === null || typeof node !== 'object') return;
+
+  if (Array.isArray(node)) {
+    for (let index = 0; index < node.length; index += 1) {
+      walkNumeric(node[index], `${path}[${String(index)}]`, path, node, null, depth + 1, state);
+    }
+    return;
+  }
+
+  let entries: Array<[string, unknown]>;
+  try {
+    entries = Object.entries(node as Record<string, unknown>);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    walkNumeric(
+      entry[1],
+      childPath(path, entry[0]),
+      path,
+      node,
+      entry[0].slice(0, 80),
+      depth + 1,
+      state,
+    );
+  }
+}
+
+function scanNumericMatches(
+  requests: readonly CapturedRequest[],
+  query: string,
+  keys: ReadonlySet<string>,
+  limit: number,
+): JsonTextMatch[] {
+  const numbers = queryNumbers(query);
+  if (numbers.size === 0) return [];
+  const candidates: NumericCandidate[] = [];
+  for (const origin of ['response', 'request'] as const) {
+    for (let index = requests.length - 1; index >= 0; index -= 1) {
+      const request = requests[index];
+      if (request === undefined) continue;
+      const body = origin === 'response' ? request.responseBody : request.requestBody;
+      if (body === null || body.text.length < MIN_QUERY_CHARS) continue;
+      const parsed = parseBody(body);
+      if (parsed === null) continue;
+      const state: NumericScanState = {
+        numbers,
+        keys,
+        candidates,
+        requestId: request.id,
+        origin,
+        bodyTruncated: body.truncated,
+        requestIndex: index,
+        order: 0,
+      };
+      walkNumeric(parsed, '$', '$', parsed, null, 0, state);
+    }
+  }
+  const seen = new Set<string>();
+  return candidates
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        right.requestIndex - left.requestIndex ||
+        left.order - right.order,
+    )
+    .filter((candidate) => {
+      const key = `${candidate.match.requestId}|${candidate.match.origin}|${candidate.match.jsonPath}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, limit)
+    .map((candidate) => candidate.match);
+}
+
+function mergeMatches(
+  primary: readonly JsonTextMatch[],
+  secondary: readonly JsonTextMatch[],
+  limit: number,
+): JsonTextMatch[] {
+  const seen = new Set<string>();
+  const result: JsonTextMatch[] = [];
+  for (const match of [...primary, ...secondary]) {
+    const key = `${match.requestId}|${match.origin}|${match.jsonPath}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(match);
+    if (result.length >= limit) break;
+  }
+  return result;
 }
 
 function scanBody(
@@ -621,6 +815,7 @@ export function findJsonTextMatches(
   text: string,
   limit = 6,
   dataValues: readonly string[] = [],
+  dataHints: readonly JsonDataHint[] = [],
 ): JsonTextMatch[] {
   const query = normalizeText(text);
   if (query.length < MIN_QUERY_CHARS && dataValues.length === 0) return [];
@@ -647,8 +842,15 @@ export function findJsonTextMatches(
     if (partialMatches.length > 0) return partialMatches.slice(0, limit);
   }
 
+  const hintKeys = relevantHintKeys(query, dataHints);
   const dataMatches = scanDataMatches(requests, dataValues, limit);
-  if (dataMatches.length > 0) return dataMatches;
+  const numericMatches =
+    hasFormattedNumber(query) || hintKeys.size > 0
+      ? scanNumericMatches(requests, query, hintKeys, limit)
+      : [];
+  if (numericMatches.length > 0 || dataMatches.length > 0) {
+    return mergeMatches(numericMatches, dataMatches, limit);
+  }
 
   if (query.length < MIN_QUERY_CHARS) return [];
   return scanReverse(requests, query);

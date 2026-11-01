@@ -104,7 +104,7 @@ describe('normalización de iniciadores', () => {
     });
   });
 
-  it('descarta marcos que no son http(s) y limita a 8', () => {
+  it('descarta marcos que no son http(s) y conserva toda la pila', () => {
     const frames = Array.from({ length: 12 }, (_, index) => ({
       functionName: `fn${index}`,
       url: index === 0 ? 'data:text/javascript,alert(1)' : `http://127.0.0.1:5173/s${index}.ts`,
@@ -112,8 +112,9 @@ describe('normalización de iniciadores', () => {
       columnNumber: index,
     }));
     const initiator = normalizeInitiator({ type: 'script', stack: { callFrames: frames } });
-    expect(initiator?.frames).toHaveLength(8);
+    expect(initiator?.frames).toHaveLength(11);
     expect(initiator?.frames[0]?.url).toBe('http://127.0.0.1:5173/s1.ts');
+    expect(initiator?.frames[10]?.url).toBe('http://127.0.0.1:5173/s11.ts');
   });
 
   it('marca la pila como asíncrona cuando hay padre y evita ciclos', () => {

@@ -13,6 +13,8 @@ import type { Logger } from '../logger';
 import type { BrowserController } from './controller';
 
 const MAX_ADDRESS_LENGTH = 2048;
+const MAX_SELECTOR_LENGTH = 2048;
+const MAX_HIGHLIGHT_KEY_LENGTH = 200;
 
 function unauthorized<T>(): IpcResult<T> {
   return {
@@ -44,6 +46,12 @@ interface SenderEvent {
 
 function isMainFrame(event: SenderEvent): boolean {
   return event.senderFrame !== null && event.senderFrame === event.sender.mainFrame;
+}
+
+function isInspectorUiSender(browser: BrowserController, event: SenderEvent): boolean {
+  return (
+    (browser.isPanelSender(event.sender) || browser.isMapSender(event.sender)) && isMainFrame(event)
+  );
 }
 
 export function registerBrowserWindowIpc(browser: BrowserController, logger: Logger): void {
@@ -110,7 +118,7 @@ export function registerBrowserWindowIpc(browser: BrowserController, logger: Log
   });
 
   ipcMain.on(BROWSER_PANEL_CHANNELS.selectRequest, (event, payload: unknown) => {
-    if (!browser.isPanelSender(event.sender) || !isMainFrame(event)) return;
+    if (!isInspectorUiSender(browser, event)) return;
     if (typeof payload !== 'string' || payload.length === 0 || payload.length > 200) return;
     try {
       browser.selectPanelRequest(payload);
@@ -122,13 +130,52 @@ export function registerBrowserWindowIpc(browser: BrowserController, logger: Log
   });
 
   ipcMain.on(BROWSER_PANEL_CHANNELS.setMode, (event, payload: unknown) => {
-    if (!browser.isPanelSender(event.sender) || !isMainFrame(event)) return;
+    if (!isInspectorUiSender(browser, event)) return;
     if (typeof payload !== 'string') return;
     if (!(INSPECTION_MODES as readonly string[]).includes(payload)) return;
     try {
       browser.selectPanelMode(payload as InspectionMode);
     } catch (error) {
       logger.error('Fallo al cambiar el modo de inspección', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  ipcMain.on(BROWSER_PANEL_CHANNELS.map, (event, payload: unknown) => {
+    if (!isInspectorUiSender(browser, event)) return;
+    if (typeof payload !== 'boolean') return;
+    try {
+      browser.setMapOpen(payload);
+    } catch (error) {
+      logger.error('Fallo al abrir o cerrar el mapa de flujo', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  ipcMain.on(BROWSER_PANEL_CHANNELS.highlight, (event, payload: unknown) => {
+    if (!browser.isMapSender(event.sender) || !isMainFrame(event)) return;
+    if (typeof payload !== 'object' || payload === null) return;
+    const record = payload as { key?: unknown; selector?: unknown };
+    const key =
+      record.key === null || record.key === undefined
+        ? null
+        : typeof record.key === 'string' && record.key.length <= MAX_HIGHLIGHT_KEY_LENGTH
+          ? record.key
+          : undefined;
+    if (key === undefined) return;
+    if (
+      typeof record.selector !== 'string' ||
+      record.selector === '' ||
+      record.selector.length > MAX_SELECTOR_LENGTH
+    ) {
+      return;
+    }
+    try {
+      browser.highlightFlowElement(key, record.selector);
+    } catch (error) {
+      logger.error('Fallo al resaltar el elemento del mapa en la página', {
         message: error instanceof Error ? error.message : String(error),
       });
     }

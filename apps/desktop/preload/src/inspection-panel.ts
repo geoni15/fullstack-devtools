@@ -671,7 +671,12 @@ function render(card: InspectionCard | null, runtime: InspectionRuntime): void {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  document.querySelectorAll<HTMLButtonElement>('.mode').forEach((button) => {
+  const openMap = (): void => {
+    ipcRenderer.send(BROWSER_PANEL_CHANNELS.map, true);
+  };
+  document.getElementById('map-toggle')?.addEventListener('click', openMap);
+  document.getElementById('map-mode')?.addEventListener('click', openMap);
+  document.querySelectorAll<HTMLButtonElement>('.mode[data-mode]').forEach((button) => {
     button.addEventListener('click', () => {
       const mode = button.dataset.mode;
       if (isMode(mode)) {

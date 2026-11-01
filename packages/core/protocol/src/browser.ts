@@ -160,6 +160,13 @@ export interface InspectionElement {
   ariaLabel: string | null;
   inputType: string | null;
   submitLike?: boolean;
+  key?: string | null;
+  selector?: string | null;
+  kind?: string | null;
+  href?: string | null;
+  formAction?: string | null;
+  formMethod?: string | null;
+  formKey?: string | null;
 }
 
 export type HandlerSource = 'listener' | 'react' | 'vue';
@@ -350,6 +357,9 @@ export const BROWSER_PANEL_CHANNELS = {
   data: 'browser-panel:data',
   selectRequest: 'browser-panel:select-request',
   setMode: 'browser-panel:set-mode',
+  map: 'browser-panel:map',
+  mapData: 'browser-panel:map-data',
+  highlight: 'browser-panel:highlight',
 } as const;
 
 export interface BrowserChromeState {

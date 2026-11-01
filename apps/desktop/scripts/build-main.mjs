@@ -43,6 +43,13 @@ await build({
   format: 'cjs',
 });
 
+await build({
+  ...commonOptions,
+  entryPoints: [path.join(appDir, 'preload', 'src', 'map.ts')],
+  outfile: path.join(appDir, 'dist', 'preload', 'map.cjs'),
+  format: 'cjs',
+});
+
 const grammarDir = path.join(appDir, 'dist', 'main', 'grammars');
 await mkdir(grammarDir, { recursive: true });
 const grammarFiles = [

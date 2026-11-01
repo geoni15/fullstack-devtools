@@ -17,8 +17,6 @@ export interface RawInitiator {
   stack?: RawStackTrace;
 }
 
-const MAX_FRAMES = 8;
-
 function isHttpUrl(value: string | undefined): value is string {
   if (value === undefined || value.length === 0) return false;
   return value.startsWith('http://') || value.startsWith('https://');
@@ -42,10 +40,9 @@ export function normalizeInitiator(raw: RawInitiator | null | undefined): Reques
   let stack = raw.stack;
   let async = false;
   const seen = new Set<RawStackTrace>();
-  while (stack !== undefined && frames.length < MAX_FRAMES && !seen.has(stack)) {
+  while (stack !== undefined && !seen.has(stack)) {
     seen.add(stack);
     for (const rawFrame of stack.callFrames ?? []) {
-      if (frames.length >= MAX_FRAMES) break;
       const frame = toFrame(rawFrame);
       if (frame !== null) frames.push(frame);
     }

@@ -18,6 +18,7 @@ import {
   type BrowserState,
   type BrowserTargetsRequest,
   type CapturedRequest,
+  type FlowMapState,
   type InspectionBackend,
   type InspectionCard,
   type InspectionCodeBlock,
@@ -39,8 +40,9 @@ import {
   type JsonTextMatch,
   type RawInitiator,
 } from '@bdt/network-capture';
-import type { StaticRoute, StaticSqlSite } from '@bdt/routes-index';
+import type { StaticRoute } from '@bdt/routes-index';
 import { analyzeSql } from '@bdt/sql-analyzer';
+import { createRootScope, type RootScope } from '../fs/root-guard';
 import type { Logger } from '../logger';
 import { AppLauncher, findFreeLoopbackPort, isUrlReachable } from '../process/app-launcher';
 import { parseAppLaunch, type LaunchProgram } from '../process/launch-command';
@@ -56,13 +58,36 @@ import {
   type InspectorHoverSignal,
   type InspectorSignal,
 } from './click-inspector';
+import { databaseHintLabel, pickDatabaseHint } from './database-hints';
 import { parseBrowserTargets } from './endpoints';
+import { buildFlowSnapshot } from './flow-graph';
+import { FlowLedger } from './flow-ledger';
+import { FlowMapWindow } from './flow-map-window';
 import { InspectionPanel } from './inspection-panel';
+import { InteractionLedger } from './interaction-ledger';
 import { NodeInspector, type SqlObservation } from './node-inspector';
+import {
+  INVENTORY_SCRIPT,
+  parseInventory,
+  type PageControl,
+  type PageElementRef,
+} from './page-inventory';
 import { BackendRouteIndex, type DatabaseHint } from './routes';
 import { readCodeBlock } from './source-snippet';
 import type { CapturedSqlExecution, SqlCaptureInfo } from './sql-capture';
+import type {
+  RuntimeDataInfo,
+  RuntimeFunctionInfo,
+  RuntimeProvenance,
+  RuntimeRenderInfo,
+  RuntimeRequestInfo,
+} from './runtime-provenance';
+import { RuntimeHandlerLedger } from './runtime-handler-ledger';
+import { RuntimeLinkLedger, type RuntimeLinkBasis } from './runtime-link-ledger';
+import { normalizeSqlText, staticQueriesForRoute } from './sql-queries';
+import { FRONTEND_FRAMEWORK_SCRIPT } from './stack-detection';
 import { BROWSER_CHROME_HTML } from './ui-html';
+import { WorkspaceSymbols, type ComponentSymbol } from './workspace-symbols';
 
 interface CdpRequestWillBeSent {
   requestId: string;
@@ -125,6 +150,7 @@ export interface BrowserControllerOptions {
   getWorkspaceRoot(): string | null;
   chromePreloadPath: string;
   panelPreloadPath: string;
+  mapPreloadPath: string;
 }
 
 const PARTITION = 'bdt-inspector';
@@ -136,6 +162,7 @@ const MIN_PANEL_WIDTH = 300;
 const MIN_HOST_WIDTH_FOR_PANEL = 640;
 const INSPECTION_WINDOW_MS = 3000;
 const INSPECTION_LEEWAY_MS = 150;
+const FLOW_REFRESH_MS = 1000;
 const MAX_BACKEND_CODE_LINES = 80;
 const MAX_ACTIVITY_DETAIL = 600;
 const MAX_BODY_CHARS = 16000;
@@ -157,6 +184,32 @@ function withTimeout<T>(command: Promise<T>, label: string): Promise<T> {
       },
     );
   });
+}
+
+function inventorySignature(controls: readonly PageControl[]): string {
+  let hash = 0x811c9dc5;
+  for (const control of controls) {
+    const text = [
+      control.key,
+      control.kind,
+      control.visible ? '1' : '0',
+      control.disabled ? '1' : '0',
+      control.text ?? '',
+      control.ariaLabel ?? '',
+      control.href ?? '',
+      control.formAction ?? '',
+      control.formMethod ?? '',
+      control.formKey ?? '',
+      control.handlers.map((hint) => `${hint.event}:${hint.source}:${hint.name ?? ''}`).join(','),
+    ].join('\u0000');
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    hash ^= 0x0a;
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${String(controls.length)}:${(hash >>> 0).toString(16)}`;
 }
 
 function idleState(config: BrowserConfig | null = null, inspectionEnabled = true): BrowserState {
@@ -182,6 +235,10 @@ function stripQuery(value: string): string {
   return index === -1 ? value : value.slice(0, index);
 }
 
+function normalizedSourceText(value: string | null): string {
+  return value === null ? '' : value.replace(/[^a-z0-9]/gi, '').toLowerCase();
+}
+
 function hasJsonContentType(headers: Record<string, string> | undefined): boolean {
   if (headers === undefined) return false;
   for (const [name, value] of Object.entries(headers)) {
@@ -196,11 +253,6 @@ function addEvidence(card: InspectionCard, evidence: 'RUNTIME' | 'STATIC'): void
   if (!card.evidence.includes(evidence)) {
     card.evidence.push(evidence);
   }
-}
-
-function joinNotes(notes: ReadonlyArray<string | null>): string | null {
-  const parts = notes.filter((note): note is string => note !== null && note !== '');
-  return parts.length === 0 ? null : parts.join(' · ');
 }
 
 const REQUEST_ORIGIN_LABEL: Record<CapturedRequest['origin'], string> = {
@@ -227,10 +279,6 @@ function sameProgram(first: LaunchProgram, second: LaunchProgram): boolean {
     return first.npm.script === second.npm.script && first.npm.cwdPath === second.npm.cwdPath;
   }
   return false;
-}
-
-function normalizeSqlText(sql: string): string {
-  return sql.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
 function sqlOperationFromText(sql: string): InspectionSqlQuery['operation'] {
@@ -284,18 +332,62 @@ interface ExtractedRequest {
   source: string;
 }
 
+interface RuntimeLink {
+  framework: 'react' | 'vue' | null;
+  render: RuntimeRenderInfo | null;
+  renderFile: string | null;
+  renderLine: string | null;
+  renderSymbol: ComponentSymbol | null;
+  functions: RuntimeFunctionInfo[];
+  data: RuntimeDataInfo | null;
+  entries: RuntimeDataInfo[];
+  requestInfo: RuntimeRequestInfo | null;
+  request: CapturedRequest | null;
+  route: StaticRoute | null;
+  database: DatabaseHint | null;
+  note: string | null;
+}
+
 interface HoverTextProvenance {
   query: string | null;
   matches: JsonTextMatch[];
   request: CapturedRequest | null;
   route: StaticRoute | null;
   database: DatabaseHint | null;
+  runtime: RuntimeLink | null;
 }
 
 function shortFunctionSource(url: string): string {
   if (url === '') return '(inline)';
   const clean = url.replace(/^https?:\/\/[^/]+/i, '');
   return clean.length > 90 ? `…${clean.slice(-90)}` : clean;
+}
+
+const RUNTIME_SOURCE_DIRS = [
+  'frontend',
+  'client',
+  'web',
+  'app',
+  'ui',
+  'renderer',
+  'desktop',
+  'apps/frontend',
+  'apps/client',
+  'apps/web',
+  'apps/app',
+  'packages/frontend',
+  'packages/client',
+  'packages/web',
+  'packages/ui',
+  'packages/app',
+];
+
+function runtimeSourcePrefixes(): string[] {
+  const prefixes: string[] = ['', 'src/'];
+  for (const dir of RUNTIME_SOURCE_DIRS) {
+    prefixes.push(`${dir}/`, `${dir}/src/`);
+  }
+  return prefixes;
 }
 
 function jsonMatchNote(match: JsonTextMatch): string {
@@ -307,36 +399,20 @@ function jsonMatchNote(match: JsonTextMatch): string {
   return notes.length === 0 ? '' : ` (${notes.join(', ')})`;
 }
 
-function databaseHintLabel(hint: DatabaseHint): string {
-  const engine = hint.engine ?? 'motor no declarado';
-  const database =
-    hint.database === null
-      ? 'nombre no declarado'
-      : `${hint.database}${hint.fallback ? ' (valor por defecto)' : ''}`;
-  return `${engine} · ${database} · ${hint.file}`;
-}
-
-function topSegment(file: string): string {
-  const index = file.indexOf('/');
-  return index === -1 ? '' : file.slice(0, index);
-}
-
-function pickDatabaseHint(
-  hints: readonly DatabaseHint[],
-  routeFile: string | null,
-): DatabaseHint | null {
-  const first = hints[0];
-  if (first === undefined) return null;
-  if (routeFile === null) return first;
-  const root = topSegment(routeFile);
-  return (
-    hints.find(
-      (hint) => topSegment(hint.file) === root && hint.database !== null && !hint.fallback,
-    ) ??
-    hints.find((hint) => topSegment(hint.file) === root && hint.database !== null) ??
-    hints.find((hint) => topSegment(hint.file) === root) ??
-    first
-  );
+function displayNumbers(value: string): number[] {
+  const cleaned = value.replace(/[^\d.,-]/g, '');
+  if (cleaned === '' || !/\d/.test(cleaned)) return [];
+  const variants = new Set<string>([
+    cleaned.replace(/,/g, ''),
+    cleaned.replace(/\./g, '').replace(/,/g, '.'),
+    cleaned.replace(/[.,]/g, ''),
+  ]);
+  const result: number[] = [];
+  for (const variant of variants) {
+    const number = Number(variant);
+    if (Number.isFinite(number)) result.push(number);
+  }
+  return result;
 }
 
 function formatClock(at: number): string {
@@ -377,6 +453,17 @@ function hoverStyleGroup(element: HoverElementInfo, names: readonly string[]): s
     if (value !== null) parts.push(`${name}: ${value}`);
   }
   return parts.length === 0 ? null : parts.join(' · ');
+}
+
+function jsonParentCode(match: JsonTextMatch, request: CapturedRequest | null): HoverTipCode {
+  const parentLines = match.parent.split('\n');
+  return {
+    file: `${match.origin === 'response' ? 'respuesta' : 'enviado'} JSON${
+      request !== null ? ` · ${request.method} ${request.path}` : ''
+    }`,
+    range: `${match.parentPath}${match.parentTruncated ? ' · recortado' : ''}`,
+    lines: parentLines.map((text, index) => ({ line: index + 1, text })),
+  };
 }
 
 function toHoverCode(block: InspectionCodeBlock | null): HoverTipCode | null {
@@ -498,8 +585,15 @@ export class BrowserController {
   private hoverProvenanceCache: { key: string; at: number; value: HoverTextProvenance } | null =
     null;
   private readonly hoverBackendCodeCache = new Map<string, { at: number; value: BackendSource }>();
+  private readonly runtimeFileCache = new Map<string, string | null>();
+  private readonly symbols = new WorkspaceSymbols(() => this.options.getWorkspaceRoot());
+  private readonly runtimeSourceCache = new Map<
+    string,
+    { at: number; value: { file: string | null; line: string | null; snippet: string | null } }
+  >();
   private cdpClockOffsetMs: number | null = null;
   private panelView: WebContentsView | null = null;
+  private readonly mapWindow: FlowMapWindow;
   private panelRuntime: InspectionRuntime = { ...OFF_RUNTIME };
   private runtime: NodeInspector | null = null;
   private frontendLauncher: AppLauncher | null = null;
@@ -512,6 +606,29 @@ export class BrowserController {
   private lastRuntimeStatus: string | null = null;
   private readonly runtimeSqlActivitySeen = new Set<string>();
   private sqlRuntimeSequence = 0;
+  private readonly flowLedger = new FlowLedger();
+  private readonly flowInteractions = new InteractionLedger();
+  private readonly runtimeLinks = new RuntimeLinkLedger();
+  private readonly runtimeHandlers = new RuntimeHandlerLedger();
+  private readonly autoResolved = new Set<string>();
+  private autoResolveTimer: ReturnType<typeof setTimeout> | null = null;
+  private autoResolveRunning = false;
+  private autoResolveWanted = false;
+  private autoResolveGeneration = 0;
+  private inventory: PageControl[] = [];
+  private inventoryKey = '';
+  private inventoryTimer: ReturnType<typeof setTimeout> | null = null;
+  private flowState: FlowMapState = { open: false, building: false, error: null, snapshot: null };
+  private mapOpen = false;
+  private flowRevision = 0;
+  private flowDirty = false;
+  private flowTimer: ReturnType<typeof setTimeout> | null = null;
+  private flowBuilding = false;
+  private flowGeneration = 0;
+  private frontendFramework: string | null = null;
+  private frontendFrameworkUrl: string | null = null;
+  private frontendDetection: Promise<string | null> | null = null;
+  private frontendDetectionUrl: string | null = null;
 
   constructor(
     private readonly getWindow: () => BrowserWindow | null,
@@ -520,6 +637,9 @@ export class BrowserController {
   ) {
     this.state = idleState();
     this.panel = new InspectionPanel(options.panelPreloadPath, log);
+    this.mapWindow = new FlowMapWindow(options.mapPreloadPath, log, () => {
+      this.handleMapWindowClosed();
+    });
     this.routes = new BackendRouteIndex(() => this.options.getWorkspaceRoot(), log);
   }
 
@@ -843,6 +963,13 @@ export class BrowserController {
     this.state = { ...this.state, requestCount: 0 };
     this.send({ type: 'requests-cleared' });
     this.clearActivity();
+    this.flowLedger.clear();
+    this.flowInteractions.clear();
+    this.runtimeLinks.clear();
+    this.runtimeHandlers.clear();
+    this.resetAutoResolve();
+    this.markFlowDirty();
+    this.scheduleAutoResolve();
     this.emitState();
     return { ...this.state };
   }
@@ -859,6 +986,7 @@ export class BrowserController {
     this.state = { ...this.state, inspectionEnabled: enabled };
     this.inspector?.setEnabled(enabled);
     if (!enabled) {
+      this.setMapOpen(false);
       this.dismissCard();
     } else {
       this.updatePanel(this.inspectionSession?.card ?? null);
@@ -893,11 +1021,15 @@ export class BrowserController {
 
   handleWorkspaceChanged(): void {
     this.hoverProvenanceCache = null;
+    this.runtimeFileCache.clear();
+    this.runtimeSourceCache.clear();
+    this.symbols.invalidate();
     this.routes.invalidate();
     void this.routes
       .refresh()
       .then(() => {
         this.syncInspectorRoutes();
+        this.markFlowDirty();
       })
       .catch(() => undefined);
   }
@@ -911,6 +1043,10 @@ export class BrowserController {
     return this.panel.isSender(sender);
   }
 
+  isMapSender(sender: WebContents): boolean {
+    return this.mapWindow.isSender(sender);
+  }
+
   handleChromeReady(sender: WebContents): void {
     if (!this.isChromeSender(sender)) return;
     this.chromeReady = true;
@@ -918,8 +1054,372 @@ export class BrowserController {
   }
 
   handlePanelReady(sender: WebContents): void {
+    if (this.mapWindow.handleReady(sender)) {
+      this.mapWindow.updateMap(this.flowState);
+      return;
+    }
     if (!this.panel.handleReady(sender)) return;
     this.updatePanel(this.inspectionSession?.card ?? null);
+  }
+
+  highlightFlowElement(key: string | null, selector: string): void {
+    this.inspector?.highlightRef(key, selector);
+  }
+
+  private handleMapWindowClosed(): void {
+    if (!this.mapOpen) return;
+    this.setMapOpen(false);
+  }
+
+  setMapOpen(open: boolean): void {
+    if (open === this.mapOpen) {
+      if (open) this.mapWindow.focus();
+      return;
+    }
+    if (open) {
+      if (!this.state.inspectionEnabled || this.view === null) {
+        return;
+      }
+      this.mapOpen = true;
+      this.cancelHover();
+      this.flowState = {
+        open: true,
+        building: true,
+        error: null,
+        snapshot: this.flowState.snapshot,
+      };
+      this.mapWindow.open();
+      this.mapWindow.updateMap(this.flowState);
+      void this.refreshMap(true).finally(() => {
+        this.scheduleAutoResolve();
+      });
+      return;
+    }
+    this.mapOpen = false;
+    this.mapWindow.close();
+    this.stopAutoResolve();
+    this.flowGeneration += 1;
+    this.flowBuilding = false;
+    this.flowDirty = false;
+    if (this.flowTimer !== null) {
+      clearTimeout(this.flowTimer);
+      this.flowTimer = null;
+    }
+    if (this.inventoryTimer !== null) {
+      clearTimeout(this.inventoryTimer);
+      this.inventoryTimer = null;
+    }
+    this.flowState = {
+      open: false,
+      building: false,
+      error: null,
+      snapshot: this.flowState.snapshot,
+    };
+    this.updatePanel(this.inspectionSession?.card ?? null);
+    this.inspector?.refreshHover();
+  }
+
+  private markFlowDirty(): void {
+    if (!this.mapOpen) return;
+    this.flowDirty = true;
+    this.scheduleFlowRefresh();
+  }
+
+  private scheduleFlowRefresh(): void {
+    if (!this.mapOpen || this.flowTimer !== null) return;
+    this.flowTimer = setTimeout(() => {
+      this.flowTimer = null;
+      void this.refreshMap(false);
+    }, FLOW_REFRESH_MS);
+  }
+
+  private async refreshMap(refreshRoutes: boolean): Promise<void> {
+    if (!this.mapOpen) return;
+    if (this.flowBuilding) {
+      this.flowDirty = true;
+      this.scheduleFlowRefresh();
+      return;
+    }
+    const generation = ++this.flowGeneration;
+    this.flowBuilding = true;
+    this.flowDirty = false;
+    this.flowState = { ...this.flowState, open: true, building: true, error: null };
+    this.mapWindow.updateMap(this.flowState);
+    try {
+      if (refreshRoutes) {
+        this.routes.invalidate();
+        await Promise.all([
+          this.routes.refresh(),
+          this.ensureFrontendFramework(),
+          this.refreshInventory(false),
+        ]);
+        this.syncInspectorRoutes();
+      }
+      if (generation !== this.flowGeneration || !this.mapOpen) return;
+      const started = Date.now();
+      const snapshot = buildFlowSnapshot({
+        traces: this.flowLedger.all(),
+        requests: this.buffer?.all() ?? [],
+        routes: this.routes.all(),
+        databases: this.routes.databases(),
+        revision: ++this.flowRevision,
+        frontend: this.frontendFramework,
+        workspaceOpen: this.options.getWorkspaceRoot() !== null,
+        inventory: this.inventory,
+        interactions: this.flowInteractions.summariesAll(),
+        references: this.flowInteractions.referencesAll(),
+        occurrences: this.flowInteractions.occurrenceList(),
+        runtimeLinks: this.runtimeLinks.all(),
+        runtimeHandlers: this.runtimeHandlers.all(),
+      });
+      if (generation !== this.flowGeneration || !this.mapOpen) return;
+      this.flowState = { open: true, building: false, error: null, snapshot };
+      this.mapWindow.updateMap(this.flowState);
+      this.log.info('Mapa de flujo construido', {
+        ms: Date.now() - started,
+        nodes: snapshot.nodes.length,
+        edges: snapshot.edges.length,
+        clicks: snapshot.stats.clicks,
+        interactions: snapshot.stats.interactions,
+        controls: snapshot.stats.controls,
+        requests: snapshot.stats.requests,
+      });
+    } catch (error) {
+      if (generation !== this.flowGeneration || !this.mapOpen) return;
+      this.flowState = {
+        ...this.flowState,
+        open: true,
+        building: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      this.mapWindow.updateMap(this.flowState);
+      this.log.warn('No se pudo construir el mapa de flujo', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      if (generation === this.flowGeneration) {
+        this.flowBuilding = false;
+        if (this.flowDirty && this.mapOpen) {
+          this.flowDirty = false;
+          this.scheduleFlowRefresh();
+        }
+      }
+    }
+  }
+
+  private resetFlow(): void {
+    this.mapOpen = false;
+    this.flowGeneration += 1;
+    this.flowBuilding = false;
+    this.flowDirty = false;
+    if (this.flowTimer !== null) {
+      clearTimeout(this.flowTimer);
+      this.flowTimer = null;
+    }
+    if (this.inventoryTimer !== null) {
+      clearTimeout(this.inventoryTimer);
+      this.inventoryTimer = null;
+    }
+    this.flowLedger.clear();
+    this.flowInteractions.clear();
+    this.runtimeLinks.clear();
+    this.runtimeHandlers.clear();
+    this.resetAutoResolve();
+    this.inventory = [];
+    this.inventoryKey = '';
+    this.frontendFramework = null;
+    this.frontendFrameworkUrl = null;
+    this.frontendDetection = null;
+    this.frontendDetectionUrl = null;
+    this.flowState = { open: false, building: false, error: null, snapshot: null };
+    this.mapWindow.updateMap(this.flowState);
+  }
+
+  private scheduleInventoryRefresh(delay = 800): void {
+    if (!this.mapOpen || this.inventoryTimer !== null) return;
+    this.inventoryTimer = setTimeout(() => {
+      this.inventoryTimer = null;
+      void this.refreshInventory();
+    }, delay);
+  }
+
+  private async refreshInventory(schedule = true): Promise<void> {
+    const view = this.view;
+    if (view === null || view.webContents.isDestroyed()) return;
+    if (!this.state.connected || !this.state.inspectionEnabled) return;
+    const contents = view.webContents;
+    let url: string;
+    try {
+      url = contents.getURL();
+    } catch (error) {
+      void error;
+      return;
+    }
+    if (!url.startsWith('http://') && !url.startsWith('https://')) return;
+    try {
+      const result = await contents.executeJavaScript(INVENTORY_SCRIPT);
+      if (this.view?.webContents !== contents) return;
+      const controls = parseInventory(result);
+      const signature = inventorySignature(controls);
+      const changed = signature !== this.inventoryKey;
+      this.inventory = controls;
+      this.inventoryKey = signature;
+      if (changed && schedule) {
+        this.markFlowDirty();
+        this.scheduleAutoResolve();
+      }
+    } catch (error) {
+      this.log.debug('No se pudo inventariar los controles de la página', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private resetAutoResolve(): void {
+    this.autoResolved.clear();
+    this.autoResolveWanted = false;
+    this.stopAutoResolve();
+  }
+
+  private stopAutoResolve(): void {
+    this.autoResolveGeneration += 1;
+    this.autoResolveWanted = false;
+    if (this.autoResolveTimer !== null) {
+      clearTimeout(this.autoResolveTimer);
+      this.autoResolveTimer = null;
+    }
+  }
+
+  private scheduleAutoResolve(delay = 600): void {
+    if (!this.mapOpen || !this.state.connected || !this.state.inspectionEnabled) return;
+    if (this.autoResolveRunning) {
+      this.autoResolveWanted = true;
+      return;
+    }
+    if (this.autoResolveTimer !== null) return;
+    const generation = this.autoResolveGeneration;
+    this.autoResolveTimer = setTimeout(() => {
+      this.autoResolveTimer = null;
+      if (generation !== this.autoResolveGeneration) return;
+      void this.runAutoResolve();
+    }, delay);
+  }
+
+  private async runAutoResolve(): Promise<void> {
+    if (this.autoResolveRunning || !this.mapOpen) return;
+    const inspector = this.inspector;
+    if (inspector === null) return;
+    const generation = this.autoResolveGeneration;
+    this.autoResolveRunning = true;
+    try {
+      while (this.mapOpen && generation === this.autoResolveGeneration) {
+        const ref = this.nextAutoResolveRef();
+        if (ref === null) break;
+        this.autoResolved.add(ref.key);
+        let resolution: HoverResolution | null = null;
+        try {
+          resolution = await inspector.resolveRef(ref, true);
+        } catch (error) {
+          this.log.debug('No se pudo resolver el control indexado', {
+            message: error instanceof Error ? error.message : String(error),
+            element: ref.selector,
+          });
+        }
+        if (!this.mapOpen || generation !== this.autoResolveGeneration) break;
+        if (resolution !== null) {
+          this.recordRuntimeResolution(resolution.element, resolution.handler, true);
+        }
+      }
+    } finally {
+      this.autoResolveRunning = false;
+      if (this.autoResolveWanted && this.mapOpen) {
+        this.autoResolveWanted = false;
+        this.scheduleAutoResolve(200);
+      }
+    }
+  }
+
+  private nextAutoResolveRef(): PageElementRef | null {
+    for (const control of this.inventory) {
+      if (this.autoResolved.has(control.key)) continue;
+      if (control.kind === 'page' || control.selector === '' || control.selector === 'document') {
+        continue;
+      }
+      return control;
+    }
+    for (const ref of this.flowInteractions.referencesAll()) {
+      if (this.autoResolved.has(ref.key)) continue;
+      if (ref.kind === 'page' || ref.selector === '' || ref.selector === 'document') continue;
+      return ref;
+    }
+    return null;
+  }
+
+  private handlePageChanged(): void {
+    this.inventory = [];
+    this.inventoryKey = '';
+    this.runtimeHandlers.clear();
+    this.resetAutoResolve();
+    this.markFlowDirty();
+    if (this.mapOpen) this.scheduleInventoryRefresh(0);
+  }
+
+  private async ensureFrontendFramework(): Promise<string | null> {
+    const contents = this.view?.webContents;
+    if (contents === undefined || contents.isDestroyed()) return null;
+    let url: string;
+    try {
+      url = contents.getURL();
+    } catch (error) {
+      this.log.debug('No se pudo leer la URL para detectar el frontend', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+    if (url === '' || url === 'about:blank') return null;
+    if (url === this.frontendFrameworkUrl) return this.frontendFramework;
+    if (this.frontendDetection !== null && this.frontendDetectionUrl === url) {
+      return this.frontendDetection;
+    }
+    const detection = this.detectFrontendFramework(contents, url);
+    this.frontendDetection = detection;
+    this.frontendDetectionUrl = url;
+    try {
+      return await detection;
+    } finally {
+      if (this.frontendDetection === detection) {
+        this.frontendDetection = null;
+        this.frontendDetectionUrl = null;
+      }
+    }
+  }
+
+  private async detectFrontendFramework(
+    contents: WebContents,
+    url: string,
+  ): Promise<string | null> {
+    try {
+      const result = await Promise.race([
+        contents.executeJavaScript(FRONTEND_FRAMEWORK_SCRIPT),
+        new Promise<null>((resolve) => {
+          setTimeout(() => resolve(null), 1500);
+        }),
+      ]);
+      if (this.view?.webContents !== contents) return this.frontendFramework;
+      const label = typeof result === 'string' ? result.trim().slice(0, 40) : '';
+      this.frontendFramework = label === '' ? null : label;
+      this.frontendFrameworkUrl = url;
+      this.markFlowDirty();
+      return this.frontendFramework;
+    } catch (error) {
+      if (this.view?.webContents !== contents) return this.frontendFramework;
+      this.frontendFramework = null;
+      this.frontendFrameworkUrl = url;
+      this.log.debug('No se pudo detectar el framework frontend', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
   }
 
   navigateFromChrome(sender: WebContents, rawInput: string): void {
@@ -1027,6 +1527,7 @@ export class BrowserController {
   }
 
   dispose(): void {
+    this.mapWindow.close();
     this.teardownConnection();
     this.window = null;
   }
@@ -1174,10 +1675,16 @@ export class BrowserController {
       };
       this.emitState();
     });
+    contents.on('did-finish-load', () => {
+      if (!isCurrent()) return;
+      this.handlePageChanged();
+      void this.ensureFrontendFramework();
+    });
     contents.on('did-navigate', (_event, url) => {
       if (!isCurrent()) return;
       const masked = maskUrl(url);
       this.state = { ...this.state, currentUrl: masked, error: null };
+      this.handlePageChanged();
       this.recordActivity({
         category: 'frontend',
         title: 'Navegación de la página',
@@ -1265,7 +1772,7 @@ export class BrowserController {
       await withTimeout(target.sendCommand('Network.enable'), 'Network.enable');
       await withTimeout(target.sendCommand('Debugger.enable'), 'Debugger.enable');
       await target.sendCommand('Debugger.setSkipAllPauses', { skip: true });
-      await target.sendCommand('Debugger.setAsyncCallStackDepth', { maxDepth: 8 });
+      await target.sendCommand('Debugger.setAsyncCallStackDepth', { maxDepth: 2147483647 });
       this.log.debug('Captura CDP activa');
     } catch (error) {
       if (target.isAttached()) target.detach();
@@ -1315,6 +1822,20 @@ export class BrowserController {
     if (signal.kind === 'hover-end') {
       this.cancelHover();
       return;
+    }
+    if (signal.kind === 'dom-changed') {
+      this.scheduleInventoryRefresh();
+      return;
+    }
+    if (signal.kind === 'interaction') {
+      if (!this.state.connected || !this.state.inspectionEnabled) return;
+      this.flowInteractions.record(signal.ref, signal.event, signal.at);
+      this.markFlowDirty();
+      return;
+    }
+    if (this.state.connected && this.state.inspectionEnabled && signal.ref !== null) {
+      this.flowInteractions.record(signal.ref, signal.kind, signal.at, signal.submitter);
+      this.markFlowDirty();
     }
     const element = signal.element;
     const label = element.text === null ? '' : ` «${shorten(element.text, 80)}»`;
@@ -1450,8 +1971,10 @@ export class BrowserController {
       return;
     }
     let tip: HoverTipData;
+    let resolved = false;
     try {
       tip = this.buildHoverTip(mode, signal, resolution);
+      resolved = true;
     } catch (error) {
       this.log.error('No se pudo construir la información del modo de inspección', {
         mode,
@@ -1462,6 +1985,99 @@ export class BrowserController {
       tip.footer = 'No se pudo resolver la procedencia; revisa el registro.';
     }
     inspector.showTooltip(tip);
+    if (resolved && mode !== 'html') {
+      this.recordRuntimeResolution(resolution.element, resolution.handler, false);
+    }
+  }
+
+  private recordRuntimeResolution(
+    element: HoverElementInfo,
+    handler: InspectionHandler | null,
+    auto: boolean,
+  ): void {
+    const ref = element.ref;
+    if (ref === null) return;
+    try {
+      if (!this.state.connected || !this.state.inspectionEnabled) return;
+      const handlerChanged =
+        handler === null
+          ? false
+          : this.runtimeHandlers.record({
+              element: ref,
+              event: handler.event,
+              name: handler.name,
+              url: handler.url,
+              line: handler.line,
+              column: handler.column,
+              source: handler.source,
+              note: handler.note,
+              at: Date.now(),
+            });
+      const provenance = this.hoverProvenance(element);
+      const runtime = provenance.runtime;
+      const request = provenance.request;
+      const route = provenance.route;
+      if (runtime === null && request === null && route === null) {
+        if (handlerChanged) {
+          this.markFlowDirty();
+          this.log.debug('Manejador resuelto registrado para el mapa', {
+            element: ref.text === null ? ref.tag : ref.text.slice(0, 60),
+            handler: handler?.name ?? null,
+            auto,
+          });
+        }
+        return;
+      }
+      const requestInfo = runtime?.requestInfo ?? null;
+      const identity = (runtime !== null && runtime.request !== null) || requestInfo !== null;
+      const render = runtime?.render ?? element.runtime?.renderSources[0] ?? null;
+      const entry = runtime?.data ?? runtime?.entries[0] ?? null;
+      const match = provenance.matches[0] ?? null;
+      const basis: RuntimeLinkBasis = identity
+        ? 'identity'
+        : request !== null || match !== null
+          ? 'content'
+          : 'render';
+      const method = request?.method ?? requestInfo?.method ?? route?.method ?? null;
+      const requestPath = request?.path ?? requestInfo?.path ?? route?.path ?? null;
+      const changed = this.runtimeLinks.record({
+        element: ref,
+        requestId: request?.id ?? null,
+        method,
+        path: requestPath,
+        route:
+          route === null
+            ? null
+            : {
+                method: route.method,
+                path: route.path,
+                file: route.file,
+                routeLine: route.routeLine,
+              },
+        basis,
+        component: render?.component ?? element.runtime?.functions[0]?.name ?? null,
+        file: runtime?.renderFile ?? render?.file ?? runtime?.renderSymbol?.file ?? null,
+        line: render?.line ?? runtime?.renderSymbol?.line ?? null,
+        code: render?.code ?? null,
+        dataPath: entry?.path ?? match?.jsonPath ?? null,
+        value: entry?.value ?? match?.value ?? null,
+        at: Date.now(),
+      });
+      if (!changed && !handlerChanged) return;
+      this.markFlowDirty();
+      this.log.debug('Cadena de procedencia registrada para el mapa', {
+        element: ref.text === null ? ref.tag : ref.text.slice(0, 60),
+        auto,
+        basis,
+        request: method === null ? null : `${method} ${requestPath ?? ''}`.trim(),
+        component: render?.component ?? null,
+        handler: handler?.name ?? null,
+      });
+    } catch (error) {
+      this.log.debug('No se pudo registrar la procedencia del hover para el mapa', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private buildHoverTip(
@@ -1509,30 +2125,60 @@ export class BrowserController {
   private hoverProvenance(element: HoverElementInfo): HoverTextProvenance {
     const query = element.text;
     const count = this.buffer?.count ?? 0;
-    const dataValues = element.dataValues.map((entry) => entry.value);
-    const key = `${query ?? ''}\u0000${String(count)}\u0000${dataValues.join('\u0001')}`;
+    const runtime = this.runtimeLink(element);
+    const runtimeHasData = runtime !== null && runtime.entries.length > 0;
+    const dataValues = runtimeHasData ? [] : element.dataValues.map((entry) => entry.value);
+    const dataHints = runtimeHasData
+      ? []
+      : element.dataValues.map((entry) => ({
+          value: entry.value,
+          path: entry.path,
+        }));
+    const runtimeSignature =
+      element.runtime === null
+        ? ''
+        : [
+            element.runtime.render === null
+              ? ''
+              : `${element.runtime.render.file ?? ''}:${String(element.runtime.render.line ?? '')}`,
+            element.runtime.data
+              .map(
+                (entry) =>
+                  `${entry.requestKey}|${entry.path}|${entry.jsonPath}|${entry.value}|${entry.kind}`,
+              )
+              .join('\u0002'),
+          ].join('\u0003');
+    const key = `${query ?? ''}\u0000${String(count)}\u0000${runtimeSignature}\u0000${dataHints
+      .map((hint) => `${hint.path}\u0002${hint.value}`)
+      .join('\u0001')}`;
     const cached = this.hoverProvenanceCache;
     if (cached !== null && cached.key === key && Date.now() - cached.at < 1200) {
       return cached.value;
     }
 
-    const matches =
-      query === null && dataValues.length === 0
+    const matches = runtimeHasData
+      ? []
+      : query === null && dataValues.length === 0
         ? []
-        : findJsonTextMatches(this.buffer?.all() ?? [], query ?? '', 5, dataValues);
+        : findJsonTextMatches(this.buffer?.all() ?? [], query ?? '', 5, dataValues, dataHints);
     const first = matches[0];
-    const request = first === undefined ? null : (this.buffer?.get(first.requestId) ?? null);
+    const matchRequest = first === undefined ? null : (this.buffer?.get(first.requestId) ?? null);
+    const request = runtime?.request ?? matchRequest;
     const route =
-      request === null ? null : this.routes.match(request.method, stripQuery(request.path));
+      runtime?.route ??
+      (request === null ? null : this.routes.match(request.method, stripQuery(request.path)));
     const value: HoverTextProvenance = {
       query,
       matches,
       request,
       route,
-      database: pickDatabaseHint(this.routes.databases(), route?.file ?? null),
+      database: runtime?.database ?? pickDatabaseHint(this.routes.databases(), route?.file ?? null),
+      runtime,
     };
     this.log.debug('Procedencia del texto bajo el mouse', {
       text: query === null ? null : query.slice(0, 80),
+      runtimeRender: runtime === null || runtime.render === null ? null : runtime.render.component,
+      runtimeData: runtime === null ? 0 : runtime.entries.length,
       dataValues: dataValues.length,
       matches: matches.length,
       basis: first?.basis ?? null,
@@ -1542,6 +2188,282 @@ export class BrowserController {
     });
     this.hoverProvenanceCache = { key, at: Date.now(), value };
     return value;
+  }
+
+  private runtimeLink(element: HoverElementInfo): RuntimeLink | null {
+    const runtime = element.runtime;
+    if (runtime === null) return null;
+    if (runtime.data.length === 0 && runtime.render === null && runtime.functions.length === 0) {
+      return null;
+    }
+    const source = this.runtimeRenderContext(runtime.render, runtime.renderSources);
+    const symbolBody = this.runtimeSymbolBody(runtime);
+    const renderSymbol = this.runtimeRenderSymbol(runtime);
+    const renderText = normalizedSourceText(source.snippet);
+    const symbolText = normalizedSourceText(symbolBody);
+    const scored = runtime.data
+      .map((entry) => ({
+        entry,
+        score: this.runtimeDataScore(entry, element.text, renderText, symbolText),
+      }))
+      .sort((left, right) => right.score - left.score);
+    const ranked = scored.map((item) => item.entry);
+    const tied =
+      scored.length > 1 &&
+      scored[0] !== undefined &&
+      scored[1] !== undefined &&
+      scored[0].score === scored[1].score;
+    const data = ranked[0] ?? null;
+    const requestInfo =
+      data === null
+        ? null
+        : (runtime.requests.find((entry) => entry.key === data.requestKey) ?? null);
+    const request = requestInfo === null ? null : this.findRuntimeRequest(requestInfo);
+    const method = request === null ? (requestInfo?.method ?? null) : request.method;
+    const requestPath = request === null ? (requestInfo?.path ?? null) : stripQuery(request.path);
+    const route =
+      method === null || requestPath === null
+        ? null
+        : this.routes.match(method, stripQuery(requestPath));
+    return {
+      framework: runtime.framework,
+      render: runtime.render,
+      renderFile: source.file,
+      renderLine: source.line,
+      renderSymbol,
+      functions: runtime.functions,
+      data: data === null || data.kind === 'object' ? null : data,
+      entries: ranked,
+      requestInfo,
+      request,
+      route,
+      database: pickDatabaseHint(this.routes.databases(), route?.file ?? null),
+      note:
+        runtime.note ??
+        (tied
+          ? 'Varios campos del componente coinciden con el texto; se muestran todas las alternativas.'
+          : null),
+    };
+  }
+
+  private runtimeSymbolBody(runtime: RuntimeProvenance): string | null {
+    if (runtime.framework !== 'react') return null;
+    const parts: string[] = [];
+    const seen = new Set<string>();
+    for (const entry of runtime.functions) {
+      if (seen.has(entry.name)) continue;
+      seen.add(entry.name);
+      const symbol = this.symbols.find(entry.name);
+      if (symbol !== null) parts.push(symbol.body);
+    }
+    return parts.length > 0 ? parts.join('\n') : null;
+  }
+
+  private runtimeRenderSymbol(runtime: RuntimeProvenance): ComponentSymbol | null {
+    if (runtime.framework !== 'react') return null;
+    const primary = runtime.render?.component ?? runtime.functions[0]?.name ?? null;
+    if (primary === null) return null;
+    return this.symbols.find(primary);
+  }
+
+  private runtimeDataScore(
+    entry: RuntimeDataInfo,
+    text: string | null,
+    renderSource: string,
+    symbolSource: string,
+  ): number {
+    let score = entry.kind === 'number' ? 6 : entry.kind === 'text' ? 5 : 0;
+    const leaf = /([A-Za-z_$][\w$]*)\s*\]?\s*$/.exec(entry.path)?.[1] ?? '';
+    const normalizedLeaf = leaf.replace(/[^a-z0-9]/gi, '').toLowerCase();
+    if (normalizedLeaf.length >= 3) {
+      if (renderSource.includes(normalizedLeaf)) score += 1000;
+      if (symbolSource.includes(normalizedLeaf)) score += 100;
+    }
+    if (text === null || text === '') return score;
+    if (entry.value !== '' && text.toLowerCase().includes(entry.value.toLowerCase())) score += 4;
+    const normalizedText = text.replace(/[^a-z0-9]/gi, '').toLowerCase();
+    if (normalizedLeaf.length >= 3 && normalizedText.includes(normalizedLeaf)) score += 3;
+    return score;
+  }
+
+  private runtimeRenderContext(
+    render: RuntimeRenderInfo | null,
+    sources: RuntimeRenderInfo[],
+  ): { file: string | null; line: string | null; snippet: string | null } {
+    const primary = this.readRuntimeSource(render);
+    if (sources.length === 0) return primary;
+    const snippets: string[] = [];
+    const seen = new Set<string>();
+    if (primary.snippet !== null) {
+      snippets.push(primary.snippet);
+      seen.add(`${render?.file ?? ''}\u0000${String(render?.line ?? '')}`);
+    }
+    for (const source of sources) {
+      const key = `${source.file ?? ''}\u0000${String(source.line ?? '')}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const extra = this.readRuntimeSource(source);
+      if (extra.snippet !== null) snippets.push(extra.snippet);
+    }
+    return {
+      file: primary.file,
+      line: primary.line,
+      snippet: snippets.length > 0 ? snippets.join('\n') : null,
+    };
+  }
+
+  private readRuntimeSource(render: RuntimeRenderInfo | null): {
+    file: string | null;
+    line: string | null;
+    snippet: string | null;
+  } {
+    if (render === null) return { file: null, line: null, snippet: null };
+    const code = render.code;
+    if (render.file === null) {
+      return { file: null, line: code, snippet: code };
+    }
+    const target = Math.max(1, render.line ?? 1);
+    const key = `${render.file}\u0000${String(target)}\u0000${code ?? ''}`;
+    const cached = this.runtimeSourceCache.get(key);
+    const now = Date.now();
+    if (cached !== undefined && now - cached.at < 5000) {
+      return cached.value;
+    }
+    let file = this.resolveRuntimeFile(render.file);
+    let line = code;
+    let snippet = code;
+    const root = this.options.getWorkspaceRoot();
+    if (file !== null && root !== null) {
+      try {
+        const block = readCodeBlock(root, file, Math.max(1, target - 1), target + 2, {
+          maxLines: 4,
+        });
+        const parts = block.lines.map((entry) => entry.text);
+        const targetIndex = block.lines.findIndex((entry) => entry.line === target);
+        const targetLine =
+          targetIndex === -1
+            ? null
+            : (block.lines[targetIndex]?.text.replace(/\s+/g, ' ').trim() ?? null);
+        if (code !== null) {
+          if (
+            targetLine !== null &&
+            normalizedSourceText(targetLine) === normalizedSourceText(code)
+          ) {
+            line = code;
+            if (parts.length > 0) snippet = parts.join('\n');
+          } else {
+            // The workspace file is a different copy than the module that runs.
+            file = null;
+            line = code;
+            snippet = code;
+          }
+        } else {
+          line = targetLine;
+          if (parts.length > 0) snippet = parts.join('\n');
+        }
+      } catch {
+        if (code !== null) {
+          file = null;
+          line = code;
+          snippet = code;
+        } else {
+          file = null;
+          line = null;
+          snippet = null;
+        }
+      }
+    }
+    const value = { file, line, snippet };
+    this.runtimeSourceCache.set(key, { at: now, value });
+    if (this.runtimeSourceCache.size > 64) {
+      const oldest = this.runtimeSourceCache.keys().next().value;
+      if (oldest !== undefined) this.runtimeSourceCache.delete(oldest);
+    }
+    return value;
+  }
+
+  private resolveRuntimeFile(url: string): string | null {
+    const cached = this.runtimeFileCache.get(url);
+    if (cached !== undefined) return cached;
+    const root = this.options.getWorkspaceRoot();
+    const result = root === null ? null : this.probeRuntimeFile(url, root);
+    this.runtimeFileCache.set(url, result);
+    return result;
+  }
+
+  private probeRuntimeFile(url: string, root: string): string | null {
+    if (url.startsWith('file:')) {
+      const direct = this.relativeFramePath(url);
+      if (direct !== null) return direct;
+    }
+    let withoutQuery = url;
+    const scheme = /^[a-z][a-z0-9+.-]*:\/\/+/i.exec(withoutQuery);
+    if (scheme !== null && !/^https?:/i.test(withoutQuery)) {
+      withoutQuery = withoutQuery.slice(scheme[0].length);
+    }
+    let pathname: string;
+    try {
+      pathname = new URL(url).pathname;
+    } catch {
+      pathname = withoutQuery.split(/[?#]/)[0] ?? withoutQuery;
+    }
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(pathname);
+    } catch {
+      decoded = pathname;
+    }
+    decoded = decoded.replace(/\\/g, '/');
+    const fsMarker = decoded.indexOf('/@fs/');
+    if (fsMarker !== -1) {
+      let absolute = decoded.slice(fsMarker + 4);
+      if (/^\/[a-zA-Z]:\//.test(absolute)) absolute = absolute.slice(1);
+      const relative = this.relativeFilePath(absolute);
+      if (relative !== null) return relative;
+      decoded = absolute;
+    }
+    const segments = decoded.split('/').filter((segment) => segment !== '' && segment !== '.');
+    if (segments.length === 0) return null;
+    if (segments.some((segment) => segment === '..')) return null;
+    let scope: RootScope;
+    try {
+      scope = createRootScope(root);
+    } catch {
+      return null;
+    }
+    const prefixes = runtimeSourcePrefixes();
+    for (let start = 0; start < segments.length; start += 1) {
+      const suffix = segments.slice(start).join('/');
+      for (const prefix of prefixes) {
+        const candidate = `${prefix}${suffix}`;
+        try {
+          scope.resolve(candidate);
+          return candidate;
+        } catch {
+          continue;
+        }
+      }
+    }
+    return null;
+  }
+
+  private findRuntimeRequest(info: RuntimeRequestInfo): CapturedRequest | null {
+    const requests = this.buffer?.all();
+    if (requests === undefined) return null;
+    const method = info.method.toUpperCase();
+    const path = stripQuery(info.path);
+    let best: CapturedRequest | null = null;
+    let bestDelta = Number.POSITIVE_INFINITY;
+    for (const request of requests) {
+      if (request.method.toUpperCase() !== method) continue;
+      if (stripQuery(request.path) !== path) continue;
+      const delta = Math.abs(request.wallStartedAt - info.startedAt);
+      if (delta < bestDelta) {
+        best = request;
+        bestDelta = delta;
+      }
+    }
+    return best;
   }
 
   private hoverBackendSource(route: StaticRoute): BackendSource {
@@ -1616,6 +2538,8 @@ export class BrowserController {
     const rows: HoverTipRow[] = [];
     const request = provenance.request;
     const match = provenance.matches[0] ?? null;
+    const link = provenance.runtime;
+    const runtimeData = link !== null && link.entries.length > 0;
 
     if (element.text !== null) {
       rows.push({ label: 'Texto', value: element.text, tone: 'normal' });
@@ -1630,8 +2554,13 @@ export class BrowserController {
     if (element.link !== null) {
       rows.push({ label: 'Enlace', value: element.link, tone: 'normal' });
     }
+    if (link !== null) {
+      rows.push(...this.runtimeChainRows(link));
+    }
     const staticCandidate =
-      request === null && match === null ? this.staticRequests(resolution)[0] : undefined;
+      request === null && match === null && (link === null || link.requestInfo === null)
+        ? this.staticRequests(resolution)[0]
+        : undefined;
     if (staticCandidate !== undefined) {
       rows.push({
         label: 'Petición',
@@ -1653,7 +2582,8 @@ export class BrowserController {
         tone: matchedRoute === null ? 'dim' : 'ok',
       });
     }
-    const frames = request?.initiator?.frames ?? [];
+    const frames =
+      link === null || link.requestInfo === null ? (request?.initiator?.frames ?? []) : [];
     if (frames.length > 0) {
       const lines = frames.map(
         (frame) =>
@@ -1688,6 +2618,7 @@ export class BrowserController {
         )}`,
         tone: 'ok',
       });
+      rows.push(...this.provenanceDataRows(element, match));
       if (request !== null) {
         rows.push({
           label: 'Petición',
@@ -1695,7 +2626,18 @@ export class BrowserController {
           tone: 'dim',
         });
       }
-    } else if (provenance.query !== null || element.dataValues.length > 0) {
+      if (provenance.route !== null) {
+        rows.push({
+          label: 'Ruta',
+          value: `${provenance.route.handlerName ?? 'sin resolver'} · ${provenance.route.file}:${String(
+            provenance.route.line,
+          )}`,
+          tone: 'ok',
+        });
+        rows.push(...this.sqlRows(provenance.route));
+        rows.push(this.databaseRow(provenance.database));
+      }
+    } else if (!runtimeData && (provenance.query !== null || element.dataValues.length > 0)) {
       rows.push({
         label: 'JSON',
         value:
@@ -1743,15 +2685,21 @@ export class BrowserController {
             : staticCandidate !== undefined
               ? `${staticCandidate.method} ${staticCandidate.path}`
               : selector,
-      subtitle: `${this.hoverSubtitle(element)}${match !== null ? ' · OBSERVADO' : ''}`,
+      subtitle: `${this.hoverSubtitle(element)}${match !== null || link !== null ? ' · OBSERVADO' : ''}`,
       rows: this.prepareHoverRows(rows),
       code: handler === null ? null : toHoverCode(handler.code),
       footer:
-        request !== null
-          ? match?.basis === 'data'
-            ? 'Petición correlacionada con los datos crudos que recibe el componente.'
-            : 'Funciones = pila que originó la petición que devolvió el texto.'
-          : (handler?.note ?? 'Clic: tarjeta completa · Esc: cerrar'),
+        link !== null && link.requestInfo !== null
+          ? 'Cadena verificada en ejecución: función de render → dato → petición → backend.'
+          : link !== null
+            ? 'Render verificado en ejecución; sin petición enlazada por identidad.'
+            : request !== null
+              ? match?.basis === 'data'
+                ? 'Petición correlacionada con los datos crudos que recibe el componente.'
+                : match?.approximate
+                  ? 'Coincidencia aproximada por valor: el texto formateado no aparece literal en el JSON; la cadena muestra la petición que contiene ese dato.'
+                  : 'Funciones = pila que originó la petición que devolvió el texto.'
+              : (handler?.note ?? 'Clic: tarjeta completa · Esc: cerrar'),
     };
   }
 
@@ -1765,6 +2713,25 @@ export class BrowserController {
     const request = provenance.request;
     const route = provenance.route;
     const match = provenance.matches[0] ?? null;
+    const link = provenance.runtime;
+
+    if (link !== null && link.requestInfo !== null) {
+      rows.push(...this.runtimeChainRows(link));
+      const source = link.route === null ? null : this.hoverBackendSource(link.route);
+      if (source?.note !== null && source?.note !== undefined) {
+        rows.push({ label: 'Código', value: source.note, tone: 'warn' });
+      }
+      const title =
+        link.route?.handlerName ?? `${link.requestInfo.method} ${link.requestInfo.path}`;
+      return {
+        ...base,
+        title,
+        subtitle: `${selector} · OBSERVADO`,
+        rows: this.prepareHoverRows(rows),
+        code: source === null ? null : toHoverCode(source.code),
+        footer: 'Función frontend y petición enlazadas por identidad en ejecución.',
+      };
+    }
 
     if (match !== null) {
       if (provenance.query !== null) {
@@ -1883,6 +2850,33 @@ export class BrowserController {
     const request = provenance.request;
     const route = provenance.route;
     const match = provenance.matches[0] ?? null;
+    const link = provenance.runtime;
+
+    if (link !== null && link.entries.length > 0) {
+      rows.push(...this.runtimeChainRows(link));
+      let code: HoverTipCode | null = null;
+      if (link.request !== null && provenance.query !== null) {
+        const local = findJsonTextMatches([link.request], provenance.query, 1, [], [])[0];
+        if (local !== undefined) code = jsonParentCode(local, link.request);
+      }
+      const title =
+        link.requestInfo !== null
+          ? `${link.requestInfo.method} ${link.requestInfo.path}`
+          : link.data !== null
+            ? link.data.jsonPath
+            : selector;
+      return {
+        ...base,
+        title,
+        subtitle: `${selector} · OBSERVADO`,
+        rows: this.prepareHoverRows(rows),
+        code,
+        footer:
+          link.data === null
+            ? 'Respuesta enlazada por identidad; el texto no coincide con un campo del JSON.'
+            : 'Camino exacto del dato en la respuesta enlazada por identidad en ejecución.',
+      };
+    }
 
     if (match !== null) {
       if (provenance.query !== null) {
@@ -1900,6 +2894,7 @@ export class BrowserController {
         value: `${match.parentPath}${match.key !== null ? ` · clave ${match.key}` : ''}`,
         tone: 'dim',
       });
+      rows.push(...this.provenanceDataRows(resolution.element, match));
       if (request !== null) {
         rows.push({ label: 'Petición', value: `${request.method} ${request.path}` });
         rows.push({
@@ -1914,6 +2909,8 @@ export class BrowserController {
           value: `${route.handlerName ?? 'sin resolver'} · ${route.file}:${String(route.line)}`,
           tone: 'ok',
         });
+        rows.push(...this.sqlRows(route));
+        rows.push(this.databaseRow(provenance.database));
       }
       for (const extra of provenance.matches.slice(1)) {
         rows.push({
@@ -1922,14 +2919,7 @@ export class BrowserController {
           tone: 'dim',
         });
       }
-      const parentLines = match.parent.split('\n');
-      const code: HoverTipCode = {
-        file: `${match.origin === 'response' ? 'respuesta' : 'enviado'} JSON${
-          request !== null ? ` · ${request.method} ${request.path}` : ''
-        }`,
-        range: `${match.parentPath}${match.parentTruncated ? ' · recortado' : ''}`,
-        lines: parentLines.map((text, index) => ({ line: index + 1, text })),
-      };
+      const code = jsonParentCode(match, request);
       return {
         ...base,
         title: request !== null ? `${request.method} ${request.path}` : `${match.jsonPath}`,
@@ -2037,7 +3027,7 @@ export class BrowserController {
     }
     const queries: InspectionSqlQuery[] = [];
     for (const route of routes) {
-      for (const query of this.buildSqlQueries(route)) {
+      for (const query of staticQueriesForRoute(route)) {
         if (query.sql === null) continue;
         if (queries.some((entry) => entry.id === query.id && entry.line === query.line)) continue;
         queries.push(query);
@@ -2046,7 +3036,11 @@ export class BrowserController {
 
     const rows: HoverTipRow[] = [];
     const match = provenance.matches[0] ?? null;
+    const link = provenance.runtime;
     const dialect = queries.find((query) => query.dialect !== null)?.dialect ?? null;
+    if (link !== null) {
+      rows.push(...this.runtimeOriginRows(link));
+    }
     if (provenance.query !== null) {
       rows.push({ label: 'Texto', value: provenance.query, tone: 'normal' });
     }
@@ -2059,7 +3053,7 @@ export class BrowserController {
         tone: 'ok',
       });
     }
-    if (provenance.request !== null) {
+    if (provenance.request !== null && (link === null || link.requestInfo === null)) {
       rows.push({
         label: 'Petición',
         value: `${provenance.request.method} ${provenance.request.path} · ${observedStatusLabel(
@@ -2166,13 +3160,15 @@ export class BrowserController {
           : firstRoute !== undefined
             ? `${firstRoute.method.toUpperCase()} ${firstRoute.path}`
             : 'Sin SQL',
-      subtitle: `${selector} · ${match !== null ? 'OBSERVADO' : 'ESTÁTICO'}`,
+      subtitle: `${selector} · ${match !== null || link !== null ? 'OBSERVADO' : 'ESTÁTICO'}`,
       rows: this.prepareHoverRows(rows),
       code,
       footer:
-        match?.basis === 'data'
-          ? 'Base de datos y ruta correlacionadas por los datos del componente · SQL estático no ejecutado.'
-          : 'Base de datos detectada en fuentes del proyecto · SQL estático no ejecutado.',
+        link !== null
+          ? 'Ruta y base de datos de la petición enlazada por identidad en ejecución · SQL estático no ejecutado.'
+          : match?.basis === 'data'
+            ? 'Base de datos y ruta correlacionadas por los datos del componente · SQL estático no ejecutado.'
+            : 'Base de datos detectada en fuentes del proyecto · SQL estático no ejecutado.',
     };
   }
 
@@ -2213,6 +3209,189 @@ export class BrowserController {
       value: row.value.trim(),
       tone: row.tone,
     }));
+  }
+
+  private runtimeOriginRows(link: RuntimeLink): HoverTipRow[] {
+    const rows: HoverTipRow[] = [];
+    if (link.render !== null) {
+      const render = link.render;
+      const file = link.renderFile ?? render.file;
+      const location =
+        file === null
+          ? 'sin archivo en el build'
+          : `${shortFunctionSource(file)}${
+              render.line === null
+                ? ''
+                : `:${String(render.line)}${
+                    render.column === null ? '' : `:${String(render.column)}`
+                  }`
+            }`;
+      rows.push({
+        label: 'Render',
+        value: `${render.component ?? 'componente'} · ${location}`,
+        tone: link.renderFile !== null ? 'ok' : render.file === null ? 'dim' : 'normal',
+      });
+      if (link.renderLine !== null) {
+        rows.push({ label: 'Código', value: link.renderLine, tone: 'ok' });
+      } else if (link.renderFile === null && link.renderSymbol !== null) {
+        rows.push({
+          label: 'Definición',
+          value: `${shortFunctionSource(link.renderSymbol.file)}:${String(
+            link.renderSymbol.line,
+          )} · ${link.renderSymbol.definition}`,
+          tone: 'normal',
+        });
+      }
+    } else if (link.functions.length > 0) {
+      const chain = link.functions.map((entry) => entry.name).join(' → ');
+      const primary = link.functions[0]?.name ?? 'componente';
+      const location =
+        link.renderSymbol === null
+          ? 'sin archivo en el build'
+          : `${shortFunctionSource(link.renderSymbol.file)}:${String(link.renderSymbol.line)}`;
+      rows.push({
+        label: 'Render',
+        value: `${primary} · ${location}`,
+        tone: link.renderSymbol === null ? 'dim' : 'ok',
+      });
+      if (link.functions.length > 1) {
+        rows.push({ label: 'Cadena', value: chain, tone: 'dim' });
+      }
+      if (link.renderSymbol !== null) {
+        rows.push({ label: 'Definición', value: link.renderSymbol.definition, tone: 'normal' });
+      }
+    }
+    if (link.data !== null) {
+      const value = link.data.value === '' ? '' : ` = "${link.data.value}"`;
+      rows.push({
+        label: 'Dato',
+        value: `${link.data.component} · ${link.data.path}${value}`,
+        tone: 'ok',
+      });
+      if (link.requestInfo !== null) {
+        rows.push({
+          label: 'Respuesta',
+          value: `${link.data.jsonPath} · ${link.requestInfo.method} ${link.requestInfo.path}`,
+          tone: 'ok',
+        });
+      }
+    }
+    if (link.requestInfo !== null) {
+      const lines: string[] = [];
+      const seen = new Set<string>();
+      for (const frame of link.requestInfo.frames) {
+        const frameKey = `${frame.functionName ?? ''}|${frame.url}|${String(frame.line)}`;
+        if (seen.has(frameKey)) continue;
+        seen.add(frameKey);
+        lines.push(
+          `${frame.functionName ?? 'anónima'} · ${shortFunctionSource(frame.url)}:${String(
+            frame.line,
+          )}`,
+        );
+      }
+      if (lines.length > 0) {
+        rows.push({ label: 'Pila', value: lines.join('\n'), tone: 'ok' });
+      }
+      if (link.request !== null) {
+        rows.push({
+          label: 'Petición',
+          value: `${link.request.method} ${link.request.path} · ${observedStatusLabel(
+            link.request,
+          )}`,
+          tone: 'dim',
+        });
+      } else {
+        const status =
+          link.requestInfo.status === null
+            ? 'sin estado'
+            : `HTTP ${String(link.requestInfo.status)}`;
+        rows.push({
+          label: 'Petición',
+          value: `${link.requestInfo.method} ${link.requestInfo.path} · ${status} · fuera del búfer`,
+          tone: 'warn',
+        });
+      }
+    }
+    return rows;
+  }
+
+  private runtimeChainRows(link: RuntimeLink): HoverTipRow[] {
+    const rows = this.runtimeOriginRows(link);
+    if (link.requestInfo !== null) {
+      if (link.route !== null) {
+        rows.push({
+          label: 'Ruta',
+          value: `${link.route.handlerName ?? 'sin resolver'} · ${link.route.file}:${String(
+            link.route.line,
+          )}`,
+          tone: 'ok',
+        });
+        rows.push(...this.sqlRows(link.route));
+        rows.push(this.databaseRow(link.database));
+      } else {
+        rows.push({
+          label: 'Ruta',
+          value: 'sin ruta estática para la petición ejecutada',
+          tone: 'dim',
+        });
+      }
+    }
+    for (const extra of link.entries) {
+      if (extra === link.data) continue;
+      const value = extra.value === '' ? '' : ` = "${extra.value}"`;
+      rows.push({
+        label: 'También',
+        value: `${extra.component} · ${extra.path}${value} · ${extra.jsonPath}`,
+        tone: 'dim',
+      });
+    }
+    if (link.note !== null) rows.push({ label: 'Nota', value: link.note, tone: 'warn' });
+    return rows;
+  }
+
+  private provenanceDataRows(element: HoverElementInfo, match: JsonTextMatch): HoverTipRow[] {
+    const rows: HoverTipRow[] = [];
+    const matchedNumbers = displayNumbers(match.value);
+    for (const entry of element.dataValues) {
+      if (rows.length >= 3) break;
+      const sameText = entry.value.trim() === match.value.trim();
+      const sameNumber =
+        matchedNumbers.length > 0 &&
+        displayNumbers(entry.value).some((value) => matchedNumbers.includes(value));
+      if (!sameText && !sameNumber) continue;
+      rows.push({
+        label: 'Dato',
+        value: `${entry.component} · ${entry.path} = "${entry.value}"`,
+        tone: 'ok',
+      });
+    }
+    return rows;
+  }
+
+  private sqlRows(route: StaticRoute): HoverTipRow[] {
+    const read = new Set<string>();
+    const written = new Set<string>();
+    for (const query of staticQueriesForRoute(route)) {
+      if (query.sql === null) continue;
+      for (const table of query.tablesRead) read.add(table);
+      for (const table of query.tablesWritten) written.add(table);
+    }
+    const rows: HoverTipRow[] = [];
+    if (read.size > 0) {
+      rows.push({ label: 'SQL', value: `lee ${[...read].join(', ')}`, tone: 'normal' });
+    }
+    if (written.size > 0) {
+      rows.push({ label: 'SQL', value: `escribe ${[...written].join(', ')}`, tone: 'warn' });
+    }
+    return rows;
+  }
+
+  private databaseRow(database: DatabaseHint | null): HoverTipRow {
+    return {
+      label: 'Base de datos',
+      value: database === null ? 'sin nombre detectado en el código' : databaseHintLabel(database),
+      tone: database === null ? 'dim' : 'ok',
+    };
   }
 
   private staticRequests(resolution: HoverResolution): StaticRequestCandidate[] {
@@ -2536,7 +3715,7 @@ export class BrowserController {
       codeNote: source.note,
     };
     session.card.backend = backend;
-    session.card.queries = this.buildSqlQueries(route);
+    session.card.queries = staticQueriesForRoute(route);
     if (session.card.level !== 'N2') {
       session.card.level = 'N1';
     }
@@ -2544,58 +3723,6 @@ export class BrowserController {
     this.tryAttachSql(session);
     this.tryAttachExecution(session);
     this.updatePanel(session.card);
-  }
-
-  private buildSqlQueries(route: StaticRoute): InspectionSqlQuery[] {
-    const sites = new Map<string, StaticSqlSite>();
-    for (const site of route.sqlSites) {
-      if (!sites.has(site.id)) {
-        sites.set(site.id, site);
-      }
-    }
-    const lineCounts = new Map<number, number>();
-    for (const site of sites.values()) {
-      lineCounts.set(site.line, (lineCounts.get(site.line) ?? 0) + 1);
-    }
-
-    const queries: InspectionSqlQuery[] = [];
-    for (const site of sites.values()) {
-      const sharedNote =
-        (lineCounts.get(site.line) ?? 0) > 1 ? 'Varias llamadas SQL comparten esta línea.' : null;
-      if (site.sql === null) {
-        continue;
-      }
-
-      for (const analysis of analyzeSql(site.sql)) {
-        if (
-          analysis.parse !== 'ast' &&
-          analysis.tablesRead.length === 0 &&
-          analysis.tablesWritten.length === 0
-        ) {
-          continue;
-        }
-        queries.push({
-          id: site.id,
-          status: 'possible',
-          operation: analysis.operation,
-          tablesRead: [...analysis.tablesRead],
-          tablesWritten: [...analysis.tablesWritten],
-          columns: analysis.columns.map((column) => ({ ...column })),
-          dialect: analysis.dialect,
-          parse: analysis.parse,
-          selectStar: analysis.selectStar,
-          sql: site.sql,
-          dynamic: false,
-          line: site.line,
-          column: site.column,
-          callMethod: site.method,
-          callObject: site.objectName,
-          note: joinNotes([site.note, analysis.note, sharedNote]),
-          observedAt: null,
-        });
-      }
-    }
-    return queries;
   }
 
   private onSqlObserved(observation: SqlObservation): void {
@@ -2805,8 +3932,6 @@ export class BrowserController {
   }
 
   private relativeFramePath(file: string): string | null {
-    const root = this.options.getWorkspaceRoot();
-    if (root === null) return null;
     let absolute = file;
     if (file.startsWith('file:')) {
       try {
@@ -2815,6 +3940,12 @@ export class BrowserController {
         return null;
       }
     }
+    return this.relativeFilePath(absolute);
+  }
+
+  private relativeFilePath(absolute: string): string | null {
+    const root = this.options.getWorkspaceRoot();
+    if (root === null) return null;
     if (!path.isAbsolute(absolute)) return null;
     const relative = path.relative(root, absolute);
     if (
@@ -2941,6 +4072,10 @@ export class BrowserController {
   }
 
   private updatePanel(card: InspectionCard | null): void {
+    if (card !== null) {
+      this.flowLedger.upsert(card);
+      this.markFlowDirty();
+    }
     this.panel.update({
       card,
       runtime: { ...this.panelRuntime },
@@ -3163,6 +4298,7 @@ export class BrowserController {
       this.state = { ...this.state, requestCount: buffer.count };
       if (requests.length > 0) {
         this.send({ type: 'requests', requests, requestCount: buffer.count });
+        this.markFlowDirty();
       }
     }
     this.flushActivity();
@@ -3265,6 +4401,8 @@ export class BrowserController {
   }
 
   private teardownConnection(): void {
+    this.resetFlow();
+    this.mapWindow.close();
     this.dismissCard();
     this.inspectionSession = null;
     this.hoverProvenanceCache = null;
