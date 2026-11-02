@@ -6,7 +6,7 @@ Devtools de escritorio para seguir una cadena completa de una aplicación web lo
 
 La aplicación se llama **Backend DevTools Desktop** en la interfaz; el repositorio se publica como **Fullstack DevTools**.
 
-Licencia MIT · v0.3.0 · Desarrollado y probado en Windows
+Licencia MIT · v0.4.0 · Desarrollado y probado en Windows
 
 ## Demostración
 
