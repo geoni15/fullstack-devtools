@@ -2,6 +2,8 @@ import { ipcRenderer } from 'electron';
 import {
   BROWSER_PANEL_CHANNELS,
   INSPECTION_MODES,
+  normalizeSearchText,
+  requestStatusView,
   type CapturedBody,
   type InspectionCard,
   type InspectionCodeBlock,
@@ -21,6 +23,9 @@ import {
 } from './highlight';
 
 const MAX_BODY_LINES = 240;
+
+let currentCard: InspectionCard | null = null;
+let currentRuntime: InspectionRuntime = { status: 'off', port: null, message: null };
 
 const MODE_HINT: Record<InspectionMode, string> = {
   html: 'Pasa el mouse: etiqueta, tamaño y estilos calculados.',
@@ -62,15 +67,124 @@ function clock(at: number): string {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+function revealLocation(
+  file: string | null | undefined,
+  line: number | null | undefined,
+  endLine: number | null | undefined,
+): void {
+  if (file === null || file === undefined || line === null || line === undefined || line <= 0) {
+    return;
+  }
+  ipcRenderer.send(BROWSER_PANEL_CHANNELS.revealLocation, {
+    path: file,
+    line,
+    endLine: endLine ?? null,
+  });
+}
+
+function codeLink(
+  label: string,
+  file: string | null | undefined,
+  line: number | null | undefined,
+  endLine: number | null | undefined,
+): HTMLElement {
+  const plain = document.createElement('span');
+  plain.textContent = label;
+  if (file === null || file === undefined || line === null || line === undefined || line <= 0) {
+    return plain;
+  }
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'code-link';
+  button.textContent = label;
+  button.title = 'Abrir en el editor y marcar la función';
+  button.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    revealLocation(file, line, endLine);
+  });
+  button.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') event.stopPropagation();
+  });
+  return button;
+}
+
+function stepEndLine(
+  card: InspectionCard,
+  file: string,
+  line: number,
+  fallback: InspectionCodeBlock | null,
+): number | null {
+  if (
+    card.backend !== null &&
+    card.backend.file === file &&
+    card.backend.line <= line &&
+    line <= card.backend.endLine
+  ) {
+    return card.backend.endLine;
+  }
+  if (fallback !== null && fallback.file === file && fallback.startLine <= line) {
+    return fallback.endLine;
+  }
+  return null;
+}
+
+function requestPath(request: InspectionRequest): string {
+  const index = request.path.indexOf('?');
+  return index === -1 ? request.path : request.path.slice(0, index);
+}
+
+function backendObserved(card: InspectionCard, request: InspectionRequest): boolean | null {
+  if (request.backend === null) return null;
+  if (card.execution === null) return false;
+  const method = request.method.toUpperCase();
+  const path = requestPath(request);
+  return card.execution.breakpoints.some(
+    (breakpoint) =>
+      breakpoint.method.toUpperCase() === method &&
+      (breakpoint.path === path || breakpoint.path === request.path),
+  );
+}
+
+function matchesRequestFilter(card: InspectionCard, request: InspectionRequest): boolean {
+  const query = normalizeSearchText(element<HTMLInputElement>('request-search').value.trim());
+  if (query === '') return true;
+  const status = requestStatusView({
+    statusCode: request.statusCode,
+    outcome: request.outcome,
+    backendObserved: backendObserved(card, request),
+  });
+  const parts = [
+    status.search,
+    request.method,
+    request.path,
+    request.initiatorFunction,
+    request.backend?.file,
+    request.backend?.handlerName,
+  ];
+  return parts.some(
+    (part) => part !== null && part !== undefined && normalizeSearchText(part).includes(query),
+  );
+}
+
 function requestNode(
+  card: InspectionCard,
   request: InspectionRequest,
   selected: boolean,
   select: (id: string) => void,
 ): HTMLElement {
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.className = `request${selected ? ' is-selected' : ''}`;
-  button.dataset.requestId = request.id;
+  const observed = backendObserved(card, request);
+  const view = requestStatusView({
+    statusCode: request.statusCode,
+    outcome: request.outcome,
+    backendObserved: observed,
+  });
+  const row = document.createElement('div');
+  row.className = `request status-${view.kind}${selected ? ' is-selected' : ''}`;
+  row.dataset.requestId = request.id;
+  row.dataset.status = view.kind;
+  row.setAttribute('role', 'button');
+  row.tabIndex = 0;
 
   const head = document.createElement('div');
   head.className = 'head';
@@ -88,31 +202,38 @@ function requestNode(
   phase.textContent = PHASE_LABEL[request.phase];
   const status = document.createElement('span');
   status.className = 'status';
-  const code =
-    request.statusCode !== null
-      ? String(request.statusCode)
-      : request.outcome === 'failed'
-        ? 'ERR'
-        : '…';
   const duration =
     request.durationMs !== null ? `${String(Math.round(request.durationMs))} ms` : '—';
-  status.textContent = `${code} · ${duration}`;
+  status.textContent = `${view.label} · ${duration}`;
+  status.title = `${view.phase} · ${view.detail}`;
   head.append(method, pathNode, time, phase, status);
 
   const backendLine = document.createElement('div');
   backendLine.className = 'backend-line';
-  backendLine.textContent =
-    request.backend === null
-      ? 'sin ruta'
-      : `${request.backend.handlerName ?? 'sin resolver'} · ${request.backend.file}:${String(
-          request.backend.line,
-        )}`;
+  if (request.backend === null) {
+    backendLine.textContent = 'sin ruta';
+  } else {
+    backendLine.append(
+      document.createTextNode(`${request.backend.handlerName ?? 'sin resolver'} · `),
+      codeLink(
+        `${request.backend.file}:${String(request.backend.line)}`,
+        request.backend.file,
+        request.backend.line,
+        stepEndLine(card, request.backend.file, request.backend.line, null),
+      ),
+    );
+  }
 
-  button.append(head, backendLine);
-  button.addEventListener('click', () => {
+  row.append(head, backendLine);
+  row.addEventListener('click', () => {
     select(request.id);
   });
-  return button;
+  row.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    select(request.id);
+  });
+  return row;
 }
 
 function renderRuntime(runtime: InspectionRuntime): void {
@@ -250,7 +371,11 @@ const SQL_OPERATION_LABEL: Record<InspectionSqlQuery['operation'], string> = {
   other: 'SQL',
 };
 
-function queryNode(query: InspectionSqlQuery): HTMLElement {
+function queryNode(
+  query: InspectionSqlQuery,
+  file: string | null,
+  endLine: number | null,
+): HTMLElement {
   const container = document.createElement('div');
   container.className = query.status === 'observed' ? 'query is-observed' : 'query';
 
@@ -270,19 +395,27 @@ function queryNode(query: InspectionSqlQuery): HTMLElement {
   renderHighlightedText(sql, query.sql ?? '', 'sql', 80);
   container.append(sql);
 
-  const parts: string[] = [];
+  const parts: Node[] = [];
   if (query.tablesRead.length > 0) {
-    parts.push(`lee ${query.tablesRead.join(', ')}`);
+    parts.push(document.createTextNode(`lee ${query.tablesRead.join(', ')}`));
   }
   if (query.tablesWritten.length > 0) {
-    parts.push(`escribe ${query.tablesWritten.join(', ')}`);
+    parts.push(document.createTextNode(`escribe ${query.tablesWritten.join(', ')}`));
   }
   if (query.line > 0) {
-    parts.push(`línea ${String(query.line)}`);
+    const label = `línea ${String(query.line)}`;
+    parts.push(
+      file === null ? document.createTextNode(label) : codeLink(label, file, query.line, endLine),
+    );
   }
   const meta = document.createElement('div');
   meta.className = 'meta';
-  meta.textContent = parts.join(' · ');
+  parts.forEach((part, index) => {
+    if (index > 0) {
+      meta.append(document.createTextNode(' · '));
+    }
+    meta.append(part);
+  });
   container.append(meta);
   return container;
 }
@@ -309,8 +442,13 @@ function renderQueries(card: InspectionCard): void {
     return;
   }
 
+  const backend = card.backend;
   for (const query of visible) {
-    container.append(queryNode(query));
+    const endLine =
+      backend !== null && query.line >= backend.line && query.line <= backend.endLine
+        ? backend.endLine
+        : null;
+    container.append(queryNode(query, backend?.file ?? null, endLine));
   }
 }
 
@@ -321,6 +459,9 @@ interface SequenceStep {
   tag: string;
   text: string;
   tone: SequenceTone;
+  file?: string | null;
+  line?: number | null;
+  endLine?: number | null;
 }
 
 function sameBackend(card: InspectionCard, request: InspectionRequest): boolean {
@@ -356,6 +497,9 @@ function requestSteps(card: InspectionCard, request: InspectionRequest): Sequenc
         tag: 'BACKEND',
         text: `${name} · ${card.execution.file}:${String(card.execution.line)}`,
         tone: 'ok',
+        file: card.execution.file,
+        line: card.execution.line,
+        endLine: stepEndLine(card, card.execution.file, card.execution.line, card.execution.code),
       });
     }
   }
@@ -366,11 +510,18 @@ function requestSteps(card: InspectionCard, request: InspectionRequest): Sequenc
       if (query.observedAt < start - 50 || (end !== null && query.observedAt > end + 500)) continue;
       const tables = query.tablesWritten.length > 0 ? query.tablesWritten : query.tablesRead;
       const target = tables.length > 0 ? ` ${tables.join(', ')}` : '';
+      const backend = card.backend;
       steps.push({
         at: query.observedAt,
         tag: 'SQL',
         text: `${SQL_OPERATION_LABEL[query.operation]}${target}`,
         tone: 'ok',
+        file: backend?.file ?? null,
+        line: query.line > 0 ? query.line : null,
+        endLine:
+          backend !== null && query.line >= backend.line && query.line <= backend.endLine
+            ? backend.endLine
+            : null,
       });
     }
   }
@@ -378,20 +529,18 @@ function requestSteps(card: InspectionCard, request: InspectionRequest): Sequenc
   if (request.outcome === 'pending') {
     steps.push({ at: null, tag: 'RESPUESTA', text: 'Pendiente', tone: 'normal' });
   } else if (end !== null) {
-    const code =
-      request.statusCode !== null
-        ? String(request.statusCode)
-        : request.outcome === 'failed'
-          ? 'ERR'
-          : '—';
+    const view = requestStatusView({
+      statusCode: request.statusCode,
+      outcome: request.outcome,
+      backendObserved: backendObserved(card, request),
+    });
     const duration =
       request.durationMs !== null ? ` · ${String(Math.round(request.durationMs))} ms` : '';
-    const failed = request.outcome === 'failed' || (request.statusCode ?? 0) >= 500;
     steps.push({
       at: end,
       tag: 'RESPUESTA',
-      text: `${code}${duration}`,
-      tone: failed ? 'error' : 'ok',
+      text: `${view.label}${duration}`,
+      tone: view.tone === 'error' ? 'error' : 'ok',
     });
   }
 
@@ -418,7 +567,16 @@ function renderSequence(card: InspectionCard, request: InspectionRequest | null)
     tag.textContent = step.tag;
     const text = document.createElement('span');
     text.className = 'seq-text';
-    text.textContent = step.text;
+    if (
+      step.file !== null &&
+      step.file !== undefined &&
+      step.line !== null &&
+      step.line !== undefined
+    ) {
+      text.append(codeLink(step.text, step.file, step.line, step.endLine));
+    } else {
+      text.textContent = step.text;
+    }
     row.append(time, tag, text);
     container.append(row);
   }
@@ -451,9 +609,16 @@ function renderExecution(
   container.hidden = false;
   empty.hidden = true;
   const functionName = execution.functionName ?? 'función anónima';
-  element('execution-loc').textContent = `${functionName} · ${execution.file}:${String(
-    execution.line,
-  )}:${String(execution.column)}`;
+  const location = element('execution-loc');
+  location.replaceChildren(
+    document.createTextNode(`${functionName} · `),
+    codeLink(
+      `${execution.file}:${String(execution.line)}:${String(execution.column)}`,
+      execution.file,
+      execution.line,
+      stepEndLine(card, execution.file, execution.line, execution.code),
+    ),
+  );
   element('breakpoints').textContent = execution.breakpoints
     .map((breakpoint) => `${breakpoint.method} ${breakpoint.path}`)
     .join(', ');
@@ -461,10 +626,24 @@ function renderExecution(
   const codeFile = element('execution-code-file');
   const codeRange = element('execution-code-range');
   if (execution.code !== null) {
-    codeFile.textContent = execution.code.file;
+    codeFile.replaceChildren(
+      codeLink(
+        execution.code.file,
+        execution.code.file,
+        execution.code.startLine,
+        execution.code.endLine,
+      ),
+    );
     codeRange.textContent = lineRange(execution.code);
   } else {
-    codeFile.textContent = execution.file;
+    codeFile.replaceChildren(
+      codeLink(
+        execution.file,
+        execution.file,
+        execution.line,
+        stepEndLine(card, execution.file, execution.line, null),
+      ),
+    );
     codeRange.textContent = '';
   }
   renderCode(element('execution-code'), execution.code, execution.codeNote, execution.line);
@@ -527,8 +706,15 @@ function renderHandler(card: InspectionCard): void {
 
   const location = element('handler-loc');
   if (card.handler !== null && card.handler.url !== null) {
-    const column = card.handler.column !== null ? `:${String(card.handler.column)}` : '';
-    location.textContent = `${card.handler.url}:${String(card.handler.line ?? 0)}${column}`;
+    const handlerUrl = card.handler.url;
+    const handler = card.handler;
+    const column = handler.column !== null ? `:${String(handler.column)}` : '';
+    const code = handler.code;
+    const line = handler.line ?? code?.startLine ?? 0;
+    const target = code?.file ?? handlerUrl;
+    const start = code?.startLine ?? line;
+    const label = line > 0 ? `${handlerUrl}:${String(line)}${column}` : handlerUrl;
+    location.replaceChildren(codeLink(label, target, start, code?.endLine ?? null));
   } else {
     location.textContent = card.handler?.note ?? '';
   }
@@ -541,7 +727,9 @@ function renderHandler(card: InspectionCard): void {
     return;
   }
   wrap.hidden = false;
-  element('handler-code-file').textContent = code.file;
+  element('handler-code-file').replaceChildren(
+    codeLink(code.file, code.file, code.startLine, code.endLine),
+  );
   element('handler-code-range').textContent = lineRange(code);
   renderCode(element('handler-code'), code, null, null);
 }
@@ -563,14 +751,31 @@ function renderBackend(card: InspectionCard): void {
     card.backend.line === card.backend.endLine
       ? String(card.backend.line)
       : `${String(card.backend.line)}–${String(card.backend.endLine)}`;
-  location.textContent = `${card.backend.file}:${range}`;
+  location.replaceChildren(
+    codeLink(
+      `${card.backend.file}:${range}`,
+      card.backend.file,
+      card.backend.line,
+      card.backend.endLine,
+    ),
+  );
 
   wrap.hidden = false;
+  const codeFile = element('backend-code-file');
   if (card.backend.code !== null) {
-    element('backend-code-file').textContent = card.backend.code.file;
+    codeFile.replaceChildren(
+      codeLink(
+        card.backend.code.file,
+        card.backend.code.file,
+        card.backend.code.startLine,
+        card.backend.code.endLine,
+      ),
+    );
     element('backend-code-range').textContent = lineRange(card.backend.code);
   } else {
-    element('backend-code-file').textContent = card.backend.file;
+    codeFile.replaceChildren(
+      codeLink(card.backend.file, card.backend.file, card.backend.line, card.backend.endLine),
+    );
     element('backend-code-range').textContent = '';
   }
   const highlight =
@@ -584,6 +789,8 @@ function renderBackend(card: InspectionCard): void {
 
 function render(card: InspectionCard | null, runtime: InspectionRuntime): void {
   document.title = 'Inspección';
+  currentCard = card;
+  currentRuntime = runtime;
   const content = element('content');
   const idle = element('idle');
   if (card === null) {
@@ -614,15 +821,21 @@ function render(card: InspectionCard | null, runtime: InspectionRuntime): void {
 
   const requests = element('requests');
   requests.replaceChildren();
+  const visibleRequests = card.requests.filter((request) => matchesRequestFilter(card, request));
   if (card.requests.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'empty';
     empty.textContent = card.status === 'done' ? 'Sin peticiones' : 'Escuchando…';
     requests.append(empty);
+  } else if (visibleRequests.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'Ninguna petición coincide con el filtro de estado.';
+    requests.append(empty);
   } else {
-    for (const request of card.requests) {
+    for (const request of visibleRequests) {
       requests.append(
-        requestNode(request, request.id === card.selectedRequestId, (id) => {
+        requestNode(card, request, request.id === card.selectedRequestId, (id) => {
           ipcRenderer.send(BROWSER_PANEL_CHANNELS.selectRequest, id);
         }),
       );
@@ -676,6 +889,9 @@ window.addEventListener('DOMContentLoaded', () => {
   };
   document.getElementById('map-toggle')?.addEventListener('click', openMap);
   document.getElementById('map-mode')?.addEventListener('click', openMap);
+  document.getElementById('request-search')?.addEventListener('input', () => {
+    render(currentCard, currentRuntime);
+  });
   document.querySelectorAll<HTMLButtonElement>('.mode[data-mode]').forEach((button) => {
     button.addEventListener('click', () => {
       const mode = button.dataset.mode;

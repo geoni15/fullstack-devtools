@@ -5,14 +5,22 @@ import {
   useEffect,
   useMemo,
   useReducer,
+  useRef,
   type ReactNode,
 } from 'react';
-import type { FileNode, WorkspaceSnapshot } from '@bdt/protocol';
+import type { CodeLocation, FileNode, WorkspaceSnapshot } from '@bdt/protocol';
 import { bdt } from '../api';
 
 export type OpenTab =
   | { path: string; name: string; status: 'ready'; content: string; size: number }
   | { path: string; name: string; status: 'error'; message: string };
+
+export interface CodeRevealTarget {
+  path: string;
+  line: number;
+  endLine: number | null;
+  nonce: number;
+}
 
 export interface WorkspaceState {
   snapshot: WorkspaceSnapshot | null;
@@ -20,6 +28,7 @@ export interface WorkspaceState {
   error: string | null;
   tabs: OpenTab[];
   activePath: string | null;
+  reveal: CodeRevealTarget | null;
 }
 
 type Action =
@@ -30,6 +39,7 @@ type Action =
   | { type: 'activate'; path: string }
   | { type: 'add-tab'; tab: OpenTab }
   | { type: 'close-tab'; path: string }
+  | { type: 'reveal'; target: CodeRevealTarget }
   | { type: 'dismiss-error' };
 
 const INITIAL_STATE: WorkspaceState = {
@@ -38,6 +48,7 @@ const INITIAL_STATE: WorkspaceState = {
   error: null,
   tabs: [],
   activePath: null,
+  reveal: null,
 };
 
 function reducer(state: WorkspaceState, action: Action): WorkspaceState {
@@ -48,7 +59,14 @@ function reducer(state: WorkspaceState, action: Action): WorkspaceState {
       return { ...state, busy: false };
     case 'snapshot': {
       if (action.snapshot === null) {
-        return { ...state, snapshot: null, busy: false, tabs: [], activePath: null };
+        return {
+          ...state,
+          snapshot: null,
+          busy: false,
+          tabs: [],
+          activePath: null,
+          reveal: null,
+        };
       }
       const workspaceChanged =
         state.snapshot === null || state.snapshot.workspace.id !== action.snapshot.workspace.id;
@@ -59,6 +77,7 @@ function reducer(state: WorkspaceState, action: Action): WorkspaceState {
         error: null,
         tabs: workspaceChanged ? [] : state.tabs,
         activePath: workspaceChanged ? null : state.activePath,
+        reveal: workspaceChanged ? null : state.reveal,
       };
     }
     case 'error':
@@ -85,11 +104,18 @@ function reducer(state: WorkspaceState, action: Action): WorkspaceState {
       const nextActive = tabs[Math.min(closingIndex, tabs.length - 1)]?.path ?? null;
       return { ...state, tabs, activePath: nextActive };
     }
+    case 'reveal':
+      return { ...state, reveal: action.target };
     case 'dismiss-error':
       return { ...state, error: null };
     default:
       return state;
   }
+}
+
+function fileNameForPath(filePath: string): string {
+  const segments = filePath.split('/');
+  return segments[segments.length - 1] ?? filePath;
 }
 
 function errorMessage(error: unknown): string {
@@ -102,6 +128,7 @@ export interface WorkspaceContextValue {
   openFile(node: FileNode): Promise<void>;
   activateTab(path: string): void;
   closeTab(path: string): void;
+  revealCode(path: string, line: number, endLine: number | null): Promise<void>;
   dismissError(): void;
 }
 
@@ -109,6 +136,7 @@ const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
 
 export function WorkspaceProvider({ children }: { children: ReactNode }): ReactNode {
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
+  const revealNonce = useRef(0);
 
   const refresh = useCallback(async (): Promise<void> => {
     try {
@@ -178,6 +206,72 @@ export function WorkspaceProvider({ children }: { children: ReactNode }): ReactN
     }
   }, []);
 
+  const openCodeLocation = useCallback(async (location: CodeLocation): Promise<void> => {
+    const name = fileNameForPath(location.path);
+    try {
+      const result = await bdt.readFile(location.path);
+      if (!result.ok) {
+        dispatch({
+          type: 'add-tab',
+          tab: {
+            path: location.path,
+            name,
+            status: 'error',
+            message: result.error.message,
+          },
+        });
+        return;
+      }
+      dispatch({
+        type: 'add-tab',
+        tab: {
+          path: result.value.path,
+          name,
+          status: 'ready',
+          content: result.value.content,
+          size: result.value.size,
+        },
+      });
+      revealNonce.current += 1;
+      dispatch({
+        type: 'reveal',
+        target: {
+          path: result.value.path,
+          line: location.line,
+          endLine: location.endLine,
+          nonce: revealNonce.current,
+        },
+      });
+    } catch (error) {
+      dispatch({ type: 'error', message: errorMessage(error) });
+    }
+  }, []);
+
+  useEffect(() => {
+    return bdt.onRevealLocation((location) => {
+      void openCodeLocation(location);
+    });
+  }, [openCodeLocation]);
+
+  const revealCode = useCallback(
+    async (filePath: string, line: number, endLine: number | null): Promise<void> => {
+      try {
+        const result = await bdt.revealCode({ path: filePath, line, endLine });
+        if (!result.ok) {
+          dispatch({ type: 'error', message: result.error.message });
+        } else if (result.value === null) {
+          dispatch({
+            type: 'error',
+            message: 'Esa ubicación no corresponde a un archivo del proyecto abierto.',
+          });
+        }
+      } catch (error) {
+        dispatch({ type: 'error', message: errorMessage(error) });
+      }
+    },
+    [],
+  );
+
   const activateTab = useCallback((path: string): void => {
     dispatch({ type: 'activate', path });
   }, []);
@@ -191,8 +285,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }): ReactN
   }, []);
 
   const value = useMemo<WorkspaceContextValue>(
-    () => ({ state, openWorkspace, openFile, activateTab, closeTab, dismissError }),
-    [state, openWorkspace, openFile, activateTab, closeTab, dismissError],
+    () => ({ state, openWorkspace, openFile, activateTab, closeTab, revealCode, dismissError }),
+    [state, openWorkspace, openFile, activateTab, closeTab, revealCode, dismissError],
   );
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;

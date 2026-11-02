@@ -383,6 +383,37 @@ button:focus-visible {
   inset: 0;
 }
 
+.code-reveal-line {
+  background: #1a2a3d;
+}
+
+.code-reveal-margin {
+  background: #16253a;
+}
+
+.code-link {
+  padding: 0;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.code-link:hover {
+  color: var(--accent);
+}
+
+.console-where.code-link {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .editor-empty,
 .editor-message {
   position: absolute;
@@ -770,6 +801,25 @@ button:focus-visible {
   font-size: 11px;
 }
 
+.timeline-search {
+  flex: 0 1 260px;
+  min-width: 140px;
+  height: 24px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+  border: 0;
+  outline: none;
+  font:
+    11px 'Cascadia Mono',
+    Consolas,
+    monospace;
+}
+
+.timeline-search:focus {
+  background: var(--raised);
+}
+
 .timeline-list {
   flex: 1;
   min-height: 0;
@@ -785,7 +835,10 @@ button:focus-visible {
 .request-head,
 .request-row {
   display: grid;
-  grid-template-columns: 62px 68px minmax(160px, 1.5fr) 76px 54px 72px minmax(110px, 0.8fr);
+  grid-template-columns: 62px 68px minmax(160px, 1.5fr) 76px minmax(118px, 0.8fr) 72px minmax(
+      110px,
+      0.8fr
+    );
   gap: 8px;
   align-items: center;
   width: 100%;
@@ -1220,6 +1273,109 @@ button:focus-visible {
 
 .tone-warning .activity-title {
   color: #d29922;
+}
+
+.console-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.console-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 10px;
+}
+
+.console-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.console-row {
+  display: grid;
+  grid-template-columns: 88px 44px 64px minmax(0, 1fr) minmax(120px, 0.4fr);
+  gap: 8px;
+  align-items: start;
+  padding: 4px 6px;
+}
+
+.console-row:hover {
+  background: var(--hover);
+}
+
+.console-time {
+  color: var(--faint);
+  font-family: 'Cascadia Mono', Consolas, monospace;
+  font-size: 10px;
+  padding-top: 2px;
+}
+
+.console-level,
+.console-source {
+  padding: 2px 6px;
+  background: var(--raised);
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  text-align: center;
+}
+
+.console-level.level-info {
+  color: #58a6ff;
+  background: #16233a;
+}
+
+.console-level.level-debug {
+  color: var(--faint);
+}
+
+.console-level.level-warn {
+  color: #d29922;
+  background: #2a2113;
+}
+
+.console-level.level-error,
+.console-level.level-exception {
+  color: var(--danger);
+  background: #2a1414;
+}
+
+.console-source.source-frontend {
+  color: #3fb950;
+  background: #12261a;
+}
+
+.console-source.source-backend {
+  color: #58a6ff;
+  background: #16233a;
+}
+
+.console-text {
+  min-width: 0;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.console-row.level-warn .console-text {
+  color: #d29922;
+}
+
+.console-row.level-error .console-text,
+.console-row.level-exception .console-text {
+  color: var(--danger);
+}
+
+.console-where {
+  color: var(--faint);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
 }
 
 .badge-count {

@@ -12,6 +12,10 @@ button:hover:not(:disabled) { background: #26313f; }
 #inspect { min-width: 108px; }
 #inspect.is-on { background: #1c5c3b; color: #e8fff1; }
 #inspect.is-off { background: #3a2a1b; color: #ffd7a8; }
+#tip-toggle { min-width: 72px; }
+#tip-toggle.is-on { background: #223044; color: #e6edf3; }
+#tip-toggle .key { margin-left: 4px; padding: 0 3px; background: #22303f; color: #9fc7f5; font-size: 9px; letter-spacing: 0; }
+#tip-toggle.is-on .key { background: #2d4560; color: #cfe6ff; }
 .meta { display: flex; align-items: center; gap: 12px; height: 24px; padding: 0 10px; background: #10161e; color: #8b98a5; font-size: 11px; }
 #loading { display: none; color: #8fc7ff; }
 #bar.is-loading #loading { display: inline; }
@@ -35,6 +39,7 @@ export const BROWSER_CHROME_HTML = `<!doctype html>
         <input id="url" type="text" spellcheck="false" aria-label="Dirección" />
       </form>
       <button id="inspect" type="button" class="is-on">Inspección ON</button>
+      <button id="tip-toggle" type="button" aria-pressed="false" title="Detalle al pasar el cursor; mantén Shift para verlo temporalmente.">Tooltip<span class="key">Shift</span></button>
     </header>
     <div class="meta">
       <span id="status">N0</span>
@@ -77,6 +82,8 @@ h2 { margin: 0 0 5px; font-size: 10px; font-weight: 600; letter-spacing: 0.08em;
 .request { display: block; width: 100%; text-align: left; padding: 6px 8px; margin: 0 0 4px; background: #131a22; border: 0; font: inherit; color: inherit; cursor: pointer; }
 .request:hover { background: #1a2430; }
 .request.is-selected { background: #223044; }
+.search { width: 100%; height: 24px; margin: 0 0 6px; padding: 0 8px; background: #0a1016; color: #e6edf3; border: 0; font: 11px system-ui, "Segoe UI", sans-serif; outline: none; }
+.search:focus { background: #111923; }
 .request .head { display: flex; gap: 8px; align-items: baseline; }
 .method { font-weight: 700; font-size: 10px; color: #9fe3b8; }
 .method.post { color: #ffd7a8; }
@@ -86,11 +93,18 @@ h2 { margin: 0 0 5px; font-size: 10px; font-weight: 600; letter-spacing: 0.08em;
 .phase.background { background: #2b2436; color: #cbb8e8; }
 .phase.after-click { background: #163a2a; color: #9fe3b8; }
 .request .status { font-size: 10px; color: #8b98a5; white-space: nowrap; }
+.request.status-success .status { color: #9fe3b8; }
+.request.status-redirect .status, .request.status-informational .status, .request.status-pending .status { color: #ffd7a8; }
+.request.status-client-error .status, .request.status-server-error .status, .request.status-network-error .status { color: #ffb4a8; }
 .request .time { font-size: 10px; color: #7d8b99; white-space: nowrap; font-family: "Cascadia Mono", Consolas, monospace; }
 .request .backend-line { margin-top: 2px; color: #a9cdf0; font-size: 11px; word-break: break-all; }
 .empty { color: #8b98a5; font-style: italic; }
 .code-head { display: flex; align-items: baseline; gap: 8px; margin-top: 6px; }
 .code-file { font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; color: #a9cdf0; word-break: break-all; }
+.code-link { padding: 0; background: none; border: 0; color: inherit; font: inherit; text-align: left; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; word-break: break-all; }
+.code-link:hover { color: #9fd0ff; }
+.request .backend-line .code-link { color: #a9cdf0; }
+.request .backend-line .code-link:hover { color: #e6edf3; }
 .code-range { margin-left: auto; font-size: 10px; color: #7d8b99; white-space: nowrap; }
 .code { margin-top: 4px; background: #0a1016; overflow-x: auto; }
 .code-line { display: flex; min-height: 17px; font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; line-height: 17px; }
@@ -152,6 +166,7 @@ body.map-open main { display: none; }
 #map-results .map-result { display: block; width: 100%; height: auto; text-align: left; padding: 5px 7px; background: #141c25; color: #c9d1d9; border: 0; font: inherit; cursor: pointer; }
 #map-results .map-result:hover { background: #1a2430; }
 #map-results .map-result.is-selected { background: #223044; }
+#map-results .map-result:focus-visible { outline: 2px solid #58a6ff; outline-offset: -2px; }
 #map-results .map-result .tag { display: block; color: #9fc7f5; font-size: 9px; letter-spacing: 0.04em; }
 #map-results .map-result .name { display: block; margin-top: 1px; color: #e6edf3; font-size: 11px; word-break: break-word; }
 #map-results .map-result .meta { display: block; margin-top: 1px; color: #7d8b99; font-size: 10px; word-break: break-word; }
@@ -162,9 +177,15 @@ body.map-open main { display: none; }
 #map-bar button { height: 24px; min-width: 24px; padding: 0 7px; background: #172029; color: #aab8c5; border: 0; font: 10px/1 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.02em; cursor: pointer; }
 #map-bar button:hover { background: #1d2833; color: #e6edf3; }
 #map-bar button.is-on { background: #223044; color: #e6edf3; }
+#map-tip-toggle .key { margin-left: 4px; padding: 0 3px; background: #22303f; color: #9fc7f5; font-size: 9px; letter-spacing: 0; }
+#map-tip-toggle.is-held { background: #27415c; color: #e6edf3; }
 #map-bar select { height: 24px; max-width: 168px; background: #172029; color: #aab8c5; border: 0; padding: 0 4px; font: 10px system-ui, "Segoe UI", sans-serif; letter-spacing: 0.02em; cursor: pointer; outline: none; }
 #map-bar select:hover { background: #1d2833; color: #e6edf3; }
 #map-bar select:disabled { color: #56616d; cursor: default; }
+#map-event-only-label { display: flex; align-items: center; gap: 4px; height: 24px; padding: 0 6px; background: #172029; color: #aab8c5; font: 10px/1 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.02em; cursor: pointer; }
+#map-event-only-label:hover { background: #1d2833; color: #e6edf3; }
+#map-event-only { width: 12px; height: 12px; margin: 0; accent-color: #58a6ff; cursor: pointer; }
+#map-event-only:disabled { cursor: default; }
 #map-body { display: flex; flex: 1; min-height: 0; gap: 2px; }
 #map-stack { display: flex; align-items: stretch; gap: 4px; padding: 5px 8px; background: #0d141b; flex: none; overflow-x: auto; }
 .stack-node { display: flex; flex-direction: column; gap: 1px; min-width: 132px; padding: 5px 10px; background: #141e28; color: #c9d1d9; border: 0; font: inherit; text-align: left; cursor: pointer; }
@@ -193,6 +214,10 @@ body.map-open main { display: none; }
 #map-canvas { position: relative; flex: 1; min-width: 0; overflow: hidden; background: #0b1017; }
 #map-svg { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
 #map-svg.is-panning { cursor: grabbing; }
+#map-tip { position: absolute; z-index: 11; max-width: 380px; max-height: 300px; overflow: hidden; padding: 6px 8px; background: #0a1016; color: #d4d4d4; font: 11px/1.45 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-word; pointer-events: none; }
+#map-menu { position: absolute; z-index: 12; min-width: 170px; padding: 3px; background: #141c25; }
+#map-menu button { display: block; width: 100%; height: 25px; padding: 0 8px; background: transparent; color: #c9d1d9; border: 0; font: 11px/1 system-ui, "Segoe UI", sans-serif; text-align: left; cursor: pointer; }
+#map-menu button:hover { background: #1d2833; color: #e6edf3; }
 #map-status { position: absolute; left: 12px; top: 10px; right: 12px; font-size: 11px; pointer-events: none; }
 #map-status .box { display: inline-block; margin: 0 6px 4px 0; padding: 4px 7px; background: #16202b; color: #aab8c5; pointer-events: auto; }
 #map-status .box.is-error { background: #2a1a18; color: #ffb4a8; }
@@ -216,14 +241,23 @@ body.map-open main { display: none; }
 #map-detail .note { margin-top: 8px; color: #ffd7a8; font-size: 10px; word-break: break-word; }
 #map-detail button { display: block; width: 100%; height: 24px; margin-top: 8px; background: #1d2632; color: #c9d1d9; border: 0; font: 10px/1 system-ui, "Segoe UI", sans-serif; cursor: pointer; }
 #map-detail button:hover { background: #26313f; }
+#map-detail .code-link, #map-results .code-link { display: inline; width: auto; height: auto; margin: 0; padding: 0; background: none; color: #9fc7f5; font: inherit; }
+#map-detail .code-link:hover, #map-results .code-link:hover { background: none; color: #e6edf3; }
 #map-footer { flex: none; display: flex; align-items: center; gap: 10px 14px; padding: 4px 10px; background: #10161e; color: #7d8b99; font-size: 10px; flex-wrap: wrap; }
+#map-busy { display: inline-flex; align-items: center; gap: 6px; color: #9fc7f5; }
+#map-busy[hidden] { display: none; }
+#map-busy .busy-bar { position: relative; display: inline-block; width: 26px; height: 2px; background: #22303f; overflow: hidden; }
+#map-busy .busy-bar::after { content: ''; position: absolute; top: 0; left: 0; width: 40%; height: 100%; background: #58a6ff; animation: map-busy 0.9s linear infinite; }
+@keyframes map-busy { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
 #map-footer .legend { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 #map-footer .key { display: inline-flex; align-items: center; gap: 4px; }
 #map-footer .swatch { display: inline-block; width: 12px; height: 2px; }
-#map-footer .swatch.static { background: #6e7f8f; }
-#map-footer .swatch.runtime { background: #3fb950; }
-#map-footer .swatch.both { background: #58a6ff; }
+#map-footer .swatch.send { background: #58a6ff; }
+#map-footer .swatch.receive { background: #3fb950; }
+#map-footer .swatch.gateway { background: #d29922; }
+#map-footer .swatch.server { background: #bc8cff; }
 #map-footer .dashed { color: #d29922; }
+#map-footer .faded { color: #56616d; }
 #map-footer .hub { color: #ffd7a8; }
 .flow-node { cursor: pointer; }
 .flow-node .box { fill: #18202b; }
@@ -241,14 +275,23 @@ body.map-open main { display: none; }
 .flow-node:hover .box { fill: #1d2836; }
 .flow-node.is-selected .box { fill: #223044; }
 .flow-node.is-selected .title { fill: #ffffff; }
-.flow-node.is-neighbor .box { fill: #1b2836; }
+.flow-node.is-chain .box { fill: #1b2836; }
 .flow-node.is-dimmed { opacity: 0.16; }
 .flow-edge { fill: none; stroke: #6e7f8f; stroke-width: 1.6; vector-effect: non-scaling-stroke; }
-.flow-edge.is-runtime { stroke: #3fb950; }
-.flow-edge.is-both { stroke: #58a6ff; }
+.flow-edge-hit { fill: none; stroke: transparent; stroke-width: 12; pointer-events: stroke; }
+.flow-edge.is-send { stroke: #58a6ff; }
+.flow-edge.is-receive { stroke: #3fb950; }
+.flow-edge.is-gateway { stroke: #d29922; }
+.flow-edge.is-server { stroke: #bc8cff; }
+.flow-edge.is-neutral { stroke: #6e7f8f; }
+.flow-edge.is-static-only { opacity: 0.55; }
 .flow-edge.is-heuristic { stroke-dasharray: 5 3; }
-.flow-edge.is-lit { stroke-width: 2.2; }
+.flow-edge.is-lit { stroke-width: 2.4; }
 .flow-edge.is-dimmed { opacity: 0.12; }
+.flow-dir { fill: #8b98a5; font: 700 11px system-ui, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; pointer-events: none; }
+.flow-dir.is-send { fill: #58a6ff; }
+.flow-dir.is-receive { fill: #3fb950; }
+.flow-dir.is-dimmed { opacity: 0.12; }
 .flow-layer-label { fill: #56616d; font: 600 9px system-ui, "Segoe UI", sans-serif; letter-spacing: 0.1em; }
 .flow-node .time { fill: #7d8b99; font: 9px "Cascadia Mono", Consolas, monospace; text-anchor: end; }
 .flow-edge.is-bundle { stroke-width: 1.8; }
@@ -257,7 +300,7 @@ body.map-open main { display: none; }
 const MAP_MARKUP = `<div id="map" hidden>
         <div id="map-bar">
           <div id="map-search-wrap">
-            <input id="map-search" type="search" placeholder="Buscar nodo, ruta o SQL…" aria-label="Buscar en el mapa" spellcheck="false" />
+            <input id="map-search" type="search" placeholder="Buscar nodo, ruta, estado o SQL…" aria-label="Buscar en el mapa" spellcheck="false" />
             <div id="map-results" aria-label="Resultados del mapa" hidden></div>
           </div>
           <div id="map-scope" role="group" aria-label="Alcance del tráfico">
@@ -267,9 +310,11 @@ const MAP_MARKUP = `<div id="map" hidden>
           <select id="map-event" aria-label="Filtrar por evento" title="Atenúa los controles y las cadenas que no salen del evento elegido. Es una vista, no una relación causal.">
             <option value="">Todos los eventos</option>
           </select>
+          <label id="map-event-only-label" title="Oculta y re-apila solo los nodos alcanzables desde el evento elegido."><input type="checkbox" id="map-event-only" />Solo esos</label>
           <button type="button" id="map-zoom-out" title="Alejar" aria-label="Alejar">−</button>
           <button type="button" id="map-zoom-in" title="Acercar" aria-label="Acercar">+</button>
           <button type="button" id="map-fit">Ajustar</button>
+          <button type="button" id="map-tip-toggle" aria-pressed="false" title="Detalle al pasar el cursor; mantén Shift para verlo temporalmente.">Tooltip<span class="key">Shift</span></button>
           <button type="button" id="map-page" title="Cerrar la ventana del mapa">Cerrar mapa</button>
         </div>
         <div id="map-stack" aria-label="Cadena de tecnologías"></div>
@@ -280,19 +325,24 @@ const MAP_MARKUP = `<div id="map" hidden>
           </aside>
           <div id="map-canvas">
             <svg id="map-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+            <div id="map-tip" role="tooltip" hidden></div>
+            <div id="map-menu" role="menu" aria-label="Acciones del nodo" hidden></div>
             <div id="map-status"></div>
           </div>
           <aside id="map-detail" aria-label="Detalle del nodo" hidden></aside>
         </div>
         <div id="map-footer">
+          <span id="map-busy" hidden aria-live="polite"><span class="busy-bar"></span><span class="busy-label">Actualizando mapa…</span></span>
           <span id="map-stats"></span>
           <span class="legend">
-            <span class="key"><span class="swatch runtime"></span>RUNTIME</span>
-            <span class="key"><span class="swatch static"></span>STATIC</span>
-            <span class="key"><span class="swatch both"></span>ambas</span>
+            <span class="key"><span class="swatch send"></span>Envío</span>
+            <span class="key"><span class="swatch receive"></span>Recibo</span>
+            <span class="key"><span class="swatch gateway"></span>Gateway</span>
+            <span class="key"><span class="swatch server"></span>Servidor</span>
             <span class="key dashed">discontinua = heurística</span>
+            <span class="key faded">atenuada = solo estática</span>
           </span>
-          <span class="hub">Todos los controles de la página · clic en un nodo aísla y resalta el elemento · flechas convergentes se agrupan · solo se dibuja lo visible · SQL por ruta y ventana de 3 s</span>
+          <span class="hub">Clic izquierdo ilumina la cadena · clic derecho → «Ver interacciones» · doble flecha = ida y vuelta observada · tooltip con el botón o Shift · solo se dibuja lo visible</span>
         </div>
       </div>`;
 
@@ -304,6 +354,8 @@ export const FLOW_MAP_HTML = `<!doctype html>
     <title>Mapa de flujo</title>
     <style>${PANEL_CSS}
 body { display: flex; flex-direction: column; }
+#map-svg, #map-svg * { user-select: none; -webkit-user-select: none; }
+#map-detail, #map-detail *, #map-traces, #map-traces * { user-select: text; -webkit-user-select: text; }
     </style>
   </head>
   <body class="map-open">
@@ -365,6 +417,15 @@ export const INSPECTION_PANEL_HTML = `<!doctype html>
 
           <section>
             <h2>Peticiones</h2>
+            <input
+              id="request-search"
+              class="search"
+              type="search"
+              placeholder="Filtrar por estado, método o ruta…"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label="Filtrar peticiones por estado"
+            />
             <div id="requests"><div class="empty">Escuchando…</div></div>
           </section>
 

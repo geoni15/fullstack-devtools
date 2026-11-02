@@ -50,10 +50,24 @@ export interface FileContent {
   content: string;
 }
 
+export interface CodeLocationRequest {
+  path: string;
+  line: number;
+  endLine?: number | null;
+}
+
+export interface CodeLocation {
+  path: string;
+  line: number;
+  endLine: number | null;
+}
+
 export interface BdtApi {
   openWorkspace(): Promise<IpcResult<WorkspaceSnapshot | null>>;
   getState(): Promise<IpcResult<WorkspaceSnapshot | null>>;
   readFile(path: string): Promise<IpcResult<FileContent>>;
+  revealCode(location: CodeLocationRequest): Promise<IpcResult<CodeLocation | null>>;
+  onRevealLocation(listener: (location: CodeLocation) => void): () => void;
   onWorkspaceChanged(listener: () => void): () => void;
   detectProjectSetup(): Promise<IpcResult<ProjectSetupDetection | null>>;
   configureBrowser(targets: BrowserTargetsRequest): Promise<IpcResult<BrowserSnapshot>>;

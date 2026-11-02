@@ -4,6 +4,8 @@ export const IPC_CHANNELS = {
   openWorkspace: 'workspace:open',
   getState: 'workspace:state',
   readFile: 'file:read',
+  revealCode: 'code:reveal',
+  revealLocation: 'code:reveal-location',
   workspaceChanged: 'workspace:changed',
   detectProjectSetup: 'project:detect-setup',
   browserConfigure: 'browser:configure',
@@ -26,6 +28,14 @@ export const READ_FILE_REQUEST_SCHEMA = z.strictObject({
 });
 
 export type ParsedReadFileRequest = z.infer<typeof READ_FILE_REQUEST_SCHEMA>;
+
+export const CODE_LOCATION_REQUEST_SCHEMA = z.strictObject({
+  path: z.string().min(1).max(4096),
+  line: z.number().int().min(1).max(10_000_000),
+  endLine: z.number().int().min(1).max(10_000_000).nullable().optional(),
+});
+
+export type ParsedCodeLocationRequest = z.infer<typeof CODE_LOCATION_REQUEST_SCHEMA>;
 
 export const WORKSPACE_CHANGED_PAYLOAD_SCHEMA = z.strictObject({});
 

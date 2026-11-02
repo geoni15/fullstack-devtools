@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ActivityCategory, ActivityEvent } from '@bdt/protocol';
 import { useBrowser } from '../state/browser-store';
+import { CodeLink } from './CodeLink';
 
 type Filter = 'all' | ActivityCategory;
 
@@ -124,7 +125,12 @@ export function ActivityLog() {
                       </span>
                     ) : null}
                   </span>
-                  <span className="activity-where mono">{where}</span>
+                  <CodeLink
+                    file={event.file}
+                    line={event.line}
+                    label={where}
+                    className="activity-where mono"
+                  />
                 </div>
               );
             })}

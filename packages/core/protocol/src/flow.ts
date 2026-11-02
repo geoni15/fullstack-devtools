@@ -79,12 +79,14 @@ export interface FlowNode {
   traceIds: string[];
   evidence: FlowEvidenceKind[];
   occurrences: number;
+  countLabel?: string | null;
   firstSeen: number;
   lastSeen: number;
   note: string | null;
   statusCode?: number | null;
   durationMs?: number | null;
   outcome?: RequestOutcome | null;
+  backendObserved?: boolean | null;
   origin?: RequestOrigin | null;
   initiatorFunction?: string | null;
   operation?: InspectionSqlOperation | null;

@@ -138,10 +138,27 @@ export interface ActivityEvent {
   line: number | null;
 }
 
+export type ConsoleSource = 'frontend' | 'backend';
+
+export type ConsoleLevel = 'log' | 'info' | 'debug' | 'warn' | 'error' | 'exception';
+
+export interface ConsoleEntry {
+  id: string;
+  at: number;
+  source: ConsoleSource;
+  level: ConsoleLevel;
+  text: string;
+  url: string | null;
+  file: string | null;
+  line: number | null;
+  column: number | null;
+}
+
 export interface BrowserSnapshot {
   state: BrowserState;
   requests: CapturedRequest[];
   activity: ActivityEvent[];
+  consoleEntries: ConsoleEntry[];
 }
 
 export type BrowserEvent =
@@ -149,7 +166,9 @@ export type BrowserEvent =
   | { type: 'requests'; requests: CapturedRequest[]; requestCount: number }
   | { type: 'requests-cleared' }
   | { type: 'activity'; activity: ActivityEvent[] }
-  | { type: 'activity-cleared' };
+  | { type: 'activity-cleared' }
+  | { type: 'console'; entries: ConsoleEntry[] }
+  | { type: 'console-cleared' };
 
 export type InspectionStatus = 'resolving' | 'listening' | 'done';
 
@@ -350,6 +369,7 @@ export const BROWSER_CHROME_CHANNELS = {
   forward: 'browser-chrome:forward',
   reload: 'browser-chrome:reload',
   toggleInspection: 'browser-chrome:toggle-inspection',
+  toggleHoverTip: 'browser-chrome:toggle-hover-tip',
 } as const;
 
 export const BROWSER_PANEL_CHANNELS = {
@@ -360,6 +380,8 @@ export const BROWSER_PANEL_CHANNELS = {
   map: 'browser-panel:map',
   mapData: 'browser-panel:map-data',
   highlight: 'browser-panel:highlight',
+  shift: 'browser-panel:shift',
+  revealLocation: 'browser-panel:reveal-location',
 } as const;
 
 export interface BrowserChromeState {
@@ -368,6 +390,7 @@ export interface BrowserChromeState {
   loading: boolean;
   captureActive: boolean;
   inspectionEnabled: boolean;
+  hoverTipPinned: boolean;
   canGoBack: boolean;
   canGoForward: boolean;
   message: string | null;

@@ -3,9 +3,12 @@ import {
   BdtError,
   BROWSER_CHROME_CHANNELS,
   BROWSER_PANEL_CHANNELS,
+  CODE_LOCATION_REQUEST_SCHEMA,
   ERROR_CODES,
   INSPECTION_MODES,
   toIpcError,
+  type CodeLocation,
+  type CodeLocationRequest,
   type InspectionMode,
   type IpcResult,
 } from '@bdt/protocol';
@@ -54,7 +57,11 @@ function isInspectorUiSender(browser: BrowserController, event: SenderEvent): bo
   );
 }
 
-export function registerBrowserWindowIpc(browser: BrowserController, logger: Logger): void {
+export function registerBrowserWindowIpc(
+  browser: BrowserController,
+  logger: Logger,
+  revealCode: (request: CodeLocationRequest) => CodeLocation | null,
+): void {
   ipcMain.on(BROWSER_CHROME_CHANNELS.ready, (event) => {
     if (!isMainFrame(event)) return;
     browser.handleChromeReady(event.sender);
@@ -92,6 +99,10 @@ export function registerBrowserWindowIpc(browser: BrowserController, logger: Log
     {
       channel: BROWSER_CHROME_CHANNELS.toggleInspection,
       action: (sender) => browser.chromeToggleInspection(sender),
+    },
+    {
+      channel: BROWSER_CHROME_CHANNELS.toggleHoverTip,
+      action: (sender) => browser.chromeToggleHoverTip(sender),
     },
   ];
 
@@ -176,6 +187,19 @@ export function registerBrowserWindowIpc(browser: BrowserController, logger: Log
       browser.highlightFlowElement(key, record.selector);
     } catch (error) {
       logger.error('Fallo al resaltar el elemento del mapa en la página', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  ipcMain.on(BROWSER_PANEL_CHANNELS.revealLocation, (event, payload: unknown) => {
+    if (!isInspectorUiSender(browser, event)) return;
+    const parsed = CODE_LOCATION_REQUEST_SCHEMA.safeParse(payload);
+    if (!parsed.success) return;
+    try {
+      revealCode(parsed.data);
+    } catch (error) {
+      logger.error('Fallo al abrir una ubicación de código desde el inspector', {
         message: error instanceof Error ? error.message : String(error),
       });
     }

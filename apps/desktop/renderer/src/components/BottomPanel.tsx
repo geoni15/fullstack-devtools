@@ -2,15 +2,16 @@ import { useState } from 'react';
 import { useBrowser } from '../state/browser-store';
 import { useWorkspace } from '../state/workspace-store';
 import { ActivityLog } from './ActivityLog';
+import { ConsolePanel } from './ConsolePanel';
 import { Timeline } from './Timeline';
 
-const BOTTOM_TABS = ['Registro', 'Peticiones', 'Terminal', 'Problemas'] as const;
+const BOTTOM_TABS = ['Registro', 'Peticiones', 'Consola', 'Problemas'] as const;
 type BottomTab = (typeof BOTTOM_TABS)[number];
 
 const TAB_TEST_ID: Record<BottomTab, string> = {
   Registro: 'bottom-tab-registro',
   Peticiones: 'bottom-tab-peticiones',
-  Terminal: 'bottom-tab-terminal',
+  Consola: 'bottom-tab-consola',
   Problemas: 'bottom-tab-problemas',
 };
 
@@ -19,6 +20,9 @@ export function BottomPanel() {
   const browser = useBrowser();
   const [active, setActive] = useState<BottomTab>('Registro');
   const requestCount = browser.state.requests.length;
+  const consoleProblems = browser.state.consoleEntries.filter(
+    (entry) => entry.level === 'warn' || entry.level === 'error' || entry.level === 'exception',
+  ).length;
 
   return (
     <section className="panel bottom-panel">
@@ -37,6 +41,9 @@ export function BottomPanel() {
             {tab === 'Peticiones' && requestCount > 0 ? (
               <span className="badge-count">{requestCount}</span>
             ) : null}
+            {tab === 'Consola' && consoleProblems > 0 ? (
+              <span className="badge-error">{consoleProblems}</span>
+            ) : null}
             {tab === 'Problemas' && state.error !== null ? (
               <span className="badge-error">1</span>
             ) : null}
@@ -46,15 +53,14 @@ export function BottomPanel() {
 
       <div
         className={`bottom-body${
-          active === 'Registro' || active === 'Peticiones' ? ' is-timeline' : ''
+          active === 'Registro' || active === 'Peticiones' || active === 'Consola'
+            ? ' is-timeline'
+            : ''
         }`}
       >
         {active === 'Registro' ? <ActivityLog /> : null}
         {active === 'Peticiones' ? <Timeline /> : null}
-
-        {active === 'Terminal' ? (
-          <p className="empty-text">El ejecutor de procesos con entorno inyectado llega en F4.</p>
-        ) : null}
+        {active === 'Consola' ? <ConsolePanel /> : null}
 
         {active === 'Problemas' ? (
           state.error !== null ? (

@@ -952,3 +952,191 @@ se resalta nada. La unión de líneas es una simplificación visual: comparte de
 causalidad, y las etiquetas STATIC/RUNTIME y directa/heurística se conservan. El mapa ya no ocupa el
 panel; el botón «Mapa» abre una ventana que puede quedar detrás o delante de la del navegador según el
 gestor de ventanas.
+
+## ADR-044 — Tooltip del mapa bajo demanda, dirección por color y foco por menú contextual
+
+**Contexto:** el mapa usaba `<title>` nativo en cada nodo y arista: aparecía siempre, sin estilo y con
+retardo del sistema, y no se podía desactivar. Además todas las aristas compartían la misma geometría y
+solo cambiaban de color por evidencia STATIC/RUNTIME, así que no se distinguía un envío de una respuesta,
+un gateway HTTP o una llamada al servidor. El clic izquierdo sobre un nodo enfocaba de inmediato toda su
+cadena, ocultaba el resto, re-apilaba y ajustaba la vista, de modo que explorar dos nodos encadenaba
+re-layouts completos y no dejaba ver solo las conexiones del nodo elegido.
+**Decisión:** (1) **Tooltip bajo demanda:** se eliminan los `<title>` nativos y se dibuja un tooltip HTML
+propio en `#map-tip`, con el mismo texto enriquecido del nodo o de la arista. Está apagado por defecto;
+el botón «Tooltip» lo fija y, mientras no esté fijo, mantener Shift lo muestra solo mientras la tecla
+sigue pulsada. El botón indica el estado con `aria-pressed` y una tecla `Shift` al lado; el tooltip se
+oculta al cerrar la ventana, al re-renderizar, al salir del SVG o al desactivarlo. Las aristas añaden una
+ruta invisible de 12 px para que el hover no dependa del grosor del trazo. (2) **Dirección por color y
+geometría:** cada arista recibe una clase de flujo `send`, `receive`, `gateway`, `server` o `neutral`.
+Envío (azul) sale por la derecha; recibo (verde) sale por la izquierda y entra al nodo anterior por su
+lado derecho, invirtiendo los extremos cuando la arista original avanza de izquierda a derecha
+(`PROVENANCE`); gateway (ámbar) es toda arista que entra en un nodo `request`; servidor (violeta) cubre
+ruta, función, SQL, tabla y motor; estructura (gris) son `CONTAINS` y las aristas entre elementos, sin
+punta porque describen jerarquía. Las aristas de una sola dirección llevan `↑` o `↓` en el margen; las
+de ida y vuelta llevan punta en ambos extremos y no llevan glifo. La ida y vuelta no se inventa: gateway
+la muestra solo si la petición tiene `outcome` o `statusCode`; servidor, solo si la arista tiene evidencia
+RUNTIME y el nodo de origen está en el cierre directo de alguna petición con respuesta capturada. Las
+conexiones pendientes o sin respuesta quedan unidireccionales, las heurísticas siguen discontinuas y las
+solo estáticas se atenúan. Los troncos se agrupan por destino y clase de flujo, de modo que no se mezclan
+colores, y cada rama conserva su propia condición de ida y vuelta. (3) **Selección frente a foco:** el
+clic izquierdo marca el nodo, muestra su detalle, lo resalta en la página y ilumina toda su cadena
+—ancestros y descendientes alcanzables— atenuando el resto; no oculta, no re-apila y no mueve la cámara.
+El clic derecho abre `#map-menu` con «Ver interacciones» —que sí aísla ancestros y descendientes,
+recompacta y ajusta—, «Resaltar en la página» y «Quitar selección» —o «Quitar enfoque» cuando hay foco
+activo—. El clic en el vacío quita la selección y el enfoque y restaura el grafo completo; «Quitar
+enfoque» hace lo mismo desde el menú. El menú se cierra con `Escape`, rueda, clic fuera o pérdida de foco. El
+buscador y su acción de enfocar conservan el comportamiento anterior.
+**Consecuencia:** el mapa deja de mostrar carteles al pasar el cursor y el detalle aparece solo cuando el
+usuario lo pide con el botón o con Shift, sin texto adicional en el trazo. La dirección se lee por color,
+por el lado del que sale la línea y por la flecha del margen; las conexiones de ida y vuelta solo se
+dibujan cuando hay una respuesta observada, así que una petición pendiente no finge un regreso. El clic
+izquierdo permite saltar de un nodo a otro sin re-layouts ni pérdida de contexto, y el foco completo queda
+explícito en el menú contextual. El tooltip fijado se reinicia al reabrir el mapa; el menú y el tooltip
+no capturan el puntero del SVG, y el foco por menú sigue dependiendo de las aristas del grafo, no de
+tráfico demostrado.
+
+## ADR-045 — Tooltip del visor bajo demanda, cadena completa, estado en errores y filtro exclusivo por evento
+
+**Contexto:** el tooltip del visor de la página seguía apareciendo con cada hover, mientras que el del
+mapa ya era bajo demanda; el usuario aclaró que el cambio pendiente era el del visor. Además, el clic
+izquierdo del mapa iluminaba solo las conexiones directas del nodo, el clic en el vacío borraba el
+enfoque logrado desde el menú contextual, las peticiones fallidas perdían su código de estado en el
+subtítulo del mapa, en el hover del visor y en la cronología, y el filtro por evento solo atenuaba el
+resto del grafo sin ofrecer una vista exclusiva como «Ver interacciones».
+**Decisión:** (1) **Tooltip del visor bajo demanda:** el recuadro de procedencia del hover de la página
+queda apagado por defecto. La barra del navegador añade un botón «Tooltip» con la tecla `Shift` al lado,
+que lo fija y se sincroniza con el estado del controlador mediante un canal de la barra; mientras no
+esté fijo, mantener Shift lo muestra solo mientras la tecla sigue pulsada. El script de la página
+conserva el último dato de hover y decide su visibilidad con `__BDT_HOVER_TIP_PINNED__` y el estado real
+de Shift, sin depender de que el hover se repita: al soltar Shift se oculta y al pulsarlo se muestra el
+último dato vigente. La captura de procedencia para el mapa sigue igual; solo cambia la visibilidad.
+El tooltip del mapa no se modifica. (2) **Cadena completa:** el clic izquierdo calcula el alcance con
+`involvedScope(id, 'both')` —ancestros y descendientes estrictos— y lo usa para iluminar nodos y
+aristas, atenuando el resto sin ocultar ni re-apilar. Al pulsar un nodo con el mapa enfocado, el enfoque
+se conserva mientras se navega con clic izquierdo. (3) **Salida del enfoque:** el clic en el vacío
+llama a `clearSelection()`: quita nodo, detalle, resaltado de página y `focusScope`, y restaura el
+alcance general —o el subgrafo del evento si «Solo esos» está marcado— re-apilando y ajustando la vista;
+«Quitar enfoque» del menú contextual y el botón del estado producen la misma salida. (4) **Estado en errores:** el
+subtítulo de la petición en el mapa, el estado observado del hover y la cronología priorizan
+`statusCode` cuando existe; `failed` sin código se muestra como `ERR` y `error`, y `pending` como `…`.
+(5) **Filtro exclusivo por evento:** el selector de eventos conserva su comportamiento por defecto —solo
+ilumina los nodos alcanzables desde el evento elegido— y añade la casilla «Solo esos». Marcada, el
+alcance del mapa se intersecta con el subgrafo del evento, los nodos ajenos se ocultan y el subgrafo
+restante se re-apila y ajusta, como «Ver interacciones». Se desactiva el foco al activarla, se limpia la
+selección si el nodo elegido queda fuera y, al desmarcarla o quitar el evento, se restaura el alcance
+anterior.
+**Consecuencia:** el visor deja de tapar la página con carteles al pasar el cursor; el botón y Shift
+ofrecen el detalle cuando se necesita, y el estado del botón refleja el del controlador. El clic
+izquierdo muestra de una vez toda la cadena del nodo, que es la ruta completa hasta base de datos y no
+solo el tramo inmediato. El clic en el vacío sale del enfoque y devuelve el grafo general, y «Quitar
+enfoque» ofrece la misma salida desde el menú y el estado. Las respuestas con error conservan su código
+en las tres vistas. La casilla
+«Solo esos» es una vista más del grafo: no altera la captura ni los datos, y desmarcarla restaura el
+alcance previo. El tooltip fijado del visor persiste entre navegaciones hasta apagarlo, y el estado de
+Shift se lee del teclado de la página, por lo que soltarlo fuera de la ventana puede dejar el tooltip
+visible hasta el siguiente evento de teclado o de puntero.
+
+## ADR-046 — Estado de ciclo de vida, buscador por estado, consola, Shift global y contadores
+
+**Contexto:** las peticiones mostraban códigos sueltos, pero no distinguían «enviada y esperando»,
+«enviada y el servidor no respondió», «recibida con error» o «recibida correctamente pero el backend no
+se capturó»; además el estado no era buscable en el mapa, el panel ni la cronología. No existía una
+vista de consola: los `console.log`, advertencias, errores y excepciones de la página y la salida del
+backend solo eran visibles abriendo las herramientas del navegador o la terminal. Shift solo se leía del
+teclado de la página inspeccionada, así que al enfocar un botón del panel o de la barra el tooltip dejaba
+de responder hasta volver a hacer clic en la página. La casilla «Solo esos» se marcaba solo cuando el
+modelo terminaba de reconstruirse, lo que en cargas grandes parecía que no funcionaba. El texto del SVG
+se podía seleccionar, y los nodos no indicaban cuántas veces se había interactuado con cada elemento,
+manejador, ruta o consulta.
+
+**Decisión:** (1) **Modelo de estado:** `packages/core/protocol/src/status.ts` define
+`RequestStatusView` a partir de `outcome`, `statusCode`, `error` y `backendObserved`. Ocho clases
+—informativa, correcta, redirección, error del cliente, error del servidor, sin respuesta, pendiente y
+sin estado—, con tono, código (`200`, `ERR`, `···`, `—`), frase de razón en español, etiqueta y fase.
+La fase distingue el punto del ciclo: «Enviada · esperando respuesta del servidor», «Enviada · el
+servidor no respondió», «Enviada · sin estado reportado», «Recibida · respuesta provisional», «Recibida
+· ejecución del backend capturada» o «Recibida · ejecución del backend no capturada», entre otras. El
+mismo modelo produce un texto normalizado de búsqueda que incluye código, frase, categoría (`4xx`,
+`5xx`), clase, fase, `outcome` y evidencia del backend. El mapa lo usa en el subtítulo y en la búsqueda
+de nodos; el panel, en el filtro de peticiones y en la tarjeta; la cronología, en la columna de estado y
+en su buscador. (2) **Consola:** el protocolo añade `ConsoleEntry` —hora, origen `frontend`/`backend`,
+nivel, texto, URL o archivo y línea/columna— y los eventos `console` y `console-cleared`. En la página,
+el controlador habilita `Runtime` y `Log` por CDP y escucha `Runtime.consoleAPICalled`,
+`Runtime.exceptionThrown` y `Log.entryAdded`; los registros de `Log` con origen `javascript` se omiten
+porque las excepciones ya llegan por `Runtime.exceptionThrown`. En los procesos lanzados por la app, la
+salida `stdout`/`stderr` se acumula por líneas, se limpia de secuencias ANSI y llama a `onOutput`; cada
+línea del backend queda como entrada `backend` y la del frontend lanzado como `frontend`. El renderer
+fusiona las entradas por hora y las muestra en la pestaña «Consola» con filtros «Todo», «Frontend» y
+«Backend», y con «Solo problemas» para advertencias, errores y excepciones; la pestaña muestra un
+contador de problemas y la lista se autodesplaza solo si el usuario está al final. La consola se vacía
+al limpiar la sesión y al desconectar. (3) **Shift global:** el proceso principal registra
+`before-input-event` en cada `webContents` de la aplicación —ventana principal, barra del navegador,
+panel de inspección, vista de la página y ventana del mapa— y mantiene un único estado de Shift; al
+cambiar, actualiza `__BDT_SHIFT_HELD__` en el mundo aislado del inspector y envía el estado a la ventana
+del mapa por el canal `browser-panel:shift`. `blur` y `destroyed` lo sueltan, y desconectar lo reinicia.
+El tooltip del visor ya no depende del foco de la página: responde igual con el foco en el panel o en
+los botones HTML/CSS, Frontend o Backend; esto sustituye la lectura de Shift limitada al teclado de la
+página descrita en ADR-045. (4) **«Solo esos» inmediata:** el cambio de la casilla y del
+selector de evento actualiza el estado visual al instante y programa el recálculo pesado 32 ms después,
+de modo que el navegador pinta la marca antes de re-apilar. El filtro de evento se conserva mientras el
+modelo se reconstruye y solo se descarta cuando un modelo terminado ya no contiene ese evento. El pie del
+mapa muestra un indicador con animación de transformación —«Actualizando mapa…» durante la construcción
+y «Aplicando filtro…» durante el recálculo—, sin bloquear la interacción. (5) **Texto no copiable en el
+mapa:** el CSS desactiva la selección en `#map-svg` y sus descendientes; el detalle, el rail de
+interacciones y las listas laterales la mantienen activa, así que el texto copiable es el del panel. (6)
+**Contadores:** cada nodo conserva `occurrences` y una etiqueta según su tipo —elemento: «Interacciones»;
+manejador: «Ejecuciones»; ruta: «Peticiones recibidas»; función: «Peticiones manejadas»; consulta:
+«Ejecuciones»; tabla y base de datos: «Consultas ejecutadas»—. Las tablas y bases de datos suman las
+ejecuciones de las consultas que las leen o escriben. El tooltip, el detalle y las notas muestran el
+recuento cuando es mayor que uno.
+
+**Consecuencia:** el estado de una petición se lee igual en el mapa, el panel y la cronología, y se
+puede buscar por código (`404`), frase («No encontrado»), categoría (`4xx`), «pendiente», «ERR» o
+evidencia del backend. Una respuesta correcta sin ejecución capturada se distingue de una ejecución
+observada, y una petición enviada sin respuesta no se confunde con un error HTTP. La consola reúne en
+orden cronológico los mensajes de la página y la salida de los procesos, con filtros por origen y una
+vista de problemas; las líneas del backend se muestran mientras la app las lanza, y las excepciones no
+se duplican. Shift funciona con independencia del foco, aunque al perder el foco de la ventana el estado
+se suelta y el tooltip se oculta. La casilla responde al primer clic y el indicador del pie hace visible
+el trabajo pendiente. Los recuentos describen actividad observada de la sesión, no llamadas internas que
+el runtime no exponga; no alteran el grafo ni la captura, y las etiquetas de evidencia siguen
+distinguiendo STATIC de RUNTIME.
+
+## ADR-047 — Enlaces de código al editor y casilla «Solo esos» sin evento elegido
+
+**Contexto:** el panel, el mapa, el registro de actividad, la consola y la cronología mostraban
+`archivo:línea` como texto plano. Para revisar la función había que copiar la ruta, buscarla a mano en el
+explorador y localizar la línea. Además, la casilla «Solo esos» del mapa solo se habilitaba cuando el
+selector tenía un evento elegido: sin evento quedaba deshabilitada y forzada a desmarcarse, así que los
+clics no producían ningún cambio y parecía rota.
+
+**Decisión:** (1) **Contrato:** el protocolo añade `CodeLocationRequest` —ruta, línea y `endLine`
+opcional— y `CodeLocation` normalizada, con los canales `code:reveal` (renderer → main),
+`code:reveal-location` (main → renderer) y `browser-panel:reveal-location` (panel o mapa → main). (2)
+**Normalización en main:** `apps/desktop/main/src/code-location.ts` resuelve rutas relativas al proyecto,
+convierte URL `http(s)` de `localhost`, `127.0.0.1` o `::1` a su ruta de proyecto y rechaza rutas que
+escapan del workspace, archivos inexistentes y orígenes externos. El proceso principal restaura y enfoca
+la ventana principal, y solo entonces emite `code:reveal-location`; si la ubicación no se puede resolver,
+devuelve `null` y no mueve la ventana. (3) **Editor:** el renderer abre o activa la pestaña del archivo,
+cambia a la vista de archivo y pasa al editor un objetivo con `line`, `endLine` y un `nonce` que fuerza el
+re-render. Monaco crea una decoración de línea completa para el rango y lo centra con
+`revealLinesInCenter`; el rango nunca excede las líneas del modelo. (4) **Enlaces:** el panel convierte en
+enlaces la ubicación del manejador, el `archivo:línea` de cada petición, los pasos BACKEND y SQL de la
+secuencia, la ejecución, el encabezado de cada bloque de código y cada consulta; el mapa hace lo propio en
+la fila «Ubicación», en las rutas alcanzables y en los resultados del buscador —que pasan de `<button>` a
+`div` con rol y teclado para poder anidar el enlace—; la ventana principal usa `CodeLink` en el registro,
+la consola y los frames de la cronología. El enlace lleva el rango de la función cuando el índice estático
+o el bloque de código lo conocen: la ejecución y las SQL toman el rango del manejador cuando la línea cae
+dentro de él, y si no, el del bloque de código; las ubicaciones sueltas resaltan solo su línea. (5)
+**Casilla «Solo esos»:** deja de deshabilitarse y de desmarcarse sin evento. Al marcarla se limpia el
+enfoque y, si no hay evento elegido, se selecciona el primero disponible; si todavía no hay eventos, la
+casilla queda marcada y el mapa muestra un aviso, y en cuanto la reconstrucción encuentra eventos el
+filtro toma el primero. Al elegir explícitamente «Todos los eventos» en el selector, la casilla se
+desmarca. El cambio sigue aplicándose de inmediato y el recálculo pesado se programa como en ADR-046.
+
+**Consecuencia:** cualquier `archivo:línea` resoluble del proyecto es un punto de salto al editor con la
+función completa marcada, sin copiar rutas; las ubicaciones externas o inexistentes no abren una pestaña
+errónea. El resaltado es una decoración de lectura y no modifica el archivo. La casilla «Solo esos»
+responde al primer clic, con o sin evento seleccionado, y no queda silenciosamente desmarcada cuando el
+modelo se reconstruye; si aún no hay eventos, el estado queda visible en el aviso del mapa.
+

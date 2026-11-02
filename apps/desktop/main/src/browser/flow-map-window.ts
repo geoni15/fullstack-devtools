@@ -11,6 +11,7 @@ export class FlowMapWindow {
   private window: BrowserWindow | null = null;
   private ready = false;
   private state: FlowMapState | null = null;
+  private shiftHeld = false;
 
   constructor(
     private readonly preloadPath: string,
@@ -89,6 +90,7 @@ export class FlowMapWindow {
     this.window = null;
     this.ready = false;
     this.state = null;
+    this.shiftHeld = false;
     if (window !== null && !window.isDestroyed()) {
       window.close();
     }
@@ -99,16 +101,35 @@ export class FlowMapWindow {
     return window !== null && !window.isDestroyed() && sender === window.webContents;
   }
 
+  webContents(): WebContents | null {
+    const window = this.window;
+    return window !== null && !window.isDestroyed() ? window.webContents : null;
+  }
+
   handleReady(sender: WebContents): boolean {
     if (!this.isSender(sender)) return false;
     this.ready = true;
     this.send();
+    this.sendShift();
     return true;
+  }
+
+  setShiftHeld(held: boolean): void {
+    if (this.shiftHeld === held) return;
+    this.shiftHeld = held;
+    this.sendShift();
   }
 
   updateMap(state: FlowMapState): void {
     this.state = state;
     this.send();
+  }
+
+  private sendShift(): void {
+    const window = this.window;
+    if (!this.ready || window === null || window.isDestroyed()) return;
+    if (window.webContents.isDestroyed()) return;
+    window.webContents.send(BROWSER_PANEL_CHANNELS.shift, this.shiftHeld);
   }
 
   private send(): void {

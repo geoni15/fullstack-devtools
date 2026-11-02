@@ -17,6 +17,7 @@ export interface LaunchOptions {
   inspectorPort: number | null;
   readyUrl: string | null;
   onUnexpectedExit: (code: number | null) => void;
+  onOutput?: (stream: 'stdout' | 'stderr', line: string) => void;
 }
 
 export interface LaunchedProcess {
@@ -109,6 +110,8 @@ export class AppLauncher {
   private stopping = false;
   private output = '';
   private exitHandler: ((code: number | null) => void) | null = null;
+  private outputHandler: ((stream: 'stdout' | 'stderr', line: string) => void) | null = null;
+  private readonly lineBuffers: Record<'stdout' | 'stderr', string> = { stdout: '', stderr: '' };
 
   constructor(private readonly log: Logger) {}
 
@@ -123,6 +126,9 @@ export class AppLauncher {
     this.ready = false;
     this.output = '';
     this.exitHandler = options.onUnexpectedExit;
+    this.outputHandler = options.onOutput ?? null;
+    this.lineBuffers.stdout = '';
+    this.lineBuffers.stderr = '';
 
     const env = { ...process.env };
     if (options.port !== null) {
@@ -176,13 +182,18 @@ export class AppLauncher {
       this.append(`Error al ejecutar el ${options.label}: ${error.message}`);
     });
     child.stdout?.on('data', (chunk: Buffer) => {
-      this.append(chunk.toString('utf8'));
+      const text = chunk.toString('utf8');
+      this.append(text);
+      this.emitLines('stdout', text);
     });
     child.stderr?.on('data', (chunk: Buffer) => {
-      this.append(chunk.toString('utf8'));
+      const text = chunk.toString('utf8');
+      this.append(text);
+      this.emitLines('stderr', text);
     });
     child.on('exit', (code) => {
       if (this.generation !== generation) return;
+      this.flushOutput();
       const wasReady = this.ready;
       this.child = null;
       this.ready = false;
@@ -242,6 +253,7 @@ export class AppLauncher {
     this.stopping = true;
     this.ready = false;
     this.exitHandler = null;
+    this.flushOutput();
     const child = this.child;
     this.child = null;
     if (child === null || child.exitCode !== null || child.pid === undefined) {
@@ -281,6 +293,31 @@ export class AppLauncher {
 
   private append(text: string): void {
     this.output = (this.output + text).slice(-MAX_OUTPUT_CHARS);
+  }
+
+  private emitLines(stream: 'stdout' | 'stderr', text: string): void {
+    const handler = this.outputHandler;
+    if (handler === null) return;
+    const parts = (this.lineBuffers[stream] + text).split(/\r?\n/);
+    this.lineBuffers[stream] = parts.pop() ?? '';
+    for (const part of parts) {
+      const line = sanitizeOutput(part).trimEnd();
+      if (line.trim() !== '') {
+        handler(stream, line);
+      }
+    }
+  }
+
+  private flushOutput(): void {
+    const handler = this.outputHandler;
+    for (const stream of ['stdout', 'stderr'] as const) {
+      const line = sanitizeOutput(this.lineBuffers[stream]).trim();
+      this.lineBuffers[stream] = '';
+      if (handler !== null && line !== '') {
+        handler(stream, line);
+      }
+    }
+    this.outputHandler = null;
   }
 
   private async inspectorReady(port: number): Promise<boolean> {

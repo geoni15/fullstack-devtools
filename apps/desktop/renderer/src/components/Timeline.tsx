@@ -1,6 +1,13 @@
 import { useState } from 'react';
-import type { CapturedBody, CapturedRequest, RequestOrigin } from '@bdt/protocol';
+import {
+  normalizeSearchText,
+  requestStatusView,
+  type CapturedBody,
+  type CapturedRequest,
+  type RequestOrigin,
+} from '@bdt/protocol';
 import { useBrowser } from '../state/browser-store';
+import { CodeLink } from './CodeLink';
 
 type Filter = 'all' | RequestOrigin;
 
@@ -58,17 +65,15 @@ function requestSteps(request: CapturedRequest): SequenceStep[] {
   });
 
   if (request.durationMs !== null) {
-    const failed = request.outcome === 'failed';
-    const text = failed
-      ? `ERR${request.error !== null ? ` · ${request.error}` : ''}`
-      : `${request.statusCode !== null ? String(request.statusCode) : '—'} · ${formatDuration(
-          request.durationMs,
-        )}`;
+    const view = requestStatus(request);
+    const text = `${view.label} · ${formatDuration(request.durationMs)}${
+      request.error !== null ? ` · ${request.error}` : ''
+    }`;
     steps.push({
       at: request.wallStartedAt + request.durationMs,
       tag: 'Respuesta',
       text,
-      tone: failed ? 'error' : 'ok',
+      tone: view.tone === 'error' ? 'error' : 'ok',
     });
   } else {
     steps.push({
@@ -108,19 +113,37 @@ function RequestSequence({ request }: { request: CapturedRequest }) {
   );
 }
 
-function statusLabel(request: CapturedRequest): string {
-  if (request.outcome === 'failed') return 'ERR';
-  if (request.statusCode === null) return request.outcome === 'pending' ? '···' : '—';
-  return String(request.statusCode);
+function requestStatus(request: CapturedRequest): ReturnType<typeof requestStatusView> {
+  return requestStatusView({
+    statusCode: request.statusCode,
+    outcome: request.outcome,
+    error: request.error,
+  });
 }
 
 function statusTone(request: CapturedRequest): string {
-  if (request.outcome === 'failed') return 'is-error';
-  if (request.statusCode === null) return 'is-idle';
-  if (request.statusCode >= 500) return 'is-error';
-  if (request.statusCode >= 400) return 'is-warning';
-  if (request.statusCode >= 300) return 'is-muted';
-  return 'is-ok';
+  const tone = requestStatus(request).tone;
+  if (tone === 'ok') return 'is-ok';
+  if (tone === 'warning') return 'is-warning';
+  if (tone === 'error') return 'is-error';
+  if (tone === 'pending') return 'is-idle';
+  return 'is-muted';
+}
+
+function matchesRequest(request: CapturedRequest, query: string): boolean {
+  if (query === '') return true;
+  const status = requestStatus(request);
+  const parts = [
+    status.search,
+    request.method,
+    request.path,
+    request.host,
+    request.url,
+    initiatorLabel(request),
+  ];
+  return parts.some(
+    (part) => part !== null && part !== undefined && normalizeSearchText(part).includes(query),
+  );
 }
 
 function initiatorLabel(request: CapturedRequest): string {
@@ -155,6 +178,7 @@ function JsonBody({ label, body }: { label: string; body: CapturedBody | null })
 function RequestDetail({ request }: { request: CapturedRequest }) {
   const headers = Object.entries(request.headers);
   const frames = request.initiator?.frames ?? [];
+  const status = requestStatus(request);
 
   return (
     <div className="request-detail" data-testid={`request-detail-${request.id}`}>
@@ -166,6 +190,10 @@ function RequestDetail({ request }: { request: CapturedRequest }) {
           {ORIGIN_LABEL[request.origin]} · {formatDuration(request.durationMs)}
           {request.mimeType !== null ? ` · ${request.mimeType}` : ''}
         </span>
+        <span className="detail-value">
+          {status.label} · {status.phase}
+        </span>
+        <span className="detail-meta">{status.detail}</span>
         {request.error !== null ? <span className="detail-error">{request.error}</span> : null}
       </div>
 
@@ -191,9 +219,12 @@ function RequestDetail({ request }: { request: CapturedRequest }) {
                 {frames.map((frame, index) => (
                   <li key={`${frame.url}:${frame.line}:${frame.column}:${index}`}>
                     <span className="initiator-fn">{frame.functionName ?? '(anónima)'}</span>
-                    <span className="initiator-loc mono">
-                      {frame.url}:{frame.line}:{frame.column}
-                    </span>
+                    <CodeLink
+                      file={frame.url}
+                      line={frame.line}
+                      label={`${frame.url}:${frame.line}:${frame.column}`}
+                      className="initiator-loc mono"
+                    />
                   </li>
                 ))}
               </ul>
@@ -225,6 +256,7 @@ function RequestDetail({ request }: { request: CapturedRequest }) {
 export function Timeline() {
   const { state } = useBrowser();
   const [filter, setFilter] = useState<Filter>('all');
+  const [query, setQuery] = useState('');
   const [expanded, setExpanded] = useState<string | null>(null);
   const browser = state.state;
   const connected = browser?.connected ?? false;
@@ -237,7 +269,11 @@ export function Timeline() {
     external: requests.filter((request) => request.origin === 'external').length,
   };
 
-  const visible = requests.filter((request) => filter === 'all' || request.origin === filter);
+  const normalizedQuery = normalizeSearchText(query.trim());
+  const visible = requests.filter(
+    (request) =>
+      (filter === 'all' || request.origin === filter) && matchesRequest(request, normalizedQuery),
+  );
 
   return (
     <div className="timeline" data-testid="timeline">
@@ -258,6 +294,15 @@ export function Timeline() {
             </button>
           ))}
         </div>
+        <input
+          type="search"
+          className="timeline-search"
+          placeholder="Buscar por estado, método o ruta…"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          aria-label="Buscar peticiones por estado"
+          data-testid="timeline-search"
+        />
         <span className="timeline-meta">
           {connected ? 'N0 · observación de red' : 'N0 · sin sesión'}
         </span>
@@ -314,8 +359,12 @@ export function Timeline() {
                         {ORIGIN_LABEL[request.origin]}
                       </span>
                     </span>
-                    <span className={`request-status ${statusTone(request)}`} role="cell">
-                      {statusLabel(request)}
+                    <span
+                      className={`request-status ${statusTone(request)}`}
+                      role="cell"
+                      title={`${requestStatus(request).phase} · ${requestStatus(request).detail}`}
+                    >
+                      {requestStatus(request).label}
                     </span>
                     <span className="request-duration" role="cell">
                       {formatDuration(request.durationMs)}

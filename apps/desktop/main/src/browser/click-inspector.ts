@@ -132,6 +132,8 @@ ${PAGE_DOM_HELPERS_SOURCE}
   let tipCode = null;
   let tipFooter = null;
   let boxHost = null;
+  let lastTipData = null;
+  let shiftHeldNow = false;
 
   const ensureBox = () => {
     if (boxHost !== null && boxHost.isConnected) return;
@@ -306,6 +308,25 @@ ${PAGE_DOM_HELPERS_SOURCE}
 
   globalThis.__bdtShowTip = (data) => {
     if (!data || typeof data !== 'object') return;
+    lastTipData = data;
+    syncTipVisibility();
+  };
+
+  const syncTipVisibility = () => {
+    const enabled =
+      globalThis.__BDT_HOVER_TIP_PINNED__ === true ||
+      globalThis.__BDT_SHIFT_HELD__ === true ||
+      shiftHeldNow;
+    if (lastTipData !== null && enabled) {
+      renderTip(lastTipData);
+      return;
+    }
+    if (tipHost !== null) style(tipHost, 'display', 'none');
+  };
+
+  globalThis.__bdtHoverTipSync = syncTipVisibility;
+
+  const renderTip = (data) => {
     ensureTip();
     const modeName = typeof data.mode === 'string' ? data.mode : 'html';
     tipMode.dataset.mode = modeName;
@@ -377,6 +398,7 @@ ${PAGE_DOM_HELPERS_SOURCE}
   globalThis.__bdtHoverClear = () => {
     hoverTarget = null;
     globalThis.__bdtHoverTarget = null;
+    lastTipData = null;
     hideTip();
     hideBox();
   };
@@ -385,6 +407,7 @@ ${PAGE_DOM_HELPERS_SOURCE}
     if (hoverTarget === null) return;
     hoverTarget = null;
     globalThis.__bdtHoverTarget = null;
+    lastTipData = null;
     hideTip();
     hideBox();
     emit({ kind: 'hover-end' });
@@ -759,13 +782,24 @@ ${PAGE_DOM_HELPERS_SOURCE}
     });
   }, true);
   window.addEventListener('keydown', (event) => {
+    if (event.key === 'Shift' && !shiftHeldNow) {
+      shiftHeldNow = true;
+      syncTipVisibility();
+      return;
+    }
     if (event.key !== 'Escape') return;
     hideTip();
     hideBox();
     hoverTarget = null;
     globalThis.__bdtHoverTarget = null;
     globalThis.__bdtClickTarget = null;
+    lastTipData = null;
     emit({ kind: 'escape' });
+  }, true);
+  window.addEventListener('keyup', (event) => {
+    if (event.key !== 'Shift' || !shiftHeldNow) return;
+    shiftHeldNow = false;
+    syncTipVisibility();
   }, true);
 })();
 `;
@@ -1748,6 +1782,8 @@ function nameFromSource(
 export class ClickInspector {
   private target: CdpDebugger | null = null;
   private enabled = true;
+  private hoverTipPinned = false;
+  private shiftHeld = false;
   private installed = false;
   private worldSequence = 0;
   private nodeGroupSequence = 0;
@@ -1827,6 +1863,10 @@ export class ClickInspector {
       });
       const expression = `globalThis.__BDT_INSPECT_ENABLED__ = ${
         this.enabled ? 'true' : 'false'
+      };\nglobalThis.__BDT_HOVER_TIP_PINNED__ = ${
+        this.hoverTipPinned ? 'true' : 'false'
+      };\nglobalThis.__BDT_SHIFT_HELD__ = ${
+        this.shiftHeld ? 'true' : 'false'
       };\n${LISTENER_SOURCE}`;
       await target.sendCommand('Runtime.evaluate', {
         expression,
@@ -1849,6 +1889,24 @@ export class ClickInspector {
       ? 'globalThis.__BDT_INSPECT_ENABLED__ = true;'
       : 'globalThis.__BDT_INSPECT_ENABLED__ = false; if (globalThis.__bdtHoverClear) globalThis.__bdtHoverClear();';
     void this.evaluateInWorlds(expression);
+  }
+
+  setHoverTipPinned(pinned: boolean): void {
+    this.hoverTipPinned = pinned;
+    if (!this.installed) return;
+    const value = pinned ? 'true' : 'false';
+    void this.evaluateInWorlds(
+      `globalThis.__BDT_HOVER_TIP_PINNED__ = ${value}; if (globalThis.__bdtHoverTipSync) globalThis.__bdtHoverTipSync();`,
+    );
+  }
+
+  setShiftHeld(held: boolean): void {
+    this.shiftHeld = held;
+    if (!this.installed) return;
+    const value = held ? 'true' : 'false';
+    void this.evaluateInWorlds(
+      `globalThis.__BDT_SHIFT_HELD__ = ${value}; if (globalThis.__bdtHoverTipSync) globalThis.__bdtHoverTipSync();`,
+    );
   }
 
   handleMessage(method: string, params: unknown): void {

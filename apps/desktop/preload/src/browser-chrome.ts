@@ -38,6 +38,9 @@ function render(state: BrowserChromeState): void {
   inspect.classList.toggle('is-on', state.inspectionEnabled);
   inspect.classList.toggle('is-off', !state.inspectionEnabled);
   inspect.textContent = state.inspectionEnabled ? 'Inspección ON' : 'Inspección OFF';
+  const tip = element<HTMLButtonElement>('tip-toggle');
+  tip.classList.toggle('is-on', state.hoverTipPinned);
+  tip.setAttribute('aria-pressed', state.hoverTipPinned ? 'true' : 'false');
   bar.classList.toggle('is-loading', state.loading);
   status.textContent = state.captureActive ? 'N0 · captura activa' : 'N0 · sin captura';
   if (document.activeElement !== url) {
@@ -73,6 +76,9 @@ window.addEventListener('DOMContentLoaded', () => {
   });
   element<HTMLButtonElement>('inspect').addEventListener('click', () => {
     void invoke(BROWSER_CHROME_CHANNELS.toggleInspection);
+  });
+  element<HTMLButtonElement>('tip-toggle').addEventListener('click', () => {
+    void invoke(BROWSER_CHROME_CHANNELS.toggleHoverTip);
   });
   form.addEventListener('submit', (event) => {
     event.preventDefault();

@@ -42,10 +42,25 @@ export function EditorArea() {
     }
   }, [state.activePath]);
 
+  useEffect(() => {
+    if (state.reveal !== null) {
+      setView('file');
+    }
+  }, [state.reveal]);
+
   const openFileTab = (path: string): void => {
     activateTab(path);
     setView('file');
   };
+
+  const reveal =
+    state.reveal !== null && state.reveal.path === activeTab?.path
+      ? {
+          line: state.reveal.line,
+          endLine: state.reveal.endLine,
+          nonce: state.reveal.nonce,
+        }
+      : null;
 
   const browserState = browser.state.state;
   const connected = browserState?.connected ?? false;
@@ -117,6 +132,7 @@ export function EditorArea() {
               key={activeTab.path}
               content={activeTab.content}
               language={languageForPath(activeTab.path)}
+              reveal={reveal}
             />
           )
         ) : null}

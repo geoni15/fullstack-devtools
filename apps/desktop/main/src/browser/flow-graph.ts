@@ -15,6 +15,7 @@ import type {
   InspectionSqlQuery,
   RequestOutcome,
 } from '@bdt/protocol';
+import { requestStatusView } from '@bdt/protocol';
 import { matchRoute, type StaticRoute } from '@bdt/routes-index';
 import { pickDatabaseHint } from './database-hints';
 import type { FlowTrace, FlowTraceHandler, FlowTraceQuery } from './flow-ledger';
@@ -118,6 +119,16 @@ const EVENT_PRIORITY: Record<FlowInteractionEvent, number> = {
   focus: 1,
   blur: 1,
   hover: 0,
+};
+
+const COUNT_LABEL: Partial<Record<FlowNodeType, string>> = {
+  element: 'Interacciones',
+  handler: 'Ejecuciones',
+  route: 'Peticiones recibidas',
+  function: 'Peticiones manejadas',
+  query: 'Ejecuciones',
+  table: 'Consultas ejecutadas',
+  database: 'Consultas ejecutadas',
 };
 
 const CORRELATION_BEFORE_MS = 3000;
@@ -354,16 +365,12 @@ function requestSubtitle(
   statusCode: number | null,
   durationMs: number | null,
   outcome: RequestOutcome,
+  backendObserved: boolean | null = null,
 ): string {
-  const state =
-    outcome === 'failed'
-      ? 'error'
-      : statusCode !== null
-        ? String(statusCode)
-        : outcome === 'pending'
-          ? 'pendiente'
-          : 'sin estado';
-  return durationMs === null ? state : `${state} · ${String(Math.round(durationMs))} ms`;
+  const status = requestStatusView({ statusCode, outcome, backendObserved });
+  return durationMs === null
+    ? status.label
+    : `${status.label} · ${String(Math.round(durationMs))} ms`;
 }
 
 interface QueryShape {
@@ -431,6 +438,7 @@ function baseNode(
     traceIds: [],
     evidence,
     occurrences: 1,
+    countLabel: COUNT_LABEL[type] ?? null,
     firstSeen: 0,
     lastSeen: 0,
     note: null,
@@ -448,6 +456,8 @@ class FlowGraphBuilder {
   private readonly matchCache = new Map<string, StaticRoute | null>();
   private readonly requestRoute = new Map<string, string | null>();
   private readonly runtimeLinkedRequests = new Set<string>();
+  private readonly executedRequests = new Set<string>();
+  private readonly executedEndpoints = new Set<string>();
   private externalRequests = 0;
   private preflightRequests = 0;
 
@@ -456,6 +466,15 @@ class FlowGraphBuilder {
   build(): FlowSnapshot {
     for (const link of this.input.runtimeLinks) {
       if (link.requestId !== null) this.runtimeLinkedRequests.add(link.requestId);
+    }
+    for (const trace of this.input.traces) {
+      if (trace.execution === null) continue;
+      for (const request of trace.requests) this.executedRequests.add(request.id);
+      for (const breakpoint of trace.execution.breakpoints) {
+        this.executedEndpoints.add(
+          `${breakpoint.method.toUpperCase()} ${stripQuery(breakpoint.path)}`,
+        );
+      }
     }
     const resolved = new Set<string>();
     for (const trace of this.input.traces) {
@@ -556,6 +575,7 @@ class FlowGraphBuilder {
       routeNode.endLine = route.endLine;
       routeNode.method = route.method.toUpperCase();
       routeNode.path = route.path;
+      routeNode.occurrences = 0;
       routeNode.note = route.resolved
         ? route.note
         : appendNote(route.note, 'Función no resuelta; sin nodo de función.');
@@ -583,6 +603,7 @@ class FlowGraphBuilder {
         functionNode.file = route.file;
         functionNode.line = route.line;
         functionNode.endLine = route.endLine;
+        functionNode.occurrences = 0;
         this.addNode(functionNode);
       }
 
@@ -1020,6 +1041,7 @@ class FlowGraphBuilder {
     node.tablesRead = [...query.tablesRead];
     node.tablesWritten = [...query.tablesWritten];
     node.note = query.note;
+    node.occurrences = 0;
     this.addNode(node);
 
     this.addEdge('QUERIES', functionId, queryId, ['STATIC'], 'direct');
@@ -1046,6 +1068,7 @@ class FlowGraphBuilder {
     if (this.nodes.has(id)) return;
     const node = baseNode(id, 'table', table, ['STATIC']);
     node.subtitle = 'tabla';
+    node.occurrences = 0;
     this.addNode(node);
   }
 
@@ -1070,6 +1093,7 @@ class FlowGraphBuilder {
     node.firstSeen = lastSeen;
     node.lastSeen = lastSeen;
     node.traceIds = [...traceIds];
+    node.occurrences = 0;
     this.addNode(node);
 
     this.addEdge('USES', queryId, id, ['STATIC'], 'heuristic', {
@@ -1092,7 +1116,9 @@ class FlowGraphBuilder {
       const route = this.match(request.method, request.path);
       if (request.origin !== 'backend' && route === null) continue;
 
-      const node = this.capturedRequestNode(request, route === null);
+      const backendObserved =
+        request.origin === 'backend' ? this.capturedBackendObserved(request, route !== null) : null;
+      const node = this.capturedRequestNode(request, route === null, backendObserved);
       this.addNode(node);
       const routeId = route === null ? null : routeNodeId(route);
       this.requestRoute.set(request.id, routeId);
@@ -1102,11 +1128,28 @@ class FlowGraphBuilder {
     }
   }
 
-  private capturedRequestNode(request: CapturedRequest, isolated: boolean): FlowNode {
+  private capturedBackendObserved(request: CapturedRequest, backendRoute: boolean): boolean | null {
+    if (this.executedRequests.has(request.id)) return true;
+    if (this.executedEndpoints.has(`${request.method.toUpperCase()} ${stripQuery(request.path)}`)) {
+      return true;
+    }
+    return backendRoute ? false : null;
+  }
+
+  private capturedRequestNode(
+    request: CapturedRequest,
+    isolated: boolean,
+    backendObserved: boolean | null,
+  ): FlowNode {
     const node = baseNode(`request:${request.id}`, 'request', `${request.method} ${request.path}`, [
       'RUNTIME',
     ]);
-    node.subtitle = requestSubtitle(request.statusCode, request.durationMs, request.outcome);
+    node.subtitle = requestSubtitle(
+      request.statusCode,
+      request.durationMs,
+      request.outcome,
+      backendObserved,
+    );
     node.method = request.method;
     node.path = request.path;
     node.url = request.url;
@@ -1114,6 +1157,7 @@ class FlowGraphBuilder {
     node.statusCode = request.statusCode;
     node.durationMs = request.durationMs;
     node.outcome = request.outcome;
+    node.backendObserved = backendObserved;
     node.origin = request.origin;
     node.initiatorFunction = request.initiator?.frames[0]?.functionName ?? null;
     node.firstSeen = request.wallStartedAt;
@@ -1126,7 +1170,13 @@ class FlowGraphBuilder {
     const node = baseNode(`request:${request.id}`, 'request', `${request.method} ${request.path}`, [
       'RUNTIME',
     ]);
-    node.subtitle = requestSubtitle(request.statusCode, request.durationMs, request.outcome);
+    const backendObserved = this.traceBackendObserved(trace, request);
+    node.subtitle = requestSubtitle(
+      request.statusCode,
+      request.durationMs,
+      request.outcome,
+      backendObserved,
+    );
     node.method = request.method;
     node.path = request.path;
     node.requestIds = [request.id];
@@ -1134,11 +1184,23 @@ class FlowGraphBuilder {
     node.statusCode = request.statusCode;
     node.durationMs = request.durationMs;
     node.outcome = request.outcome;
+    node.backendObserved = backendObserved;
     node.origin = null;
     node.initiatorFunction = request.initiatorFunction;
     node.firstSeen = request.wallStartedAt;
     node.lastSeen = request.wallStartedAt;
     return node;
+  }
+
+  private traceBackendObserved(
+    trace: FlowTrace,
+    request: FlowTrace['requests'][number],
+  ): boolean | null {
+    if (trace.execution !== null) {
+      const key = `${request.method.toUpperCase()} ${stripQuery(request.path)}`;
+      if (this.executedEndpoints.has(key) || this.executedRequests.has(request.id)) return true;
+    }
+    return request.backend === null ? null : false;
   }
 
   private projectTrace(trace: FlowTrace): void {
@@ -1221,6 +1283,13 @@ class FlowGraphBuilder {
             },
           );
           this.addTraceToNode(backendRouteId, trace.id, request.wallStartedAt);
+          const routeNode = this.nodes.get(backendRouteId);
+          if (routeNode !== undefined) routeNode.occurrences += 1;
+          const backendFunctionId = this.routeFunction.get(backendRouteId);
+          if (backendFunctionId !== undefined) {
+            const functionNode = this.nodes.get(backendFunctionId);
+            if (functionNode !== undefined) functionNode.occurrences += 1;
+          }
         }
       }
 
@@ -1313,6 +1382,7 @@ class FlowGraphBuilder {
     node.tablesWritten = [...query.tablesWritten];
     node.note = query.note;
     node.traceIds = [trace.id];
+    node.occurrences = 0;
     this.addNode(node);
 
     const target = functionId ?? this.findFunctionNode(file, query.line);
@@ -1338,6 +1408,7 @@ class FlowGraphBuilder {
     mergeEvidence(node.evidence, ['RUNTIME']);
     node.note = appendNote(node.note, 'Observada en ejecución.');
     node.lastSeen = latest(node.lastSeen, at);
+    node.occurrences += 1;
     mergeStrings(node.traceIds, [trace.id]);
 
     const target = functionId ?? this.findFunctionNode(node.file, node.line);
@@ -1405,9 +1476,9 @@ class FlowGraphBuilder {
   ): void {
     const execution = trace.execution;
     if (execution === null) return;
+    const existingFunction = functionId ?? this.findFunctionNode(execution.file, execution.line);
     const target =
-      functionId ??
-      this.findFunctionNode(execution.file, execution.line) ??
+      existingFunction ??
       this.ensureRuntimeFunction(
         trace,
         execution.file,
@@ -1416,6 +1487,10 @@ class FlowGraphBuilder {
         execution.observedAt,
       );
     if (target === null) return;
+    if (routeId === null) {
+      const targetNode = this.nodes.get(target);
+      if (targetNode !== undefined && existingFunction !== null) targetNode.occurrences += 1;
+    }
     if (routeId !== null && functionId !== null) {
       this.addEdge('HANDLES', routeId, functionId, ['STATIC', 'RUNTIME'], 'heuristic', {
         increment: 0,
@@ -1497,6 +1572,15 @@ class FlowGraphBuilder {
       const functionId = this.routeFunction.get(routeId);
       if (functionId !== undefined) this.addTraceToNode(functionId, traceId, lastSeen);
     }
+    if (increment > 0) {
+      const routeNode = this.nodes.get(routeId);
+      if (routeNode !== undefined) routeNode.occurrences += increment;
+      const functionId = this.routeFunction.get(routeId);
+      if (functionId !== undefined) {
+        const functionNode = this.nodes.get(functionId);
+        if (functionNode !== undefined) functionNode.occurrences += increment;
+      }
+    }
   }
 
   private addTraceToNode(id: string, traceId: string, at: number): void {
@@ -1540,6 +1624,11 @@ class FlowGraphBuilder {
       existing.durationMs = node.durationMs;
     }
     if (node.outcome !== undefined && node.outcome !== null) existing.outcome = node.outcome;
+    if (node.backendObserved === true) {
+      existing.backendObserved = true;
+    } else if (node.backendObserved === false && existing.backendObserved !== true) {
+      existing.backendObserved = false;
+    }
     if (node.origin !== undefined && node.origin !== null) existing.origin = node.origin;
     if (node.initiatorFunction !== undefined && node.initiatorFunction !== null) {
       existing.initiatorFunction = node.initiatorFunction;
@@ -1633,8 +1722,18 @@ class FlowGraphBuilder {
   }
 
   private finalizeNodeNotes(): void {
+    for (const edge of this.edges.values()) {
+      if (edge.type !== 'READS' && edge.type !== 'WRITES' && edge.type !== 'USES') continue;
+      const source = this.nodes.get(edge.from);
+      if (source === undefined || source.type !== 'query' || source.occurrences <= 0) continue;
+      const target = this.nodes.get(edge.to);
+      if (target === undefined) continue;
+      if (target.type !== 'table' && target.type !== 'database') continue;
+      target.occurrences += source.occurrences;
+    }
     for (const node of this.nodes.values()) {
       if (node.occurrences <= 1) continue;
+      const label = node.countLabel ?? 'Repeticiones';
       if (node.type === 'element') {
         node.note = appendNote(
           node.note,
@@ -1645,6 +1744,10 @@ class FlowGraphBuilder {
           node.note,
           `Se ejecutó en ${String(node.occurrences)} interacciones de la sesión.`,
         );
+      } else if (node.type === 'route' || node.type === 'function') {
+        node.note = appendNote(node.note, `${label}: ${String(node.occurrences)} en la sesión.`);
+      } else if (node.type === 'query' || node.type === 'table' || node.type === 'database') {
+        node.note = appendNote(node.note, `${label}: ${String(node.occurrences)}.`);
       }
     }
   }

@@ -1,8 +1,9 @@
 import { fileURLToPath } from 'node:url';
 import { app, BrowserWindow, Menu } from 'electron';
-import { IPC_CHANNELS } from '@bdt/protocol';
+import { IPC_CHANNELS, type CodeLocation, type CodeLocationRequest } from '@bdt/protocol';
 import { BrowserController } from './browser/controller';
 import { registerBrowserWindowIpc } from './browser/chrome-ipc';
+import { normalizeCodeLocation } from './code-location';
 import { registerAppProtocol, registerAppScheme } from './app-protocol';
 import { APP_INDEX_URL, DEV_SERVER_URL } from './config';
 import { registerIpcHandlers } from './ipc';
@@ -42,6 +43,24 @@ if (!app.requestSingleInstanceLock()) {
     browserHolder.current?.handleWorkspaceChanged();
   });
 
+  const revealCode = (request: CodeLocationRequest): CodeLocation | null => {
+    const location = normalizeCodeLocation(workspace.getRootPath(), request);
+    if (location === null) {
+      return null;
+    }
+    const window = mainWindow;
+    if (window === null || window.isDestroyed()) {
+      return null;
+    }
+    if (window.isMinimized()) {
+      window.restore();
+    }
+    window.show();
+    window.focus();
+    window.webContents.send(IPC_CHANNELS.revealLocation, location);
+    return location;
+  };
+
   const browser = new BrowserController(() => mainWindow, createLogger('browser'), {
     getWorkspaceRoot: () => workspace.getRootPath(),
     chromePreloadPath: fileURLToPath(new URL('../preload/browser-chrome.cjs', import.meta.url)),
@@ -80,9 +99,10 @@ if (!app.requestSingleInstanceLock()) {
         getMainWindow: () => mainWindow,
         workspace,
         browser,
+        revealCode,
         logger: createLogger('ipc'),
       });
-      registerBrowserWindowIpc(browser, createLogger('browser-window'));
+      registerBrowserWindowIpc(browser, createLogger('browser-window'), revealCode);
 
       mainWindowOptions = { preloadPath, devServerUrl, log };
       mainWindow = createMainWindow(mainWindowOptions);

@@ -15,6 +15,7 @@ import type {
   BrowserSnapshot,
   BrowserState,
   CapturedRequest,
+  ConsoleEntry,
   LaunchRequest,
 } from '@bdt/protocol';
 import { bdt } from '../api';
@@ -23,6 +24,7 @@ export interface BrowserUiState {
   state: BrowserState | null;
   requests: CapturedRequest[];
   activities: ActivityEvent[];
+  consoleEntries: ConsoleEntry[];
   busy: boolean;
   error: string | null;
 }
@@ -34,6 +36,8 @@ type Action =
   | { type: 'cleared' }
   | { type: 'activity'; activity: ActivityEvent[] }
   | { type: 'activity-cleared' }
+  | { type: 'console'; entries: ConsoleEntry[] }
+  | { type: 'console-cleared' }
   | { type: 'busy' }
   | { type: 'idle' }
   | { type: 'error'; message: string }
@@ -43,6 +47,7 @@ const INITIAL_STATE: BrowserUiState = {
   state: null,
   requests: [],
   activities: [],
+  consoleEntries: [],
   busy: false,
   error: null,
 };
@@ -71,6 +76,19 @@ function mergeActivity(
   );
 }
 
+function mergeConsole(
+  current: readonly ConsoleEntry[],
+  incoming: readonly ConsoleEntry[],
+): ConsoleEntry[] {
+  const merged = new Map(current.map((entry) => [entry.id, entry]));
+  for (const entry of incoming) {
+    merged.set(entry.id, entry);
+  }
+  return [...merged.values()].sort(
+    (left, right) => left.at - right.at || left.id.localeCompare(right.id),
+  );
+}
+
 function reducer(state: BrowserUiState, action: Action): BrowserUiState {
   switch (action.type) {
     case 'snapshot':
@@ -79,6 +97,7 @@ function reducer(state: BrowserUiState, action: Action): BrowserUiState {
         state: action.snapshot.state,
         requests: action.snapshot.requests,
         activities: action.snapshot.activity,
+        consoleEntries: action.snapshot.consoleEntries,
         busy: false,
         error: null,
       };
@@ -97,6 +116,10 @@ function reducer(state: BrowserUiState, action: Action): BrowserUiState {
       return { ...state, activities: mergeActivity(state.activities, action.activity) };
     case 'activity-cleared':
       return { ...state, activities: [] };
+    case 'console':
+      return { ...state, consoleEntries: mergeConsole(state.consoleEntries, action.entries) };
+    case 'console-cleared':
+      return { ...state, consoleEntries: [] };
     case 'busy':
       return { ...state, busy: true, error: null };
     case 'idle':
@@ -130,6 +153,12 @@ function applyEvent(dispatch: (action: Action) => void, event: BrowserEvent): vo
       break;
     case 'activity-cleared':
       dispatch({ type: 'activity-cleared' });
+      break;
+    case 'console':
+      dispatch({ type: 'console', entries: event.entries });
+      break;
+    case 'console-cleared':
+      dispatch({ type: 'console-cleared' });
       break;
     default:
       break;
@@ -223,7 +252,7 @@ export function BrowserProvider({ children }: { children: ReactNode }): ReactNod
       }
       dispatch({
         type: 'snapshot',
-        snapshot: { state: result.value, requests: [], activity: [] },
+        snapshot: { state: result.value, requests: [], activity: [], consoleEntries: [] },
       });
     } catch (error) {
       dispatch({ type: 'error', message: errorMessage(error) });

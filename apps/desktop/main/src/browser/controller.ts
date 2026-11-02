@@ -7,6 +7,7 @@ import {
   ERROR_CODES,
   IPC_CHANNELS,
   INSPECTION_MODES,
+  requestStatusView,
   type ActivityCategory,
   type ActivityEvent,
   type ActivityTone,
@@ -18,6 +19,9 @@ import {
   type BrowserState,
   type BrowserTargetsRequest,
   type CapturedRequest,
+  type ConsoleEntry,
+  type ConsoleLevel,
+  type ConsoleSource,
   type FlowMapState,
   type InspectionBackend,
   type InspectionCard,
@@ -121,6 +125,69 @@ interface CdpLoadingFailed {
   canceled?: boolean;
 }
 
+interface CdpRemoteObject {
+  type?: string;
+  subtype?: string;
+  value?: unknown;
+  unserializableValue?: string;
+  description?: string;
+  preview?: {
+    properties?: {
+      name?: string;
+      type?: string;
+      value?: string;
+    }[];
+    overflow?: boolean;
+  };
+}
+
+interface CdpConsoleApiCalled {
+  type: string;
+  args?: unknown[];
+  timestamp?: number;
+  stackTrace?: { callFrames?: CdpStackFrame[] };
+}
+
+interface CdpStackFrame {
+  url?: string;
+  lineNumber?: number;
+  columnNumber?: number;
+}
+
+interface CdpExceptionThrown {
+  timestamp?: number;
+  exceptionDetails?: {
+    text?: string;
+    url?: string;
+    lineNumber?: number;
+    columnNumber?: number;
+    exception?: { description?: string };
+    stackTrace?: { callFrames?: CdpStackFrame[] };
+  };
+}
+
+interface CdpLogEntryAdded {
+  entry?: {
+    source?: string;
+    level?: string;
+    text?: string;
+    url?: string;
+    lineNumber?: number;
+    timestamp?: number;
+  };
+}
+
+interface ConsoleInput {
+  source: ConsoleSource;
+  level: ConsoleLevel;
+  text: string;
+  url?: string | null;
+  file?: string | null;
+  line?: number | null;
+  column?: number | null;
+  at?: number;
+}
+
 interface PendingRequest {
   storeId: string;
   startedAt: number;
@@ -210,6 +277,99 @@ function inventorySignature(controls: readonly PageControl[]): string {
     hash = Math.imul(hash, 0x01000193);
   }
   return `${String(controls.length)}:${(hash >>> 0).toString(16)}`;
+}
+
+const PROCESS_ERROR_HINT = /(^|\W)(error|err!|exception|unhandled|fatal|failed|traceback)(\W|$)/i;
+
+function processConsoleLevel(stream: 'stdout' | 'stderr', line: string): ConsoleLevel {
+  if (stream === 'stdout') return 'log';
+  return PROCESS_ERROR_HINT.test(line) ? 'error' : 'warn';
+}
+
+function consoleApiLevel(type: string): ConsoleLevel {
+  switch (type) {
+    case 'warning':
+      return 'warn';
+    case 'error':
+    case 'assert':
+      return 'error';
+    case 'debug':
+    case 'trace':
+      return 'debug';
+    case 'info':
+      return 'info';
+    default:
+      return 'log';
+  }
+}
+
+function consoleLogLevel(level: string | undefined): ConsoleLevel {
+  switch (level) {
+    case 'error':
+      return 'error';
+    case 'warning':
+      return 'warn';
+    case 'verbose':
+      return 'debug';
+    default:
+      return 'info';
+  }
+}
+
+function consoleTime(value: number | undefined): number {
+  return value !== undefined && Number.isFinite(value) && value > 1e12 ? value : Date.now();
+}
+
+function previewText(preview: CdpRemoteObject['preview'], isArray: boolean): string | null {
+  const properties = preview?.properties;
+  if (!Array.isArray(properties) || properties.length === 0) {
+    return null;
+  }
+  const parts: string[] = [];
+  for (const property of properties) {
+    const name = property.name ?? '';
+    const value = property.value ?? property.type ?? '';
+    parts.push(isArray && /^\d+$/.test(name) ? value : `${name}: ${value}`);
+  }
+  const body = parts.join(', ');
+  return isArray ? `[${body}]` : `{ ${body} }`;
+}
+
+function remoteArgText(arg: unknown): string {
+  if (typeof arg !== 'object' || arg === null) return '';
+  const remote = arg as CdpRemoteObject;
+  if (remote.value !== undefined) {
+    if (typeof remote.value === 'string') return remote.value;
+    if (remote.value === null) return 'null';
+    if (typeof remote.value === 'object') {
+      try {
+        return JSON.stringify(remote.value);
+      } catch {
+        return String(remote.value);
+      }
+    }
+    return String(remote.value);
+  }
+  if (typeof remote.unserializableValue === 'string') return remote.unserializableValue;
+  const preview = previewText(remote.preview, remote.subtype === 'array');
+  if (preview !== null) return preview;
+  if (typeof remote.description === 'string') return remote.description;
+  return typeof remote.type === 'string' ? remote.type : '';
+}
+
+function frameLocation(frame: CdpStackFrame | undefined): {
+  url: string | null;
+  line: number | null;
+  column: number | null;
+} {
+  if (frame === undefined) {
+    return { url: null, line: null, column: null };
+  }
+  return {
+    url: typeof frame.url === 'string' && frame.url !== '' ? frame.url : null,
+    line: typeof frame.lineNumber === 'number' ? frame.lineNumber + 1 : null,
+    column: typeof frame.columnNumber === 'number' ? frame.columnNumber + 1 : null,
+  };
 }
 
 function idleState(config: BrowserConfig | null = null, inspectionEnabled = true): BrowserState {
@@ -422,17 +582,13 @@ function formatClock(at: number): string {
 }
 
 function observedStatusLabel(request: CapturedRequest): string {
-  const code =
-    request.outcome === 'failed'
-      ? 'ERR'
-      : request.statusCode !== null
-        ? String(request.statusCode)
-        : request.outcome === 'pending'
-          ? '…'
-          : '—';
+  const status = requestStatusView({
+    statusCode: request.statusCode,
+    outcome: request.outcome,
+  });
   const duration =
     request.durationMs !== null ? ` · ${String(Math.round(request.durationMs))} ms` : '';
-  return `${formatClock(request.wallStartedAt)} · ${code}${duration}`;
+  return `${formatClock(request.wallStartedAt)} · ${status.code} ${status.reason}${duration}`;
 }
 
 function formatHoverSelector(element: HoverElementInfo): string {
@@ -576,6 +732,9 @@ export class BrowserController {
   private sessionHardened = false;
   private inspector: ClickInspector | null = null;
   private inspectionEnabled = true;
+  private hoverTipPinned = false;
+  private shiftHeld = false;
+  private readonly shiftTracked = new WeakSet<WebContents>();
   private inspectionMode: InspectionMode = 'html';
   private inspectionSession: InspectionSession | null = null;
   private inspectionSequence = 0;
@@ -603,6 +762,9 @@ export class BrowserController {
   private activity: ActivityEvent[] = [];
   private pendingActivity: ActivityEvent[] = [];
   private activitySequence = 0;
+  private consoleEntries: ConsoleEntry[] = [];
+  private pendingConsole: ConsoleEntry[] = [];
+  private consoleSequence = 0;
   private lastRuntimeStatus: string | null = null;
   private readonly runtimeSqlActivitySeen = new Set<string>();
   private sqlRuntimeSequence = 0;
@@ -654,6 +816,7 @@ export class BrowserController {
       state: { ...this.state },
       requests: this.buffer?.all() ?? [],
       activity: [...this.activity],
+      consoleEntries: [...this.consoleEntries],
     };
   }
 
@@ -739,6 +902,8 @@ export class BrowserController {
     }
 
     const hostWindow = config.mode === 'window' ? this.createChromeWindow() : window;
+    this.trackShift(window.webContents);
+    this.trackShift(hostWindow.webContents);
     const view = new WebContentsView({
       webPreferences: {
         partition: PARTITION,
@@ -757,6 +922,7 @@ export class BrowserController {
 
     const panelView = this.panel.create();
     this.panelView = panelView;
+    this.trackShift(panelView.webContents);
     hostWindow.contentView.addChildView(panelView);
     if (config.nodeInspectorPort !== null) {
       void this.runtime?.connect(config.nodeInspectorPort);
@@ -770,6 +936,7 @@ export class BrowserController {
     }
     this.hardenView(view);
     this.wireView(view);
+    this.trackShift(view.webContents);
 
     try {
       await view.webContents.loadURL('about:blank');
@@ -858,6 +1025,13 @@ export class BrowserController {
       onUnexpectedExit: (code) => {
         this.onLaunchedExit('backend', launcher, code);
       },
+      onOutput: (stream, line) => {
+        this.recordConsole({
+          source: 'backend',
+          level: processConsoleLevel(stream, line),
+          text: line,
+        });
+      },
     });
     if (wantsInspector) {
       this.panelRuntime = {
@@ -897,6 +1071,13 @@ export class BrowserController {
       readyUrl: config.frontend.url,
       onUnexpectedExit: (code) => {
         this.onLaunchedExit('frontend', launcher, code);
+      },
+      onOutput: (stream, line) => {
+        this.recordConsole({
+          source: 'frontend',
+          level: processConsoleLevel(stream, line),
+          text: line,
+        });
       },
     });
     this.recordActivity({
@@ -1089,6 +1270,10 @@ export class BrowserController {
         snapshot: this.flowState.snapshot,
       };
       this.mapWindow.open();
+      const mapContents = this.mapWindow.webContents();
+      if (mapContents !== null) {
+        this.trackShift(mapContents);
+      }
       this.mapWindow.updateMap(this.flowState);
       void this.refreshMap(true).finally(() => {
         this.scheduleAutoResolve();
@@ -1483,6 +1668,43 @@ export class BrowserController {
     this.setInspection(!this.state.inspectionEnabled);
   }
 
+  chromeToggleHoverTip(sender: WebContents): void {
+    if (!this.isChromeSender(sender)) return;
+    this.setHoverTipPinned(!this.hoverTipPinned);
+  }
+
+  private setHoverTipPinned(pinned: boolean): void {
+    this.hoverTipPinned = pinned;
+    this.inspector?.setHoverTipPinned(pinned);
+    this.sendChromeState();
+  }
+
+  private trackShift(contents: WebContents): void {
+    if (this.shiftTracked.has(contents)) return;
+    this.shiftTracked.add(contents);
+    contents.on('before-input-event', (_event, input) => {
+      if (input.key !== 'Shift') return;
+      if (input.type === 'keyDown') {
+        this.setShiftHeld(true);
+      } else if (input.type === 'keyUp') {
+        this.setShiftHeld(false);
+      }
+    });
+    contents.on('blur', () => {
+      this.setShiftHeld(false);
+    });
+    contents.on('destroyed', () => {
+      this.setShiftHeld(false);
+    });
+  }
+
+  private setShiftHeld(held: boolean): void {
+    if (this.shiftHeld === held) return;
+    this.shiftHeld = held;
+    this.inspector?.setShiftHeld(held);
+    this.mapWindow.setShiftHeld(held);
+  }
+
   selectPanelRequest(requestId: string): void {
     const session = this.inspectionSession;
     if (session === null) return;
@@ -1771,6 +1993,8 @@ export class BrowserController {
     try {
       await withTimeout(target.sendCommand('Network.enable'), 'Network.enable');
       await withTimeout(target.sendCommand('Debugger.enable'), 'Debugger.enable');
+      await withTimeout(target.sendCommand('Runtime.enable'), 'Runtime.enable');
+      await target.sendCommand('Log.enable').catch(() => undefined);
       await target.sendCommand('Debugger.setSkipAllPauses', { skip: true });
       await target.sendCommand('Debugger.setAsyncCallStackDepth', { maxDepth: 2147483647 });
       this.log.debug('Captura CDP activa');
@@ -1800,6 +2024,7 @@ export class BrowserController {
     try {
       await inspector.install(view.webContents.debugger);
       inspector.setEnabled(this.state.inspectionEnabled);
+      inspector.setHoverTipPinned(this.hoverTipPinned);
     } catch (error) {
       this.inspector = null;
       this.inspectionEnabled = false;
@@ -4103,6 +4328,15 @@ export class BrowserController {
       case 'Network.loadingFailed':
         this.onLoadingFailed(params as CdpLoadingFailed);
         break;
+      case 'Runtime.consoleAPICalled':
+        this.onConsoleApiCalled(params as CdpConsoleApiCalled);
+        break;
+      case 'Runtime.exceptionThrown':
+        this.onExceptionThrown(params as CdpExceptionThrown);
+        break;
+      case 'Log.entryAdded':
+        this.onLogEntryAdded(params as CdpLogEntryAdded);
+        break;
       case 'Debugger.paused': {
         void this.view?.webContents.debugger.sendCommand('Debugger.resume').catch(() => undefined);
         break;
@@ -4278,6 +4512,59 @@ export class BrowserController {
     this.scheduleFlush();
   }
 
+  private onConsoleApiCalled(params: CdpConsoleApiCalled): void {
+    const args = Array.isArray(params.args) ? params.args : [];
+    const text = args
+      .map(remoteArgText)
+      .filter((part) => part !== '')
+      .join(' ');
+    if (text.trim() === '') return;
+    const location = frameLocation(params.stackTrace?.callFrames?.[0]);
+    this.recordConsole({
+      source: 'frontend',
+      level: consoleApiLevel(params.type),
+      text,
+      url: location.url,
+      line: location.line,
+      column: location.column,
+      at: consoleTime(params.timestamp),
+    });
+  }
+
+  private onExceptionThrown(params: CdpExceptionThrown): void {
+    const details = params.exceptionDetails;
+    if (details === undefined) return;
+    const description = details.exception?.description;
+    const text =
+      typeof description === 'string' && description.trim() !== ''
+        ? description
+        : (details.text ?? 'Excepción sin mensaje');
+    const frame = frameLocation(details.stackTrace?.callFrames?.[0]);
+    this.recordConsole({
+      source: 'frontend',
+      level: 'exception',
+      text,
+      url: details.url ?? frame.url,
+      line: typeof details.lineNumber === 'number' ? details.lineNumber + 1 : frame.line,
+      column: typeof details.columnNumber === 'number' ? details.columnNumber + 1 : frame.column,
+      at: consoleTime(params.timestamp),
+    });
+  }
+
+  private onLogEntryAdded(params: CdpLogEntryAdded): void {
+    const entry = params.entry;
+    if (entry === undefined || typeof entry.text !== 'string' || entry.text.trim() === '') return;
+    if (entry.source === 'javascript') return;
+    this.recordConsole({
+      source: 'frontend',
+      level: consoleLogLevel(entry.level),
+      text: entry.text,
+      url: typeof entry.url === 'string' && entry.url !== '' ? entry.url : null,
+      line: typeof entry.lineNumber === 'number' && entry.lineNumber > 0 ? entry.lineNumber : null,
+      at: consoleTime(entry.timestamp),
+    });
+  }
+
   private scheduleFlush(): void {
     if (this.flushTimer !== null) return;
     this.flushTimer = setTimeout(() => {
@@ -4302,12 +4589,38 @@ export class BrowserController {
       }
     }
     this.flushActivity();
+    this.flushConsole();
   }
 
   private flushActivity(): void {
     if (this.pendingActivity.length === 0) return;
     const activity = this.pendingActivity.splice(0, this.pendingActivity.length);
     this.send({ type: 'activity', activity });
+  }
+
+  private flushConsole(): void {
+    if (this.pendingConsole.length === 0) return;
+    const entries = this.pendingConsole.splice(0, this.pendingConsole.length);
+    this.send({ type: 'console', entries });
+  }
+
+  private recordConsole(input: ConsoleInput): void {
+    const text = input.text.replace(/\s+$/u, '');
+    if (text.trim() === '') return;
+    const entry: ConsoleEntry = {
+      id: `con-${String(Date.now())}-${String(++this.consoleSequence)}`,
+      at: input.at ?? Date.now(),
+      source: input.source,
+      level: input.level,
+      text,
+      url: input.url ?? null,
+      file: input.file ?? null,
+      line: input.line ?? null,
+      column: input.column ?? null,
+    };
+    this.consoleEntries.push(entry);
+    this.pendingConsole.push(entry);
+    this.scheduleFlush();
   }
 
   private recordActivity(input: ActivityInput): void {
@@ -4339,6 +4652,14 @@ export class BrowserController {
     this.pendingActivity = [];
     this.runtimeSqlActivitySeen.clear();
     this.send({ type: 'activity-cleared' });
+    this.clearConsole();
+  }
+
+  private clearConsole(): void {
+    this.consoleEntries = [];
+    this.pendingConsole = [];
+    this.consoleSequence = 0;
+    this.send({ type: 'console-cleared' });
   }
 
   private applyBounds(): void {
@@ -4380,6 +4701,7 @@ export class BrowserController {
       loading: this.state.loading,
       captureActive: this.state.captureActive,
       inspectionEnabled: this.state.inspectionEnabled,
+      hoverTipPinned: this.hoverTipPinned,
       canGoBack: contents.navigationHistory.canGoBack(),
       canGoForward: contents.navigationHistory.canGoForward(),
       message: this.state.error,
@@ -4407,7 +4729,7 @@ export class BrowserController {
     this.inspectionSession = null;
     this.hoverProvenanceCache = null;
     this.lastRuntimeStatus = null;
-    this.clearActivity();
+    this.setShiftHeld(false);
     this.activitySequence = 0;
     this.sqlRuntimeSequence = 0;
 
@@ -4422,6 +4744,7 @@ export class BrowserController {
     const backendLauncher = this.backendLauncher;
     this.backendLauncher = null;
     backendLauncher?.stop();
+    this.clearActivity();
 
     const inspector = this.inspector;
     this.inspector = null;

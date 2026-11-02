@@ -4,6 +4,7 @@ import {
   BROWSER_BOUNDS_SCHEMA,
   BROWSER_SET_INSPECTION_SCHEMA,
   BROWSER_TARGETS_REQUEST_SCHEMA,
+  CODE_LOCATION_REQUEST_SCHEMA,
   ERROR_CODES,
   IPC_CHANNELS,
   NO_PAYLOAD_SCHEMA,
@@ -11,6 +12,8 @@ import {
   toIpcError,
   type BrowserSnapshot,
   type BrowserState,
+  type CodeLocation,
+  type CodeLocationRequest,
   type FileContent,
   type IpcResult,
   type ProjectSetupDetection,
@@ -25,6 +28,7 @@ export interface IpcDependencies {
   getMainWindow(): BrowserWindow | null;
   workspace: WorkspaceService;
   browser: BrowserController;
+  revealCode(request: CodeLocationRequest): CodeLocation | null;
   logger: Logger;
 }
 
@@ -73,7 +77,7 @@ function reportFailure<T>(error: unknown, logger: Logger, channel: string): IpcR
 }
 
 export function registerIpcHandlers(dependencies: IpcDependencies): void {
-  const { getMainWindow, workspace, browser, logger } = dependencies;
+  const { getMainWindow, workspace, browser, revealCode, logger } = dependencies;
 
   ipcMain.handle(
     IPC_CHANNELS.openWorkspace,
@@ -134,6 +138,21 @@ export function registerIpcHandlers(dependencies: IpcDependencies): void {
       return { ok: true, value: workspace.readFile(parsed.data.path) };
     } catch (error) {
       return reportFailure(error, logger, IPC_CHANNELS.readFile);
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.revealCode, (event, payload): IpcResult<CodeLocation | null> => {
+    if (!isTrustedSender(event, getMainWindow())) {
+      return unauthorized();
+    }
+    const parsed = CODE_LOCATION_REQUEST_SCHEMA.safeParse(payload);
+    if (!parsed.success) {
+      return invalidPayload();
+    }
+    try {
+      return { ok: true, value: revealCode(parsed.data) };
+    } catch (error) {
+      return reportFailure(error, logger, IPC_CHANNELS.revealCode);
     }
   });
 

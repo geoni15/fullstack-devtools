@@ -7,6 +7,8 @@ import {
   type BrowserSnapshot,
   type BrowserState,
   type BrowserTargetsRequest,
+  type CodeLocation,
+  type CodeLocationRequest,
   type FileContent,
   type IpcResult,
   type ProjectSetupDetection,
@@ -22,6 +24,22 @@ const api: BdtApi = {
     ipcRenderer.invoke(IPC_CHANNELS.readFile, { path: filePath }) as Promise<
       IpcResult<FileContent>
     >,
+  revealCode: (location: CodeLocationRequest) =>
+    ipcRenderer.invoke(IPC_CHANNELS.revealCode, location) as Promise<
+      IpcResult<CodeLocation | null>
+    >,
+  onRevealLocation: (listener: (location: CodeLocation) => void) => {
+    if (typeof listener !== 'function') {
+      throw new TypeError('El listener debe ser una función.');
+    }
+    const handler = (_event: unknown, payload: CodeLocation): void => {
+      listener(payload);
+    };
+    ipcRenderer.on(IPC_CHANNELS.revealLocation, handler);
+    return () => {
+      ipcRenderer.removeListener(IPC_CHANNELS.revealLocation, handler);
+    };
+  },
   detectProjectSetup: () =>
     ipcRenderer.invoke(IPC_CHANNELS.detectProjectSetup) as Promise<
       IpcResult<ProjectSetupDetection | null>

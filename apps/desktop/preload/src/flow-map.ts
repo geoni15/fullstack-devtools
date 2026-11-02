@@ -2,6 +2,8 @@ import { ipcRenderer } from 'electron';
 import {
   BROWSER_PANEL_CHANNELS,
   FLOW_INTERACTION_EVENTS,
+  normalizeSearchText,
+  requestStatusView,
   type FlowEdge,
   type FlowElementKind,
   type FlowInteractionEvent,
@@ -9,6 +11,7 @@ import {
   type FlowNode,
   type FlowNodeType,
   type FlowSnapshot,
+  type RequestStatusView,
 } from '@bdt/protocol';
 import {
   FLOW_NODE_HEIGHT,
@@ -27,6 +30,15 @@ const BUNDLE_JUNCTION_GAP = 44;
 
 type TrafficMode = 'all' | 'interacted';
 type FocusDirection = 'forward' | 'both';
+type EdgeFlowClass = 'send' | 'receive' | 'gateway' | 'server' | 'neutral';
+
+const FLOW_CLASS_LABEL: Record<EdgeFlowClass, string> = {
+  send: 'Envío',
+  receive: 'Recibo',
+  gateway: 'Gateway HTTP',
+  server: 'Servidor',
+  neutral: 'Estructura',
+};
 
 const SEARCH_TYPE_ORDER: Record<FlowNodeType, number> = {
   element: 0,
@@ -76,12 +88,6 @@ const EVENT_LABEL: Record<FlowInteractionEvent, string> = {
   keydown: 'Tecla',
   hover: 'Hover',
   scroll: 'Desplazamiento',
-};
-
-const OUTCOME_LABEL: Record<string, string> = {
-  pending: 'pendiente',
-  finished: 'completada',
-  failed: 'fallida',
 };
 
 const ORIGIN_LABEL: Record<string, string> = {
@@ -135,8 +141,35 @@ interface EdgePlan {
   tooltip: string;
   d: string;
   marker: string;
+  startMarker: string;
   className: string;
+  flowClass: EdgeFlowClass;
+  roundTrip: boolean;
+  glyph: '↑' | '↓' | '';
+  glyphX: number;
+  glyphY: number;
   bbox: { minX: number; minY: number; maxX: number; maxY: number };
+}
+
+interface EdgeView {
+  plan: EdgePlan;
+  path: SVGPathElement;
+  group: SVGGElement;
+  glyph: SVGTextElement | null;
+}
+
+interface ForwardGroup {
+  targetId: string;
+  flowClass: EdgeFlowClass;
+  bySource: Map<string, FlowEdge[]>;
+}
+
+interface SingleEdgeItem {
+  edge: FlowEdge;
+  source: FlowPlacedNode;
+  target: FlowPlacedNode;
+  targetNode: FlowNode;
+  flowClass: EdgeFlowClass;
 }
 
 interface WorldBounds {
@@ -150,10 +183,13 @@ let initialized = false;
 let state: FlowMapState = { open: false, building: false, error: null, snapshot: null };
 let model: GraphModel | null = null;
 let selectedId: string | null = null;
+let selectionHighlight = false;
+let highlightScope: Set<string> | null = null;
 let currentCardRequests = new Set<string>();
 let searchTerm = '';
 let trafficMode: TrafficMode = 'all';
 let eventFilter: FlowInteractionEvent | null = null;
+let eventOnly = false;
 let focusScope: Set<string> | null = null;
 let focusOriginId: string | null = null;
 let focusDirection: FocusDirection = 'both';
@@ -170,12 +206,22 @@ let branchLayer: SVGGElement | null = null;
 let trunkLayer: SVGGElement | null = null;
 let nodeLayer: SVGGElement | null = null;
 let edgePlans: EdgePlan[] = [];
+let planById = new Map<string, EdgePlan>();
+let respondedScope = new Set<string>();
 let nodeViews = new Map<string, { node: FlowNode; group: SVGGElement }>();
-let edgeViews = new Map<string, { plan: EdgePlan; path: SVGPathElement }>();
+let edgeViews = new Map<string, EdgeView>();
 let filterVisibility = new Map<string, boolean>();
 let viewportFrame = 0;
 let resizeObserver: ResizeObserver | null = null;
 let traceButtons = new Map<string, HTMLButtonElement>();
+let tooltipsPinned = false;
+let shiftHeld = false;
+let tipKey: string | null = null;
+let hoverKey: string | null = null;
+let hoverText = '';
+let tipPointerX = 0;
+let tipPointerY = 0;
+let menuNodeId: string | null = null;
 
 function element<T extends HTMLElement = HTMLElement>(id: string): T {
   const found = document.getElementById(id);
@@ -230,6 +276,48 @@ function clock(at: number): string {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+function revealLocation(
+  file: string | null | undefined,
+  line: number | null | undefined,
+  endLine: number | null | undefined,
+): void {
+  if (file === null || file === undefined || line === null || line === undefined || line <= 0) {
+    return;
+  }
+  ipcRenderer.send(BROWSER_PANEL_CHANNELS.revealLocation, {
+    path: file,
+    line,
+    endLine: endLine ?? null,
+  });
+}
+
+function codeLink(
+  label: string,
+  file: string | null | undefined,
+  line: number | null | undefined,
+  endLine: number | null | undefined,
+): HTMLElement {
+  const plain = document.createElement('span');
+  plain.textContent = label;
+  if (file === null || file === undefined || line === null || line === undefined || line <= 0) {
+    return plain;
+  }
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'code-link';
+  button.textContent = label;
+  button.title = 'Abrir en el editor y marcar la función';
+  button.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    revealLocation(file, line, endLine);
+  });
+  button.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') event.stopPropagation();
+  });
+  return button;
+}
+
 function evidenceClass(evidence: readonly string[]): string {
   const runtime = evidence.includes('RUNTIME');
   const staticEvidence = evidence.includes('STATIC');
@@ -237,11 +325,72 @@ function evidenceClass(evidence: readonly string[]): string {
   return runtime ? 'is-runtime' : '';
 }
 
-function arrowMarker(evidence: readonly string[]): string {
-  const runtime = evidence.includes('RUNTIME');
-  const staticEvidence = evidence.includes('STATIC');
-  if (runtime && staticEvidence) return 'url(#flow-arrow-both)';
-  return runtime ? 'url(#flow-arrow-runtime)' : 'url(#flow-arrow-static)';
+function flowClassMarker(flowClass: EdgeFlowClass): string {
+  return `url(#flow-arrow-${flowClass})`;
+}
+
+function requestResponded(node: FlowNode | undefined): boolean {
+  if (node === undefined || node.type !== 'request') return false;
+  if (node.outcome === 'finished' || node.outcome === 'failed') return true;
+  return node.statusCode !== null && node.statusCode !== undefined;
+}
+
+function directionLabel(flowClass: EdgeFlowClass, roundTrip: boolean): string {
+  const base = FLOW_CLASS_LABEL[flowClass];
+  if (flowClass === 'gateway') {
+    return roundTrip
+      ? `${base} · solicitud y respuesta observadas`
+      : `${base} · solo solicitud observada`;
+  }
+  if (flowClass === 'server') {
+    return roundTrip
+      ? `${base} · llamada y respuesta observadas`
+      : `${base} · llamada sin respuesta observada`;
+  }
+  if (flowClass === 'receive') return `${base} · dato que vuelve`;
+  if (flowClass === 'send') return `${base} · solicitud o evento`;
+  return `${base} · jerarquía o inferencia`;
+}
+
+function flowClassFor(edge: FlowEdge, source: FlowNode, target: FlowNode): EdgeFlowClass {
+  if (edge.type === 'PROVENANCE' || edge.type === 'RENDERS') return 'receive';
+  if (edge.type === 'CONTAINS') return 'neutral';
+  if (source.type === 'element' && target.type === 'element') return 'neutral';
+  if (target.type === 'request') return 'gateway';
+  if (edge.type === 'TRIGGERS' || edge.type === 'NAVIGATES') return 'send';
+  if (edge.type === 'SUBMITS') {
+    return target.type === 'route' ? 'send' : 'gateway';
+  }
+  if (edge.type === 'SENDS') return 'gateway';
+  return 'server';
+}
+
+function edgeRoundTrip(edge: FlowEdge, target: FlowNode, flowClass: EdgeFlowClass): boolean {
+  if (flowClass === 'gateway') return requestResponded(target);
+  if (flowClass !== 'server') return false;
+  if (!edge.evidence.includes('RUNTIME')) return false;
+  return respondedScope.has(edge.from);
+}
+
+function computeRespondedScope(): Set<string> {
+  const reached = new Set<string>();
+  if (model === null) return reached;
+  const queue: string[] = [];
+  for (const node of model.snapshot.nodes) {
+    if (node.type !== 'request' || !requestResponded(node)) continue;
+    reached.add(node.id);
+    queue.push(node.id);
+  }
+  while (queue.length > 0) {
+    const current = queue.pop();
+    if (current === undefined) continue;
+    for (const next of model.outgoing.get(current) ?? []) {
+      if (reached.has(next)) continue;
+      reached.add(next);
+      queue.push(next);
+    }
+  }
+  return reached;
 }
 
 function nodeTypeLabel(node: FlowNode): string {
@@ -267,6 +416,21 @@ function eventTotal(node: FlowNode): number {
   return total;
 }
 
+function nodeCount(node: FlowNode): number {
+  if (node.type === 'request') return 0;
+  if (node.type === 'element') return Math.max(node.occurrences, eventTotal(node));
+  return node.occurrences;
+}
+
+function requestStatus(node: FlowNode): RequestStatusView | null {
+  if (node.type !== 'request') return null;
+  return requestStatusView({
+    statusCode: node.statusCode ?? null,
+    outcome: node.outcome ?? 'pending',
+    backendObserved: node.backendObserved ?? null,
+  });
+}
+
 function eventSummary(node: FlowNode): string | null {
   const events = node.events ?? [];
   if (events.length === 0) return null;
@@ -283,6 +447,14 @@ function nodeTooltip(node: FlowNode): string {
     const line = node.line === null ? '' : `:${String(node.line)}`;
     parts.push(`${node.file}${line}`);
   }
+  const status = requestStatus(node);
+  if (status !== null) {
+    parts.push(`Estado: ${status.phase}`);
+    if (status.detail !== status.phase) parts.push(status.detail);
+  }
+  if (node.countLabel !== null && node.countLabel !== undefined && node.occurrences > 0) {
+    parts.push(`${node.countLabel}: ${String(node.occurrences)}`);
+  }
   const events = eventSummary(node);
   if (events !== null) parts.push(`Eventos: ${events}`);
   if (node.firstSeen > 0) {
@@ -296,8 +468,9 @@ function nodeTooltip(node: FlowNode): string {
   return parts.join('\n');
 }
 
-function edgeTooltip(edge: FlowEdge): string {
+function edgeTooltip(edge: FlowEdge, flowClass: EdgeFlowClass, roundTrip: boolean): string {
   const parts = [
+    directionLabel(flowClass, roundTrip),
     `${edge.type} · ${edge.evidence.join(' + ')} · ${
       edge.correlation === 'direct' ? 'directa' : 'heurística'
     }`,
@@ -461,8 +634,13 @@ function updateVisibleViews(): void {
     if (planInBounds(plan, bounds)) {
       if (mounted === undefined) mountPlan(plan);
     } else if (mounted !== undefined) {
-      mounted.path.remove();
+      mounted.group.remove();
       edgeViews.delete(plan.id);
+      if (hoverKey === `plan:${plan.id}`) {
+        hoverKey = null;
+        hoverText = '';
+        hideTip();
+      }
     }
   }
 }
@@ -585,7 +763,12 @@ function lastSeenOf(edges: readonly FlowEdge[]): number {
   return latest;
 }
 
-function mergedEdgeTooltip(target: FlowNode, edges: readonly FlowEdge[]): string {
+function mergedEdgeTooltip(
+  target: FlowNode,
+  edges: readonly FlowEdge[],
+  flowClass: EdgeFlowClass,
+  roundTrip: boolean,
+): string {
   const kinds = edges.map(
     (edge) =>
       `${edge.type}${edge.occurrences > 1 ? ` ×${String(edge.occurrences)}` : ''}${
@@ -593,6 +776,7 @@ function mergedEdgeTooltip(target: FlowNode, edges: readonly FlowEdge[]): string
       }`,
   );
   const parts = [
+    directionLabel(flowClass, roundTrip),
     `${String(edges.length)} conexiones hacia ${TYPE_LABEL[target.type]} ${target.title}`,
     kinds.join(' · '),
   ];
@@ -607,21 +791,65 @@ function mergedEdgeTooltip(target: FlowNode, edges: readonly FlowEdge[]): string
   return parts.join('\n');
 }
 
-function edgeClassName(evidence: readonly string[], heuristic: boolean, bundle: boolean): string {
-  let name = 'flow-edge';
-  const evidenceName = evidenceClass(evidence);
-  if (evidenceName !== '') name += ` ${evidenceName}`;
+function edgeClassName(
+  evidence: readonly string[],
+  heuristic: boolean,
+  bundle: boolean,
+  flowClass: EdgeFlowClass,
+  roundTrip: boolean,
+): string {
+  let name = `flow-edge is-${flowClass}`;
   if (heuristic) name += ' is-heuristic';
   if (bundle) name += ' is-bundle';
+  if (!evidence.includes('RUNTIME')) name += ' is-static-only';
+  if (roundTrip) name += ' is-roundtrip';
   return name;
 }
 
 function planBBox(x1: number, y1: number, x2: number, y2: number): EdgePlan['bbox'] {
   return {
-    minX: Math.min(x1, x2) - 8,
-    minY: Math.min(y1, y2) - 8,
-    maxX: Math.max(x1, x2) + 8,
-    maxY: Math.max(y1, y2) + 8,
+    minX: Math.min(x1, x2) - 16,
+    minY: Math.min(y1, y2) - 16,
+    maxX: Math.max(x1, x2) + 16,
+    maxY: Math.max(y1, y2) + 16,
+  };
+}
+
+function makePlan(input: {
+  id: string;
+  kind: EdgePlan['kind'];
+  sources: string[];
+  to: string;
+  edgeIds: string[];
+  tooltip: string;
+  d: string;
+  marker: string;
+  startMarker?: string;
+  className: string;
+  flowClass: EdgeFlowClass;
+  roundTrip: boolean;
+  glyph?: '↑' | '↓' | '';
+  glyphX?: number;
+  glyphY?: number;
+  bbox: EdgePlan['bbox'];
+}): EdgePlan {
+  return {
+    id: input.id,
+    kind: input.kind,
+    sources: input.sources,
+    to: input.to,
+    edgeIds: input.edgeIds,
+    tooltip: input.tooltip,
+    d: input.d,
+    marker: input.marker,
+    startMarker: input.startMarker ?? '',
+    className: input.className,
+    flowClass: input.flowClass,
+    roundTrip: input.roundTrip,
+    glyph: input.glyph ?? '',
+    glyphX: input.glyphX ?? 0,
+    glyphY: input.glyphY ?? 0,
+    bbox: input.bbox,
   };
 }
 
@@ -632,161 +860,260 @@ function edgePath(sourceX: number, sourceY: number, targetX: number, targetY: nu
   )}, ${String(targetX - bend)} ${String(targetY)}, ${String(targetX)} ${String(targetY)}`;
 }
 
-function buildEdgePlans(): EdgePlan[] {
-  if (model === null) return [];
-  const positions = model.layout.positions;
-  const forward = new Map<string, Map<string, FlowEdge[]>>();
-  const backward: FlowEdge[] = [];
-  for (const edge of model.viewEdges) {
-    const source = positions.get(edge.from);
-    const target = positions.get(edge.to);
-    if (source === undefined || target === undefined) continue;
-    if (source.x + FLOW_NODE_WIDTH > target.x) {
-      backward.push(edge);
-      continue;
+function receiveEdgePath(
+  sourceX: number,
+  sourceY: number,
+  targetX: number,
+  targetY: number,
+): string {
+  const bend = Math.max(36, Math.abs(targetX - sourceX) / 2);
+  return `M ${String(sourceX)} ${String(sourceY)} C ${String(sourceX - bend)} ${String(
+    sourceY,
+  )}, ${String(targetX + bend)} ${String(targetY)}, ${String(targetX)} ${String(targetY)}`;
+}
+
+function verticalEdgePath(source: FlowPlacedNode, target: FlowPlacedNode): string {
+  const downward = target.y >= source.y;
+  const sourceX = source.x + FLOW_NODE_WIDTH / 2;
+  const sourceY = downward ? source.y + FLOW_NODE_HEIGHT : source.y;
+  const targetX = target.x + FLOW_NODE_WIDTH / 2;
+  const targetY = downward ? target.y : target.y + FLOW_NODE_HEIGHT;
+  const bend = Math.max(18, Math.abs(targetY - sourceY) / 2);
+  const direction = downward ? 1 : -1;
+  return `M ${String(sourceX)} ${String(sourceY)} C ${String(sourceX)} ${String(
+    sourceY + direction * bend,
+  )}, ${String(targetX)} ${String(targetY - direction * bend)}, ${String(targetX)} ${String(
+    targetY,
+  )}`;
+}
+
+function buildSinglePlan(item: SingleEdgeItem): EdgePlan {
+  const { edge, flowClass } = item;
+  const roundTrip = edgeRoundTrip(edge, item.targetNode, flowClass);
+  let from = item.source;
+  let to = item.target;
+  if (flowClass === 'receive' && to.x > from.x) {
+    from = item.target;
+    to = item.source;
+  }
+
+  let d: string;
+  let glyph: '↑' | '↓' | '' = '';
+  let glyphX = 0;
+  let glyphY = 0;
+  if (from.x === to.x) {
+    d = verticalEdgePath(from, to);
+    if (flowClass === 'receive') {
+      glyph = '↓';
+      glyphX = from.x - 9;
+      glyphY = from.y + FLOW_NODE_HEIGHT / 2;
     }
-    let bySource = forward.get(edge.to);
-    if (bySource === undefined) {
-      bySource = new Map();
-      forward.set(edge.to, bySource);
+  } else if (from.x > to.x) {
+    const sourceX = from.x;
+    const sourceY = from.y + FLOW_NODE_HEIGHT / 2;
+    const targetX = to.x + FLOW_NODE_WIDTH;
+    const targetY = to.y + FLOW_NODE_HEIGHT / 2;
+    d = receiveEdgePath(sourceX, sourceY, targetX, targetY);
+    if (flowClass === 'receive') {
+      glyph = '↓';
+      glyphX = sourceX - 9;
+      glyphY = sourceY - 6;
     }
-    const list = bySource.get(edge.from);
-    if (list === undefined) {
-      bySource.set(edge.from, [edge]);
-    } else {
-      list.push(edge);
+  } else {
+    const sourceX = from.x + FLOW_NODE_WIDTH;
+    const sourceY = from.y + FLOW_NODE_HEIGHT / 2;
+    const targetX = to.x;
+    const targetY = to.y + FLOW_NODE_HEIGHT / 2;
+    d = edgePath(sourceX, sourceY, targetX, targetY);
+    if (flowClass === 'send' || flowClass === 'gateway' || flowClass === 'server') {
+      glyph = '↑';
+      glyphX = sourceX + 9;
+      glyphY = sourceY - 6;
     }
   }
 
-  const plans: EdgePlan[] = [];
-  for (const edge of backward) {
-    const source = positions.get(edge.from);
-    const target = positions.get(edge.to);
-    if (source === undefined || target === undefined) continue;
-    const sourceX = source.x + FLOW_NODE_WIDTH;
-    const sourceY = source.y + FLOW_NODE_HEIGHT / 2;
-    const targetX = target.x;
-    const targetY = target.y + FLOW_NODE_HEIGHT / 2;
-    plans.push({
-      id: `edge:${edge.id}`,
-      kind: 'edge',
-      sources: [edge.from],
-      to: edge.to,
-      edgeIds: [edge.id],
-      tooltip: edgeTooltip(edge),
-      d: edgePath(sourceX, sourceY, targetX, targetY),
-      marker: arrowMarker(edge.evidence),
-      className: edgeClassName(edge.evidence, edge.correlation === 'heuristic', false),
-      bbox: planBBox(sourceX, sourceY, targetX, targetY),
+  const marker = flowClass === 'neutral' ? '' : flowClassMarker(flowClass);
+  return makePlan({
+    id: `edge:${edge.id}`,
+    kind: 'edge',
+    sources: [edge.from],
+    to: edge.to,
+    edgeIds: [edge.id],
+    tooltip: edgeTooltip(edge, flowClass, roundTrip),
+    d,
+    marker,
+    startMarker: roundTrip ? marker : '',
+    className: edgeClassName(
+      edge.evidence,
+      edge.correlation === 'heuristic',
+      false,
+      flowClass,
+      roundTrip,
+    ),
+    flowClass,
+    roundTrip,
+    glyph: roundTrip ? '' : glyph,
+    glyphX,
+    glyphY,
+    bbox: planBBox(from.x, from.y, to.x + FLOW_NODE_WIDTH, to.y + FLOW_NODE_HEIGHT),
+  });
+}
+
+function buildForwardPlans(group: ForwardGroup): EdgePlan[] {
+  const current = model;
+  if (current === null) return [];
+  const targetNode = current.nodesById.get(group.targetId);
+  const target = current.layout.positions.get(group.targetId);
+  if (targetNode === undefined || target === undefined) return [];
+
+  const entries: Array<{
+    sourceId: string;
+    edges: FlowEdge[];
+    source: FlowPlacedNode;
+    roundTrip: boolean;
+  }> = [];
+  for (const [sourceId, edges] of group.bySource) {
+    const source = current.layout.positions.get(sourceId);
+    if (source === undefined || current.nodesById.get(sourceId) === undefined) continue;
+    if (edges.length === 0) continue;
+    entries.push({
+      sourceId,
+      edges,
+      source,
+      roundTrip: edges.some((edge) => edgeRoundTrip(edge, targetNode, group.flowClass)),
     });
   }
+  if (entries.length === 0) return [];
 
-  for (const [targetId, bySource] of forward) {
-    const targetNode = model.nodesById.get(targetId);
-    const target = positions.get(targetId);
-    if (targetNode === undefined || target === undefined) continue;
-    const sourceIds = [...bySource.keys()];
-    const firstSourceId = sourceIds[0];
-    if (firstSourceId === undefined) continue;
+  const roundTrip = entries.some((entry) => entry.roundTrip);
+  const marker = flowClassMarker(group.flowClass);
+  const plans: EdgePlan[] = [];
 
-    if (sourceIds.length === 1) {
-      const source = positions.get(firstSourceId);
-      const edges = bySource.get(firstSourceId) ?? [];
-      if (source === undefined || edges.length === 0) continue;
-      const sourceX = source.x + FLOW_NODE_WIDTH;
-      const sourceY = source.y + FLOW_NODE_HEIGHT / 2;
-      const targetX = target.x;
-      const targetY = target.y + FLOW_NODE_HEIGHT / 2;
-      const evidence = mergeEvidence(edges);
-      const first = edges[0];
-      plans.push({
-        id: `edge:${targetId}:${firstSourceId}`,
+  if (entries.length === 1) {
+    const entry = entries[0];
+    if (entry === undefined) return plans;
+    const sourceX = entry.source.x + FLOW_NODE_WIDTH;
+    const sourceY = entry.source.y + FLOW_NODE_HEIGHT / 2;
+    const targetX = target.x;
+    const targetY = target.y + FLOW_NODE_HEIGHT / 2;
+    const evidence = mergeEvidence(entry.edges);
+    const first = entry.edges[0];
+    plans.push(
+      makePlan({
+        id: `edge:${group.targetId}:${entry.sourceId}`,
         kind: 'edge',
-        sources: [firstSourceId],
-        to: targetId,
-        edgeIds: edges.map((edge) => edge.id),
+        sources: [entry.sourceId],
+        to: group.targetId,
+        edgeIds: entry.edges.map((edge) => edge.id),
         tooltip:
-          edges.length === 1 && first !== undefined
-            ? edgeTooltip(first)
-            : mergedEdgeTooltip(targetNode, edges),
+          entry.edges.length === 1 && first !== undefined
+            ? edgeTooltip(first, group.flowClass, entry.roundTrip)
+            : mergedEdgeTooltip(targetNode, entry.edges, group.flowClass, entry.roundTrip),
         d: edgePath(sourceX, sourceY, targetX, targetY),
-        marker: arrowMarker(evidence),
+        marker,
+        startMarker: entry.roundTrip ? marker : '',
         className: edgeClassName(
           evidence,
-          edges.some((edge) => edge.correlation === 'heuristic'),
+          entry.edges.some((edge) => edge.correlation === 'heuristic'),
           false,
+          group.flowClass,
+          entry.roundTrip,
         ),
+        flowClass: group.flowClass,
+        roundTrip: entry.roundTrip,
+        glyph: entry.roundTrip ? '' : '↑',
+        glyphX: sourceX + 9,
+        glyphY: sourceY - 6,
         bbox: planBBox(sourceX, sourceY, targetX, targetY),
-      });
-      continue;
-    }
+      }),
+    );
+    return plans;
+  }
 
-    const junctionX = target.x - BUNDLE_JUNCTION_GAP;
-    const placedSources: Array<{
-      sourceId: string;
-      edges: FlowEdge[];
-      x: number;
-      y: number;
-    }> = [];
-    let sumY = 0;
-    for (const sourceId of sourceIds) {
-      const source = positions.get(sourceId);
-      if (source === undefined) continue;
-      const sourceX = source.x + FLOW_NODE_WIDTH;
-      const sourceY = source.y + FLOW_NODE_HEIGHT / 2;
-      sumY += sourceY;
-      placedSources.push({ sourceId, edges: bySource.get(sourceId) ?? [], x: sourceX, y: sourceY });
-    }
-    if (placedSources.length === 0) continue;
-    const junctionY = sumY / placedSources.length;
+  const junctionX = target.x - BUNDLE_JUNCTION_GAP;
+  const placedSources: Array<{
+    sourceId: string;
+    edges: FlowEdge[];
+    source: FlowPlacedNode;
+    x: number;
+    y: number;
+    roundTrip: boolean;
+  }> = [];
+  let sumY = 0;
+  for (const entry of entries) {
+    const sourceX = entry.source.x + FLOW_NODE_WIDTH;
+    const sourceY = entry.source.y + FLOW_NODE_HEIGHT / 2;
+    sumY += sourceY;
+    placedSources.push({
+      sourceId: entry.sourceId,
+      edges: entry.edges,
+      source: entry.source,
+      x: sourceX,
+      y: sourceY,
+      roundTrip: entry.roundTrip,
+    });
+  }
+  const junctionY = sumY / placedSources.length;
 
-    for (const item of placedSources) {
-      const evidence = mergeEvidence(item.edges);
-      const first = item.edges[0];
-      const bend = Math.max(24, (junctionX - item.x) / 2);
-      plans.push({
-        id: `branch:${targetId}:${item.sourceId}`,
+  for (const item of placedSources) {
+    const evidence = mergeEvidence(item.edges);
+    const first = item.edges[0];
+    const bend = Math.max(24, (junctionX - item.x) / 2);
+    plans.push(
+      makePlan({
+        id: `branch:${group.targetId}:${item.sourceId}`,
         kind: 'branch',
         sources: [item.sourceId],
-        to: targetId,
+        to: group.targetId,
         edgeIds: item.edges.map((edge) => edge.id),
         tooltip:
           item.edges.length === 1 && first !== undefined
-            ? edgeTooltip(first)
-            : mergedEdgeTooltip(targetNode, item.edges),
+            ? edgeTooltip(first, group.flowClass, item.roundTrip)
+            : mergedEdgeTooltip(targetNode, item.edges, group.flowClass, item.roundTrip),
         d: `M ${String(item.x)} ${String(item.y)} C ${String(item.x + bend)} ${String(
           item.y,
         )}, ${String(junctionX - bend)} ${String(junctionY)}, ${String(junctionX)} ${String(
           junctionY,
         )}`,
         marker: '',
+        startMarker: item.roundTrip ? marker : '',
         className: edgeClassName(
           evidence,
           item.edges.some((edge) => edge.correlation === 'heuristic'),
           true,
+          group.flowClass,
+          item.roundTrip,
         ),
+        flowClass: group.flowClass,
+        roundTrip: item.roundTrip,
+        glyph: item.roundTrip ? '' : '↑',
+        glyphX: item.x + 9,
+        glyphY: item.y - 6,
         bbox: planBBox(item.x, item.y, junctionX, junctionY),
-      });
-    }
+      }),
+    );
+  }
 
-    const allEdges = placedSources.flatMap((item) => item.edges);
-    const trunkEvidence = mergeEvidence(allEdges);
-    const targetX = target.x;
-    const targetY = target.y + FLOW_NODE_HEIGHT / 2;
-    const trunkBend = Math.max(18, (targetX - junctionX) / 2);
-    const latest = lastSeenOf(allEdges);
-    const tooltipParts = [
-      `Flechas convergentes hacia ${TYPE_LABEL[targetNode.type]} ${targetNode.title}`,
-      `${String(placedSources.length)} orígenes · ${String(
-        allEdges.length,
-      )} conexiones agrupadas en un solo tronco`,
-    ];
-    if (latest > 0) tooltipParts.push(`Visto: ${clock(latest)}`);
-    plans.push({
-      id: `trunk:${targetId}`,
+  const allEdges = placedSources.flatMap((item) => item.edges);
+  const trunkEvidence = mergeEvidence(allEdges);
+  const targetX = target.x;
+  const targetY = target.y + FLOW_NODE_HEIGHT / 2;
+  const trunkBend = Math.max(18, (targetX - junctionX) / 2);
+  const latest = lastSeenOf(allEdges);
+  const tooltipParts = [
+    directionLabel(group.flowClass, roundTrip),
+    `Flechas convergentes hacia ${TYPE_LABEL[targetNode.type]} ${targetNode.title}`,
+    `${String(placedSources.length)} orígenes · ${String(
+      allEdges.length,
+    )} conexiones agrupadas en un solo tronco`,
+  ];
+  if (latest > 0) tooltipParts.push(`Visto: ${clock(latest)}`);
+  plans.push(
+    makePlan({
+      id: `trunk:${group.targetId}:${group.flowClass}`,
       kind: 'trunk',
       sources: placedSources.map((item) => item.sourceId),
-      to: targetId,
+      to: group.targetId,
       edgeIds: allEdges.map((edge) => edge.id),
       tooltip: tooltipParts.join('\n'),
       d: `M ${String(junctionX)} ${String(junctionY)} C ${String(
@@ -794,30 +1121,95 @@ function buildEdgePlans(): EdgePlan[] {
       )} ${String(junctionY)}, ${String(targetX - trunkBend)} ${String(targetY)}, ${String(
         targetX,
       )} ${String(targetY)}`,
-      marker: arrowMarker(trunkEvidence),
+      marker,
       className: edgeClassName(
         trunkEvidence,
         allEdges.some((edge) => edge.correlation === 'heuristic'),
         true,
+        group.flowClass,
+        roundTrip,
       ),
+      flowClass: group.flowClass,
+      roundTrip,
       bbox: planBBox(junctionX, junctionY, targetX, targetY),
-    });
+    }),
+  );
+  return plans;
+}
+
+function buildEdgePlans(): EdgePlan[] {
+  if (model === null) {
+    respondedScope = new Set();
+    return [];
+  }
+  respondedScope = computeRespondedScope();
+  const positions = model.layout.positions;
+  const groups = new Map<string, ForwardGroup>();
+  const singles: SingleEdgeItem[] = [];
+
+  for (const edge of model.viewEdges) {
+    const source = positions.get(edge.from);
+    const target = positions.get(edge.to);
+    const sourceNode = model.nodesById.get(edge.from);
+    const targetNode = model.nodesById.get(edge.to);
+    if (
+      source === undefined ||
+      target === undefined ||
+      sourceNode === undefined ||
+      targetNode === undefined
+    ) {
+      continue;
+    }
+    const flowClass = flowClassFor(edge, sourceNode, targetNode);
+    if (
+      flowClass === 'receive' ||
+      flowClass === 'neutral' ||
+      target.x < source.x + FLOW_NODE_WIDTH
+    ) {
+      singles.push({ edge, source, target, targetNode, flowClass });
+      continue;
+    }
+    const key = `${edge.to}\u0000${flowClass}`;
+    let group = groups.get(key);
+    if (group === undefined) {
+      group = { targetId: edge.to, flowClass, bySource: new Map() };
+      groups.set(key, group);
+    }
+    const list = group.bySource.get(edge.from);
+    if (list === undefined) {
+      group.bySource.set(edge.from, [edge]);
+    } else {
+      list.push(edge);
+    }
+  }
+
+  const plans = singles.map((item) => buildSinglePlan(item));
+  for (const group of groups.values()) {
+    plans.push(...buildForwardPlans(group));
   }
   return plans;
 }
 
 function mountPlan(plan: EdgePlan): void {
-  const attributes: Record<string, string> = { class: plan.className, d: plan.d };
+  const group = svgElement('g');
+  const attributes: Record<string, string> = {
+    class: plan.className,
+    d: plan.d,
+    'data-plan-id': plan.id,
+  };
   if (plan.marker !== '') attributes['marker-end'] = plan.marker;
+  if (plan.startMarker !== '') attributes['marker-start'] = plan.startMarker;
+  group.append(svgElement('path', { class: 'flow-edge-hit', d: plan.d, 'data-plan-id': plan.id }));
   const path = svgElement('path', attributes);
-  if (plan.tooltip !== '') {
-    const tooltip = svgElement('title');
-    tooltip.textContent = plan.tooltip;
-    path.append(tooltip);
+  group.append(path);
+  let glyph: SVGTextElement | null = null;
+  if (plan.glyph !== '') {
+    glyph = svgText(`flow-dir is-${plan.flowClass}`, plan.glyphX, plan.glyphY, plan.glyph);
+    group.append(glyph);
   }
   const layer = plan.kind === 'trunk' ? trunkLayer : branchLayer;
-  if (layer !== null) layer.append(path);
-  const view = { plan, path };
+  if (layer !== null) layer.append(group);
+  const view: EdgeView = { plan, path, group, glyph };
   edgeViews.set(plan.id, view);
   applyPlanViewState(view);
 }
@@ -837,17 +1229,25 @@ function renderGraph(): void {
   nodeViews = new Map();
   edgeViews = new Map();
   edgePlans = [];
+  planById = new Map();
+  respondedScope = new Set();
   viewport = null;
   branchLayer = null;
   trunkLayer = null;
   nodeLayer = null;
+  hoverKey = null;
+  hoverText = '';
+  hideTip();
+  closeNodeMenu();
   if (model === null) return;
 
   const defs = svgElement('defs');
   const markers: Array<[string, string]> = [
-    ['flow-arrow-static', '#6e7f8f'],
-    ['flow-arrow-runtime', '#3fb950'],
-    ['flow-arrow-both', '#58a6ff'],
+    ['flow-arrow-send', '#58a6ff'],
+    ['flow-arrow-receive', '#3fb950'],
+    ['flow-arrow-gateway', '#d29922'],
+    ['flow-arrow-server', '#bc8cff'],
+    ['flow-arrow-neutral', '#6e7f8f'],
   ];
   for (const [id, color] of markers) {
     const marker = svgElement('marker', {
@@ -884,6 +1284,7 @@ function renderGraph(): void {
   }
 
   edgePlans = buildEdgePlans();
+  planById = new Map(edgePlans.map((plan) => [plan.id, plan]));
   applyFiltersAndSelection();
   if (!viewReady) {
     fitView();
@@ -898,14 +1299,12 @@ function createNodeGroup(placed: FlowPlacedNode): SVGGElement {
   const group = svgElement('g', {
     class: `flow-node${evidenceClass(node.evidence) === '' ? '' : ` ${evidenceClass(node.evidence)}`}`,
     transform: `translate(${String(placed.x)} ${String(placed.y)})`,
+    'data-node-id': node.id,
   });
   if (node.type === 'element') {
     group.classList.toggle('is-hidden', node.visible === false);
     group.classList.toggle('is-disabled', node.disabled === true);
   }
-  const tooltip = svgElement('title');
-  tooltip.textContent = nodeTooltip(node);
-  group.append(tooltip);
   group.append(
     svgElement('rect', {
       class: 'box',
@@ -925,7 +1324,7 @@ function createNodeGroup(placed: FlowPlacedNode): SVGGElement {
     }),
   );
   group.append(svgText('type', 10, 14, nodeTypeLabel(node)));
-  const total = eventTotal(node);
+  const total = nodeCount(node);
   if (total > 0) {
     group.append(svgText('badge', FLOW_NODE_WIDTH - 8, 14, `${String(total)}×`));
   }
@@ -941,14 +1340,12 @@ function createNodeGroup(placed: FlowPlacedNode): SVGGElement {
     event.stopPropagation();
     selectNode(node.id);
   });
+  group.addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    openNodeMenu(node.id, event.clientX, event.clientY);
+  });
   return group;
-}
-
-function normalizeSearchText(value: string): string {
-  return value
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase();
 }
 
 function matchesSearch(node: FlowNode): boolean {
@@ -974,6 +1371,8 @@ function matchesSearch(node: FlowNode): boolean {
   for (const hint of node.handlers ?? []) {
     parts.push(hint.name, hint.source, hint.event);
   }
+  const status = requestStatus(node);
+  if (status !== null) parts.push(status.search);
   return parts.some(
     (part) => part !== null && part !== undefined && normalizeSearchText(part).includes(searchTerm),
   );
@@ -1017,6 +1416,77 @@ function trafficScope(): Set<string> | null {
   return model.runtimeReachable;
 }
 
+function scopeForView(): Set<string> | null {
+  const base = focusScope ?? trafficScope();
+  if (!eventOnly || eventFilter === null) return base;
+  const events = eventSubgraph(eventFilter);
+  if (base === null) return events;
+  const scope = new Set<string>();
+  for (const id of events) {
+    if (base.has(id)) scope.add(id);
+  }
+  return scope;
+}
+
+function syncEventOnly(): void {
+  const box = document.getElementById('map-event-only') as HTMLInputElement | null;
+  if (box === null) return;
+  box.checked = eventOnly;
+}
+
+let busyCount = 0;
+let scopeApplyTimer: number | null = null;
+
+function syncBusy(): void {
+  const busy = document.getElementById('map-busy');
+  if (busy === null) return;
+  const active = state.building || busyCount > 0;
+  busy.hidden = !active;
+  const label = busy.querySelector('.busy-label');
+  if (label !== null) {
+    label.textContent = busyCount > 0 ? 'Aplicando filtro…' : 'Actualizando mapa…';
+  }
+}
+
+function scheduleScopeApply(): void {
+  if (scopeApplyTimer !== null) {
+    clearTimeout(scopeApplyTimer);
+    busyCount = Math.max(0, busyCount - 1);
+  }
+  busyCount += 1;
+  syncBusy();
+  scopeApplyTimer = window.setTimeout(() => {
+    scopeApplyTimer = null;
+    try {
+      applyScopeView();
+    } finally {
+      busyCount = Math.max(0, busyCount - 1);
+      syncBusy();
+    }
+  }, 32);
+}
+
+function applyScopeView(): void {
+  if (model === null) return;
+  const scope = scopeForView();
+  if (selectedId !== null && scope !== null && !scope.has(selectedId)) {
+    selectedId = null;
+    selectionHighlight = false;
+    highlightScope = null;
+    const detail = element('map-detail');
+    detail.hidden = true;
+    detail.replaceChildren();
+  }
+  applyDisplayScope(scope);
+  renderGraph();
+  if (scope === null) {
+    fitView();
+  } else {
+    fitToNodes([...scope]);
+  }
+  renderStatus();
+}
+
 function syncTrafficButtons(): void {
   const all = element<HTMLButtonElement>('map-scope-all');
   const interacted = element<HTMLButtonElement>('map-scope-interacted');
@@ -1034,7 +1504,7 @@ function setTrafficMode(mode: TrafficMode): void {
   focusOriginId = null;
   focusDirection = 'both';
   hideSearchResults();
-  const scope = trafficScope();
+  const scope = scopeForView();
   if (selectedId !== null && scope !== null && !scope.has(selectedId)) {
     selectedId = null;
     const detail = element('map-detail');
@@ -1051,32 +1521,47 @@ function setTrafficMode(mode: TrafficMode): void {
 
 function applyNodeViewState(view: { node: FlowNode; group: SVGGElement }): void {
   const isSelected = selectedId === view.node.id;
-  const isNeighbor =
+  const inChain =
+    selectionHighlight &&
     selectedId !== null &&
-    selectedId !== view.node.id &&
-    (model?.neighbors.get(selectedId)?.has(view.node.id) ?? false);
+    !isSelected &&
+    (highlightScope?.has(view.node.id) ?? false);
   const visibleNode = filterVisibility.get(view.node.id) ?? true;
-  const selectionDim = focusScope === null && selectedId !== null && !isSelected && !isNeighbor;
+  const selectionDim = selectionHighlight && selectedId !== null && !isSelected && !inChain;
   view.group.classList.toggle('is-selected', isSelected);
-  view.group.classList.toggle('is-neighbor', isNeighbor);
+  view.group.classList.toggle('is-chain', inChain);
   view.group.classList.toggle('is-dimmed', !visibleNode || selectionDim);
 }
 
-function applyPlanViewState(view: { plan: EdgePlan; path: SVGPathElement }): void {
+function applyPlanViewState(view: EdgeView): void {
   const plan = view.plan;
   const targetVisible = filterVisibility.get(plan.to) ?? true;
   const sourceVisible =
     plan.kind === 'trunk'
       ? plan.sources.some((id) => filterVisibility.get(id) ?? true)
       : plan.sources.every((id) => filterVisibility.get(id) ?? true);
-  const lit = selectedId !== null && (plan.to === selectedId || plan.sources.includes(selectedId));
-  const selectionDim = focusScope === null && selectedId !== null && !lit;
+  const inChain =
+    selectionHighlight &&
+    selectedId !== null &&
+    highlightScope !== null &&
+    (highlightScope.has(plan.to) ?? false) &&
+    (plan.kind === 'trunk'
+      ? plan.sources.some((id) => highlightScope?.has(id) ?? false)
+      : plan.sources.length > 0 && plan.sources.every((id) => highlightScope?.has(id) ?? false));
+  const lit =
+    selectedId !== null &&
+    (selectionHighlight ? inChain : plan.to === selectedId || plan.sources.includes(selectedId));
+  const selectionDim = selectionHighlight && selectedId !== null && !lit;
+  const dimmed = !targetVisible || !sourceVisible || selectionDim;
   view.path.classList.toggle('is-lit', lit);
-  view.path.classList.toggle('is-dimmed', !targetVisible || !sourceVisible || selectionDim);
+  view.path.classList.toggle('is-dimmed', dimmed);
+  view.glyph?.classList.toggle('is-dimmed', dimmed);
 }
 
 function applyFiltersAndSelection(): void {
   if (model === null) return;
+  highlightScope =
+    selectionHighlight && selectedId !== null ? involvedScope(selectedId, 'both') : null;
   const eventScope = eventFilter === null ? null : eventSubgraph(eventFilter);
   filterVisibility = new Map<string, boolean>();
   for (const node of model.snapshot.nodes) {
@@ -1100,7 +1585,7 @@ function applyFiltersAndSelection(): void {
   }
 }
 
-function addRow(container: HTMLElement, label: string, value: string | null): void {
+function addRow(container: HTMLElement, label: string, value: string | HTMLElement | null): void {
   if (value === null || value === '') return;
   const row = document.createElement('div');
   row.className = 'row';
@@ -1109,7 +1594,11 @@ function addRow(container: HTMLElement, label: string, value: string | null): vo
   key.textContent = label;
   const text = document.createElement('div');
   text.className = 'value';
-  text.textContent = value;
+  if (typeof value === 'string') {
+    text.textContent = value;
+  } else {
+    text.append(value);
+  }
   row.append(key, text);
   container.append(row);
 }
@@ -1125,12 +1614,8 @@ function locationText(node: FlowNode): string | null {
 
 function requestSummary(node: FlowNode): string | null {
   const parts: string[] = [];
-  if (node.statusCode !== null && node.statusCode !== undefined) {
-    parts.push(String(node.statusCode));
-  }
-  if (node.outcome !== null && node.outcome !== undefined) {
-    parts.push(OUTCOME_LABEL[node.outcome] ?? node.outcome);
-  }
+  const status = requestStatus(node);
+  if (status !== null) parts.push(status.label);
   if (node.durationMs !== null && node.durationMs !== undefined) {
     parts.push(`${String(Math.round(node.durationMs))} ms`);
   }
@@ -1224,13 +1709,23 @@ function reachableNodeList(id: string): FlowNode[] {
   return nodes;
 }
 
-function routeLine(node: FlowNode): string {
+function routeLine(node: FlowNode): HTMLElement {
   const method = node.method ?? 'GET';
   const path = node.path ?? node.title;
-  const location =
-    node.file === null ? '' : ` · ${node.file}${node.line === null ? '' : `:${String(node.line)}`}`;
   const time = node.firstSeen > 0 ? `${clock(node.firstSeen)} · ` : '';
-  return `${time}${method} ${path}${location} · ${node.evidence.includes('RUNTIME') ? 'RUNTIME' : 'STATIC'}`;
+  const evidence = node.evidence.includes('RUNTIME') ? 'RUNTIME' : 'STATIC';
+  const row = document.createElement('span');
+  if (node.file === null) {
+    row.textContent = `${time}${method} ${path} · ${evidence}`;
+    return row;
+  }
+  const label = node.line === null ? node.file : `${node.file}:${String(node.line)}`;
+  row.append(
+    document.createTextNode(`${time}${method} ${path} · `),
+    codeLink(label, node.file, node.line, node.endLine),
+    document.createTextNode(` · ${evidence}`),
+  );
+  return row;
 }
 
 function requestLine(node: FlowNode): string {
@@ -1247,7 +1742,7 @@ function chronologicalNodes(left: FlowNode, right: FlowNode): number {
   return `${left.title}`.localeCompare(`${right.title}`, 'es') || left.id.localeCompare(right.id);
 }
 
-function reachableRoutes(node: FlowNode): string[] {
+function reachableRoutes(node: FlowNode): HTMLElement[] {
   return reachableNodeList(node.id)
     .filter((item) => item.type === 'route')
     .sort(chronologicalNodes)
@@ -1261,7 +1756,9 @@ function reachableRequests(node: FlowNode): string[] {
     .map(requestLine);
 }
 
-function pagedList(items: readonly string[]): HTMLElement {
+type ListEntry = string | HTMLElement;
+
+function pagedList(items: readonly ListEntry[]): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'list';
   let shown = 0;
@@ -1278,7 +1775,11 @@ function pagedList(items: readonly string[]): HTMLElement {
       if (item === undefined) continue;
       const row = document.createElement('div');
       row.className = 'list-item';
-      row.textContent = item;
+      if (typeof item === 'string') {
+        row.textContent = item;
+      } else {
+        row.append(item);
+      }
       wrap.append(row);
     }
     shown = end;
@@ -1299,7 +1800,7 @@ function pagedList(items: readonly string[]): HTMLElement {
 function addListRow(
   container: HTMLElement,
   label: string,
-  items: readonly string[],
+  items: readonly ListEntry[],
   emptyText: string | null,
 ): void {
   if (items.length === 0 && emptyText === null) return;
@@ -1365,12 +1866,29 @@ function renderDetail(node: FlowNode): void {
   }
 
   addRow(detail, 'Detalle', node.subtitle);
-  addRow(detail, 'Ubicación', locationText(node));
+  if (node.file !== null) {
+    const label = locationText(node);
+    addRow(
+      detail,
+      'Ubicación',
+      label === null ? null : codeLink(label, node.file, node.line, node.endLine),
+    );
+  }
   if (node.method !== null && node.path !== null) {
     addRow(detail, 'Camino', `${node.method} ${node.path}`);
   }
   addRow(detail, 'URL', node.url);
   addRow(detail, 'Petición', requestSummary(node));
+  const status = requestStatus(node);
+  if (status !== null) {
+    addRow(detail, 'Estado', status.label);
+    addRow(detail, 'Ciclo', status.phase);
+    if (node.backendObserved === true) {
+      addRow(detail, 'Backend', 'ejecución capturada con Node Inspector');
+    } else if (node.backendObserved === false) {
+      addRow(detail, 'Backend', 'sin evidencia de ejecución');
+    }
+  }
   addRow(detail, 'Iniciador', node.initiatorFunction ?? null);
   addRow(detail, 'SQL', querySummary(node));
   addRow(detail, 'Conexiones', connectionSummary(node));
@@ -1405,6 +1923,8 @@ function renderDetail(node: FlowNode): void {
 
   if (node.type === 'element') {
     addRow(detail, 'Interacciones', String(Math.max(node.occurrences, eventTotal(node))));
+  } else if (node.countLabel !== null && node.countLabel !== undefined && node.occurrences > 0) {
+    addRow(detail, node.countLabel, String(node.occurrences));
   } else if (node.occurrences > 1) {
     addRow(detail, 'Repeticiones', String(node.occurrences));
   }
@@ -1492,38 +2012,186 @@ function selectNode(id: string): void {
   const node = model?.nodesById.get(id);
   if (node === undefined) return;
   selectedId = id;
-  focusDirection = 'both';
-  focusScope = involvedScope(id, focusDirection);
-  focusOriginId = id;
-  eventFilter = null;
-  element<HTMLSelectElement>('map-event').value = '';
+  selectionHighlight = true;
   renderDetail(node);
-  applyDisplayScope(focusScope);
-  renderGraph();
-  fitToNodes([...focusScope]);
+  applyFiltersAndSelection();
   hideSearchResults();
   renderStatus();
   highlightInPage(node);
+  hideTip();
 }
 
 function clearSelection(): void {
   if (selectedId === null && focusScope === null) return;
   const hadFocus = focusScope !== null;
   selectedId = null;
-  focusScope = null;
-  focusOriginId = null;
-  focusDirection = 'both';
+  selectionHighlight = false;
+  highlightScope = null;
   const detail = element('map-detail');
   detail.hidden = true;
   detail.replaceChildren();
-  if (hadFocus && model !== null) {
-    applyDisplayScope(trafficScope());
-    renderGraph();
-    fitView();
-  } else {
-    applyFiltersAndSelection();
+  if (hadFocus) {
+    focusScope = null;
+    focusOriginId = null;
+    focusDirection = 'both';
+    applyScopeView();
+    return;
   }
+  applyFiltersAndSelection();
   renderStatus();
+}
+
+function hideTip(): void {
+  tipKey = null;
+  const tip = document.getElementById('map-tip');
+  if (tip === null) return;
+  tip.hidden = true;
+  tip.textContent = '';
+}
+
+function tooltipEnabled(): boolean {
+  return tooltipsPinned || shiftHeld;
+}
+
+function syncTipToggle(): void {
+  const button = document.getElementById('map-tip-toggle');
+  if (button === null) return;
+  button.classList.toggle('is-on', tooltipsPinned);
+  button.classList.toggle('is-held', shiftHeld);
+  button.setAttribute('aria-pressed', tooltipsPinned ? 'true' : 'false');
+}
+
+function setMapShiftHeld(held: boolean): void {
+  if (shiftHeld === held) return;
+  shiftHeld = held;
+  syncTipToggle();
+  showTipAtPointer();
+}
+
+function placeTip(clientX: number, clientY: number): void {
+  const tip = document.getElementById('map-tip');
+  if (tip === null || tip.hidden) return;
+  const canvas = element('map-canvas');
+  const rect = canvas.getBoundingClientRect();
+  const width = tip.offsetWidth;
+  const height = tip.offsetHeight;
+  let left = clientX - rect.left + 14;
+  let top = clientY - rect.top + 16;
+  if (left + width > canvas.clientWidth - 8) {
+    left = Math.max(8, clientX - rect.left - width - 14);
+  }
+  if (top + height > canvas.clientHeight - 8) {
+    top = Math.max(8, clientY - rect.top - height - 12);
+  }
+  tip.style.left = `${String(Math.round(left))}px`;
+  tip.style.top = `${String(Math.round(top))}px`;
+}
+
+function showTipAtPointer(): void {
+  const tip = document.getElementById('map-tip');
+  if (tip === null) return;
+  if (!tooltipEnabled() || hoverKey === null) {
+    hideTip();
+    return;
+  }
+  if (tipKey !== hoverKey) {
+    tip.textContent = hoverText;
+    tipKey = hoverKey;
+  }
+  tip.hidden = false;
+  placeTip(tipPointerX, tipPointerY);
+}
+
+function tooltipForTarget(target: EventTarget | null): { key: string; text: string } | null {
+  if (!(target instanceof Element)) return null;
+  const edgeElement = target.closest('[data-plan-id]');
+  if (edgeElement !== null) {
+    const id = edgeElement.getAttribute('data-plan-id');
+    const plan = id === null ? undefined : planById.get(id);
+    if (plan !== undefined && plan.tooltip !== '') {
+      return { key: `plan:${plan.id}`, text: plan.tooltip };
+    }
+  }
+  const nodeElement = target.closest('[data-node-id]');
+  if (nodeElement !== null) {
+    const id = nodeElement.getAttribute('data-node-id');
+    const node = id === null ? undefined : model?.nodesById.get(id);
+    if (node !== undefined) return { key: `node:${node.id}`, text: nodeTooltip(node) };
+  }
+  return null;
+}
+
+function trackHover(event: PointerEvent): void {
+  tipPointerX = event.clientX;
+  tipPointerY = event.clientY;
+  const target = tooltipForTarget(event.target);
+  if (target === null) {
+    hoverKey = null;
+    hoverText = '';
+    hideTip();
+    return;
+  }
+  if (hoverKey !== target.key) {
+    hoverKey = target.key;
+    hoverText = target.text;
+    tipKey = null;
+  }
+  showTipAtPointer();
+}
+
+function closeNodeMenu(): void {
+  menuNodeId = null;
+  const menu = document.getElementById('map-menu');
+  if (menu === null) return;
+  menu.hidden = true;
+  menu.replaceChildren();
+}
+
+function openNodeMenu(nodeId: string, clientX: number, clientY: number): void {
+  const node = model?.nodesById.get(nodeId);
+  if (node === undefined) return;
+  closeNodeMenu();
+  hideTip();
+  const menu = element('map-menu');
+  const addItem = (label: string, run: () => void): void => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    button.addEventListener('click', () => {
+      closeNodeMenu();
+      run();
+    });
+    menu.append(button);
+  };
+  addItem('Ver interacciones', () => {
+    focusFromNode(nodeId, 'both');
+  });
+  if (pageElementFor(node) !== null) {
+    addItem('Resaltar en la página', () => {
+      highlightInPage(node);
+    });
+  }
+  if (selectedId === nodeId || focusScope !== null) {
+    addItem(focusScope !== null ? 'Quitar enfoque' : 'Quitar selección', () => {
+      clearSelection();
+    });
+  }
+  const canvas = element('map-canvas');
+  const rect = canvas.getBoundingClientRect();
+  menu.style.left = '0px';
+  menu.style.top = '0px';
+  menu.hidden = false;
+  menuNodeId = nodeId;
+  let left = clientX - rect.left;
+  let top = clientY - rect.top;
+  if (left + menu.offsetWidth > canvas.clientWidth - 6) {
+    left = Math.max(6, left - menu.offsetWidth);
+  }
+  if (top + menu.offsetHeight > canvas.clientHeight - 6) {
+    top = Math.max(6, top - menu.offsetHeight);
+  }
+  menu.style.left = `${String(Math.round(left))}px`;
+  menu.style.top = `${String(Math.round(top))}px`;
 }
 
 function forwardReachable(id: string): Set<string> {
@@ -1597,7 +2265,10 @@ function focusFromNode(id: string, direction: FocusDirection = 'both'): void {
   focusScope = involvedScope(id, direction);
   focusOriginId = id;
   selectedId = id;
+  selectionHighlight = false;
   eventFilter = null;
+  eventOnly = false;
+  syncEventOnly();
   element<HTMLSelectElement>('map-event').value = '';
   renderDetail(node);
   applyDisplayScope(focusScope);
@@ -1625,18 +2296,19 @@ function computeSearchResults(): FlowNode[] {
     .sort(compareSearchNodes);
 }
 
-function searchResultButton(node: FlowNode): HTMLButtonElement {
-  const button = document.createElement('button');
-  button.type = 'button';
+function searchResultButton(node: FlowNode): HTMLDivElement {
+  const button = document.createElement('div');
   button.className = 'map-result';
+  button.setAttribute('role', 'button');
+  button.tabIndex = 0;
   button.classList.toggle('is-selected', selectedId === node.id);
   const tag = document.createElement('span');
   tag.className = 'tag';
-  const location =
-    node.file === null
-      ? ''
-      : ` · ${truncate(node.file, 34)}${node.line === null ? '' : `:${String(node.line)}`}`;
-  tag.textContent = `${nodeTypeLabel(node)}${location}`;
+  tag.append(document.createTextNode(nodeTypeLabel(node)));
+  if (node.file !== null) {
+    const location = ` · ${truncate(node.file, 34)}${node.line === null ? '' : `:${String(node.line)}`}`;
+    tag.append(codeLink(location, node.file, node.line, node.endLine));
+  }
   const name = document.createElement('span');
   name.className = 'name';
   name.textContent = truncate(node.title, 64);
@@ -1652,6 +2324,11 @@ function searchResultButton(node: FlowNode): HTMLButtonElement {
   meta.textContent = bits.join(' · ');
   button.append(tag, name, meta);
   button.addEventListener('click', () => {
+    focusFromNode(node.id, 'forward');
+  });
+  button.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
     focusFromNode(node.id, 'forward');
   });
   return button;
@@ -1758,6 +2435,7 @@ function renderTraces(): void {
 }
 
 function renderStats(): void {
+  syncBusy();
   const stats = element('map-stats');
   const snapshot = state.snapshot;
   if (snapshot === null) {
@@ -1782,7 +2460,6 @@ function renderStats(): void {
   if (data.preflightRequests > 0) {
     parts.push(`${String(data.preflightRequests)} preflight fuera del mapa`);
   }
-  if (state.building) parts.push('actualizando…');
   stats.textContent = parts.join(' · ');
 }
 
@@ -1798,8 +2475,13 @@ function renderEventFilter(): void {
       }
     }
   }
-  if (eventFilter !== null && !counts.has(eventFilter)) eventFilter = null;
+  if (eventFilter !== null && model !== null && !state.building && !counts.has(eventFilter)) {
+    eventFilter = null;
+  }
   const available = FLOW_INTERACTION_EVENTS.filter((event) => counts.has(event));
+  if (eventOnly && eventFilter === null && available.length > 0) {
+    eventFilter = available[0] ?? null;
+  }
   select.replaceChildren();
   const all = document.createElement('option');
   all.value = '';
@@ -1813,6 +2495,7 @@ function renderEventFilter(): void {
   }
   select.value = eventFilter ?? '';
   select.disabled = available.length === 0;
+  syncEventOnly();
 }
 
 function addStatusBox(text: string, className: string): void {
@@ -1876,6 +2559,12 @@ function renderStatus(): void {
       '',
     );
   }
+  if (eventOnly && model !== null && eventFilter === null) {
+    addStatusBox(
+      '«Solo esos» esperando un evento: todavía no hay eventos registrados en la página.',
+      'is-empty',
+    );
+  }
   if (focusScope !== null && focusOriginId !== null && model !== null) {
     const origin = model.nodesById.get(focusOriginId);
     const box = document.createElement('div');
@@ -1911,8 +2600,17 @@ function setOpenUi(open: boolean): void {
 }
 
 function resetViewOnOpen(): void {
+  hideTip();
+  closeNodeMenu();
+  tooltipsPinned = false;
+  shiftHeld = false;
+  syncTipToggle();
   selectedId = null;
+  selectionHighlight = false;
+  highlightScope = null;
   eventFilter = null;
+  eventOnly = false;
+  syncEventOnly();
   focusScope = null;
   focusOriginId = null;
   focusDirection = 'both';
@@ -2107,6 +2805,8 @@ function applyFlowMapState(next: FlowMapState): void {
   state = next;
   setOpenUi(state.open);
   if (!state.open) {
+    hideTip();
+    closeNodeMenu();
     renderStats();
     renderStatus();
     return;
@@ -2129,9 +2829,13 @@ function applyFlowMapState(next: FlowMapState): void {
       cancelAnimationFrame(viewportFrame);
       viewportFrame = 0;
     }
+    hideTip();
+    closeNodeMenu();
     svgById('map-svg').replaceChildren();
     if (selectedId !== null || focusScope !== null) {
       selectedId = null;
+      selectionHighlight = false;
+      highlightScope = null;
       focusScope = null;
       focusOriginId = null;
       focusDirection = 'both';
@@ -2156,12 +2860,18 @@ function applyFlowMapState(next: FlowMapState): void {
           focusDirection = 'both';
         }
       }
-      applyDisplayScope(focusScope ?? trafficScope());
       renderEventFilter();
+      const viewScope = scopeForView();
+      applyDisplayScope(viewScope);
       renderSearchResults();
       renderGraph();
-      if (focusScope !== null) {
-        fitToNodes([...focusScope]);
+      if (focusScope !== null || eventOnly) {
+        const fitScope = scopeForView();
+        if (fitScope === null) {
+          fitView();
+        } else {
+          fitToNodes([...fitScope]);
+        }
       }
       renderTraces();
       renderStack();
@@ -2225,6 +2935,15 @@ function initFlowMap(): void {
     const rect = svg.getBoundingClientRect();
     zoomAt(rect.width / 2, rect.height / 2, 1 / 1.2);
   });
+  const tipToggle = document.getElementById('map-tip-toggle');
+  if (tipToggle !== null) {
+    tipToggle.addEventListener('click', () => {
+      tooltipsPinned = !tooltipsPinned;
+      syncTipToggle();
+      showTipAtPointer();
+    });
+  }
+  syncTipToggle();
   element<HTMLButtonElement>('map-scope-all').addEventListener('click', () => {
     setTrafficMode('all');
   });
@@ -2262,14 +2981,53 @@ function initFlowMap(): void {
   });
   eventSelect.addEventListener('change', () => {
     eventFilter = asEvent(eventSelect.value);
+    if (eventFilter === null) {
+      if (!eventOnly) {
+        syncEventOnly();
+        applyFiltersAndSelection();
+        return;
+      }
+      eventOnly = false;
+      syncEventOnly();
+      scheduleScopeApply();
+      return;
+    }
+    if (eventOnly) {
+      scheduleScopeApply();
+      return;
+    }
     applyFiltersAndSelection();
   });
+  const eventOnlyBox = document.getElementById('map-event-only');
+  if (eventOnlyBox instanceof HTMLInputElement) {
+    eventOnlyBox.addEventListener('change', () => {
+      eventOnly = eventOnlyBox.checked;
+      if (eventOnly) {
+        focusScope = null;
+        focusOriginId = null;
+        focusDirection = 'both';
+        hideSearchResults();
+        if (eventFilter === null) {
+          const chosen = Array.from(eventSelect.options).find((option) => option.value !== '');
+          if (chosen !== undefined) {
+            eventFilter = asEvent(chosen.value);
+            eventSelect.value = chosen.value;
+          }
+        }
+      }
+      syncEventOnly();
+      scheduleScopeApply();
+      renderStatus();
+    });
+  }
 
   svg.addEventListener(
     'wheel',
     (event) => {
       if (!state.open) return;
       event.preventDefault();
+      closeNodeMenu();
+      hideTip();
       const rect = svg.getBoundingClientRect();
       const px = event.clientX - rect.left;
       const py = event.clientY - rect.top;
@@ -2277,10 +3035,34 @@ function initFlowMap(): void {
     },
     { passive: false },
   );
+  svg.addEventListener('pointermove', (event) => {
+    if (!state.open || pan !== null) return;
+    trackHover(event);
+  });
+  svg.addEventListener('pointerleave', () => {
+    hoverKey = null;
+    hoverText = '';
+    hideTip();
+  });
+  svg.addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+    closeNodeMenu();
+  });
+  window.addEventListener(
+    'pointerdown',
+    (event) => {
+      if (menuNodeId === null) return;
+      const target = event.target;
+      if (target instanceof Element && target.closest('#map-menu') !== null) return;
+      closeNodeMenu();
+    },
+    true,
+  );
 
   svg.addEventListener('pointerdown', (event) => {
     if (!state.open || event.button !== 0) return;
     hideSearchResults();
+    hideTip();
     const target = event.target;
     if (target instanceof Element && target.closest('.flow-node') !== null) return;
     pan = {
@@ -2319,13 +3101,30 @@ function initFlowMap(): void {
   svg.addEventListener('pointercancel', endPan);
 
   window.addEventListener('keydown', (event) => {
-    if (event.key !== 'Escape' || !state.open) return;
+    if (!state.open) return;
+    if (event.key === 'Shift') {
+      setMapShiftHeld(true);
+      return;
+    }
+    if (event.key !== 'Escape') return;
+    if (menuNodeId !== null) {
+      closeNodeMenu();
+      return;
+    }
     if (!results.hidden) {
       hideSearchResults();
       return;
     }
     ipcRenderer.send(BROWSER_PANEL_CHANNELS.map, false);
   });
+  window.addEventListener('keyup', (event) => {
+    if (event.key !== 'Shift') return;
+    setMapShiftHeld(false);
+  });
+  window.addEventListener('blur', () => {
+    setMapShiftHeld(false);
+    closeNodeMenu();
+  });
 }
 
-export { applyFlowMapState, initFlowMap, setFlowCardRequests };
+export { applyFlowMapState, initFlowMap, setFlowCardRequests, setMapShiftHeld };
