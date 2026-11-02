@@ -171,9 +171,9 @@ body.map-open main { display: none; }
 #map-results .map-result .name { display: block; margin-top: 1px; color: #e6edf3; font-size: 11px; word-break: break-word; }
 #map-results .map-result .meta { display: block; margin-top: 1px; color: #7d8b99; font-size: 10px; word-break: break-word; }
 .map-paged-foot { padding: 4px 7px; color: #7d8b99; font-size: 9px; letter-spacing: 0.02em; background: #10161e; }
-#map-scope { display: flex; gap: 2px; flex: none; }
-#map-scope button { background: #131b24; }
-#map-scope button.is-on { background: #223044; color: #e6edf3; }
+#map-scope, #map-order { display: flex; gap: 2px; flex: none; }
+#map-scope button, #map-order button { background: #131b24; }
+#map-scope button.is-on, #map-order button.is-on { background: #223044; color: #e6edf3; }
 #map-bar button { height: 24px; min-width: 24px; padding: 0 7px; background: #172029; color: #aab8c5; border: 0; font: 10px/1 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.02em; cursor: pointer; }
 #map-bar button:hover { background: #1d2833; color: #e6edf3; }
 #map-bar button.is-on { background: #223044; color: #e6edf3; }
@@ -182,9 +182,9 @@ body.map-open main { display: none; }
 #map-bar select { height: 24px; max-width: 168px; background: #172029; color: #aab8c5; border: 0; padding: 0 4px; font: 10px system-ui, "Segoe UI", sans-serif; letter-spacing: 0.02em; cursor: pointer; outline: none; }
 #map-bar select:hover { background: #1d2833; color: #e6edf3; }
 #map-bar select:disabled { color: #56616d; cursor: default; }
-#map-event-only-label { display: flex; align-items: center; gap: 4px; height: 24px; padding: 0 6px; background: #172029; color: #aab8c5; font: 10px/1 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.02em; cursor: pointer; }
-#map-event-only-label:hover { background: #1d2833; color: #e6edf3; }
-#map-event-only { width: 12px; height: 12px; margin: 0; accent-color: #58a6ff; cursor: pointer; }
+#map-event-only-label, #map-compact-label { display: flex; align-items: center; gap: 4px; height: 24px; padding: 0 6px; background: #172029; color: #aab8c5; font: 10px/1 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.02em; cursor: pointer; }
+#map-event-only-label:hover, #map-compact-label:hover { background: #1d2833; color: #e6edf3; }
+#map-event-only, #map-compact { width: 12px; height: 12px; margin: 0; accent-color: #58a6ff; cursor: pointer; }
 #map-event-only:disabled { cursor: default; }
 #map-body { display: flex; flex: 1; min-height: 0; gap: 2px; }
 #map-stack { display: flex; align-items: stretch; gap: 4px; padding: 5px 8px; background: #0d141b; flex: none; overflow-x: auto; }
@@ -212,13 +212,20 @@ body.map-open main { display: none; }
 .map-trace .name { display: block; margin-top: 2px; font-size: 11px; color: #e6edf3; word-break: break-word; }
 .map-trace .meta { display: block; margin-top: 1px; font-size: 10px; color: #7d8b99; }
 #map-canvas { position: relative; flex: 1; min-width: 0; overflow: hidden; background: #0b1017; }
+#map-axis { position: absolute; top: 0; left: 0; right: 0; height: 22px; overflow: hidden; background: #0b1017; pointer-events: none; z-index: 3; }
+#map-axis .axis-label { position: absolute; top: 6px; left: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; color: #7d8b99; font: 600 9px system-ui, "Segoe UI", sans-serif; letter-spacing: 0.1em; white-space: nowrap; }
+#map-axis .axis-grip { position: absolute; top: 0; bottom: 0; left: 0; width: 9px; background: transparent; pointer-events: auto; cursor: col-resize; touch-action: none; }
+#map-axis .axis-grip::after { content: ""; position: absolute; top: 4px; bottom: 4px; left: 4px; width: 1px; background: #2b3a4a; }
+#map-axis .axis-grip:hover, #map-axis .axis-grip.is-active { background: #1d2833; }
+#map-axis .axis-grip:hover::after, #map-axis .axis-grip.is-active::after { background: #58a6ff; }
+body.is-column-resizing, body.is-column-resizing * { cursor: col-resize !important; user-select: none !important; }
 #map-svg { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
 #map-svg.is-panning { cursor: grabbing; }
 #map-tip { position: absolute; z-index: 11; max-width: 380px; max-height: 300px; overflow: hidden; padding: 6px 8px; background: #0a1016; color: #d4d4d4; font: 11px/1.45 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-word; pointer-events: none; }
 #map-menu { position: absolute; z-index: 12; min-width: 170px; padding: 3px; background: #141c25; }
 #map-menu button { display: block; width: 100%; height: 25px; padding: 0 8px; background: transparent; color: #c9d1d9; border: 0; font: 11px/1 system-ui, "Segoe UI", sans-serif; text-align: left; cursor: pointer; }
 #map-menu button:hover { background: #1d2833; color: #e6edf3; }
-#map-status { position: absolute; left: 12px; top: 10px; right: 12px; font-size: 11px; pointer-events: none; }
+#map-status { position: absolute; left: 12px; top: 30px; right: 12px; font-size: 11px; pointer-events: none; }
 #map-status .box { display: inline-block; margin: 0 6px 4px 0; padding: 4px 7px; background: #16202b; color: #aab8c5; pointer-events: auto; }
 #map-status .box.is-error { background: #2a1a18; color: #ffb4a8; }
 #map-status .box.is-empty { background: #131a22; color: #8b98a5; }
@@ -292,7 +299,6 @@ body.map-open main { display: none; }
 .flow-dir.is-send { fill: #58a6ff; }
 .flow-dir.is-receive { fill: #3fb950; }
 .flow-dir.is-dimmed { opacity: 0.12; }
-.flow-layer-label { fill: #56616d; font: 600 9px system-ui, "Segoe UI", sans-serif; letter-spacing: 0.1em; }
 .flow-node .time { fill: #7d8b99; font: 9px "Cascadia Mono", Consolas, monospace; text-anchor: end; }
 .flow-edge.is-bundle { stroke-width: 1.8; }
 `;
@@ -303,6 +309,12 @@ const MAP_MARKUP = `<div id="map" hidden>
             <input id="map-search" type="search" placeholder="Buscar nodo, ruta, estado o SQL…" aria-label="Buscar en el mapa" spellcheck="false" />
             <div id="map-results" aria-label="Resultados del mapa" hidden></div>
           </div>
+          <div id="map-order" role="group" aria-label="Orden del mapa">
+            <button type="button" id="map-order-chrono" class="is-on" aria-pressed="true" title="Columnas por tipo en orden temporal">Cronológico</button>
+            <button type="button" id="map-order-structural" aria-pressed="false" title="Columnas por tipo con filas ordenadas por archivo, línea y posición en el DOM">Estructural</button>
+            <button type="button" id="map-order-hierarchy" aria-pressed="false" title="Árbol jerárquico por archivo: HTML, CSS/JS, controles, peticiones, backend y SQL">Jerárquico</button>
+          </div>
+          <label id="map-compact-label" title="Muestra solo el título y el contador de cada cuadro para que quepan más nodos en pantalla."><input type="checkbox" id="map-compact" />Vista compacta</label>
           <div id="map-scope" role="group" aria-label="Alcance del tráfico">
             <button type="button" id="map-scope-all" class="is-on" aria-pressed="true">Todo el tráfico</button>
             <button type="button" id="map-scope-interacted" aria-pressed="false">Solo lo que interactuaste</button>
@@ -324,6 +336,7 @@ const MAP_MARKUP = `<div id="map" hidden>
             <div id="map-trace-list"></div>
           </aside>
           <div id="map-canvas">
+            <div id="map-axis" aria-hidden="true"></div>
             <svg id="map-svg" xmlns="http://www.w3.org/2000/svg"></svg>
             <div id="map-tip" role="tooltip" hidden></div>
             <div id="map-menu" role="menu" aria-label="Acciones del nodo" hidden></div>

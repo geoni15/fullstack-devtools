@@ -5,11 +5,12 @@ import {
   BdtError,
   ERROR_CODES,
   type FileContent,
+  type FileNode,
   type WorkspaceInfo,
   type WorkspaceSnapshot,
 } from '@bdt/protocol';
 import { isIgnoredName } from './config';
-import { buildFileTree } from './fs/file-tree';
+import { buildFileTree, type BuiltTree } from './fs/file-tree';
 import { readTextFile } from './fs/read-file';
 import { createRootScope, type RootScope } from './fs/root-guard';
 import { createLogger, type Logger } from './logger';
@@ -28,6 +29,8 @@ function workspaceIdFor(rootReal: string): string {
 
 export class WorkspaceService {
   private current: OpenWorkspace | null = null;
+  private builtTree: BuiltTree | null = null;
+  private filePaths: string[] | null = null;
 
   constructor(
     private readonly onChange: () => void,
@@ -61,6 +64,9 @@ export class WorkspaceService {
     };
 
     watcher.on('all', () => {
+      if (this.current !== openWorkspace) return;
+      this.builtTree = null;
+      this.filePaths = null;
       if (openWorkspace.debounceTimer !== null) {
         clearTimeout(openWorkspace.debounceTimer);
       }
@@ -91,6 +97,23 @@ export class WorkspaceService {
     return this.current?.scope.rootReal ?? null;
   }
 
+  getFilePaths(): readonly string[] {
+    const current = this.current;
+    if (current === null) return [];
+    if (this.filePaths !== null) return this.filePaths;
+    const paths: string[] = [];
+    const walk = (node: FileNode): void => {
+      if (node.kind === 'file') {
+        paths.push(node.path);
+        return;
+      }
+      for (const child of node.children ?? []) walk(child);
+    };
+    walk(this.built(current).tree);
+    this.filePaths = paths;
+    return paths;
+  }
+
   readFile(relativePath: string): FileContent {
     if (!this.current) {
       throw new BdtError(ERROR_CODES.WORKSPACE_NONE, 'No hay ninguna carpeta de proyecto abierta.');
@@ -103,8 +126,15 @@ export class WorkspaceService {
     this.current = null;
   }
 
+  private built(openWorkspace: OpenWorkspace): BuiltTree {
+    if (this.builtTree === null) {
+      this.builtTree = buildFileTree(openWorkspace.scope.rootReal, openWorkspace.info.name);
+    }
+    return this.builtTree;
+  }
+
   private snapshot(openWorkspace: OpenWorkspace): WorkspaceSnapshot {
-    const { tree, stats } = buildFileTree(openWorkspace.scope.rootReal, openWorkspace.info.name);
+    const { tree, stats } = this.built(openWorkspace);
     return {
       workspace: openWorkspace.info,
       tree,
@@ -126,5 +156,7 @@ export class WorkspaceService {
       });
     });
     this.current = null;
+    this.builtTree = null;
+    this.filePaths = null;
   }
 }

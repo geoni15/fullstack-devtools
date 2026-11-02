@@ -17,6 +17,7 @@ import {
   type FileContent,
   type IpcResult,
   type ProjectSetupDetection,
+  type SecurityScanReport,
   type WorkspaceSnapshot,
 } from '@bdt/protocol';
 import type { BrowserController } from './browser/controller';
@@ -283,6 +284,23 @@ export function registerIpcHandlers(dependencies: IpcDependencies): void {
       return reportFailure(error, logger, IPC_CHANNELS.browserSnapshot);
     }
   });
+
+  ipcMain.handle(
+    IPC_CHANNELS.browserSecurityScan,
+    async (event, payload): Promise<IpcResult<SecurityScanReport>> => {
+      if (!isTrustedSender(event, getMainWindow())) {
+        return unauthorized();
+      }
+      if (!NO_PAYLOAD_SCHEMA.safeParse(payload).success) {
+        return invalidPayload();
+      }
+      try {
+        return { ok: true, value: await browser.scanSecurity() };
+      } catch (error) {
+        return reportFailure(error, logger, IPC_CHANNELS.browserSecurityScan);
+      }
+    },
+  );
 
   ipcMain.handle(IPC_CHANNELS.browserClearRequests, (event, payload): IpcResult<BrowserState> => {
     if (!isTrustedSender(event, getMainWindow())) {

@@ -7,16 +7,18 @@ import {
   useReducer,
   type ReactNode,
 } from 'react';
-import type {
-  ActivityEvent,
-  BackendLaunchRequest,
-  BrowserEvent,
-  BrowserMode,
-  BrowserSnapshot,
-  BrowserState,
-  CapturedRequest,
-  ConsoleEntry,
-  LaunchRequest,
+import {
+  emptySecurityReport,
+  type ActivityEvent,
+  type BackendLaunchRequest,
+  type BrowserEvent,
+  type BrowserMode,
+  type BrowserSnapshot,
+  type BrowserState,
+  type CapturedRequest,
+  type ConsoleEntry,
+  type LaunchRequest,
+  type SecurityScanReport,
 } from '@bdt/protocol';
 import { bdt } from '../api';
 
@@ -25,6 +27,7 @@ export interface BrowserUiState {
   requests: CapturedRequest[];
   activities: ActivityEvent[];
   consoleEntries: ConsoleEntry[];
+  security: SecurityScanReport;
   busy: boolean;
   error: string | null;
 }
@@ -38,6 +41,7 @@ type Action =
   | { type: 'activity-cleared' }
   | { type: 'console'; entries: ConsoleEntry[] }
   | { type: 'console-cleared' }
+  | { type: 'security'; report: SecurityScanReport }
   | { type: 'busy' }
   | { type: 'idle' }
   | { type: 'error'; message: string }
@@ -48,6 +52,7 @@ const INITIAL_STATE: BrowserUiState = {
   requests: [],
   activities: [],
   consoleEntries: [],
+  security: emptySecurityReport(),
   busy: false,
   error: null,
 };
@@ -98,6 +103,7 @@ function reducer(state: BrowserUiState, action: Action): BrowserUiState {
         requests: action.snapshot.requests,
         activities: action.snapshot.activity,
         consoleEntries: action.snapshot.consoleEntries,
+        security: action.snapshot.security,
         busy: false,
         error: null,
       };
@@ -120,6 +126,8 @@ function reducer(state: BrowserUiState, action: Action): BrowserUiState {
       return { ...state, consoleEntries: mergeConsole(state.consoleEntries, action.entries) };
     case 'console-cleared':
       return { ...state, consoleEntries: [] };
+    case 'security':
+      return { ...state, security: action.report };
     case 'busy':
       return { ...state, busy: true, error: null };
     case 'idle':
@@ -160,6 +168,9 @@ function applyEvent(dispatch: (action: Action) => void, event: BrowserEvent): vo
     case 'console-cleared':
       dispatch({ type: 'console-cleared' });
       break;
+    case 'security':
+      dispatch({ type: 'security', report: event.report });
+      break;
     default:
       break;
   }
@@ -178,6 +189,7 @@ export interface BrowserContextValue {
   disconnect(): Promise<void>;
   reload(): Promise<void>;
   clearRequests(): Promise<void>;
+  scanSecurity(): Promise<void>;
   setInspection(enabled: boolean): Promise<void>;
   focusBrowserWindow(): Promise<void>;
   dismissError(): void;
@@ -252,7 +264,13 @@ export function BrowserProvider({ children }: { children: ReactNode }): ReactNod
       }
       dispatch({
         type: 'snapshot',
-        snapshot: { state: result.value, requests: [], activity: [], consoleEntries: [] },
+        snapshot: {
+          state: result.value,
+          requests: [],
+          activity: [],
+          consoleEntries: [],
+          security: emptySecurityReport(),
+        },
       });
     } catch (error) {
       dispatch({ type: 'error', message: errorMessage(error) });
@@ -297,6 +315,25 @@ export function BrowserProvider({ children }: { children: ReactNode }): ReactNod
     }
   }, []);
 
+  const scanSecurity = useCallback(async (): Promise<void> => {
+    dispatch({ type: 'security', report: { ...emptySecurityReport(), status: 'scanning' } });
+    try {
+      const result = await bdt.scanBrowserSecurity();
+      if (!result.ok) {
+        dispatch({ type: 'error', message: result.error.message });
+        dispatch({
+          type: 'security',
+          report: { ...emptySecurityReport(), status: 'error', error: result.error.message },
+        });
+        return;
+      }
+      dispatch({ type: 'security', report: result.value });
+    } catch (error) {
+      dispatch({ type: 'error', message: errorMessage(error) });
+      dispatch({ type: 'security', report: emptySecurityReport() });
+    }
+  }, []);
+
   const focusBrowserWindow = useCallback(async (): Promise<void> => {
     try {
       const result = await bdt.focusBrowserWindow();
@@ -319,6 +356,7 @@ export function BrowserProvider({ children }: { children: ReactNode }): ReactNod
       disconnect,
       reload,
       clearRequests,
+      scanSecurity,
       setInspection,
       focusBrowserWindow,
       dismissError,
@@ -329,6 +367,7 @@ export function BrowserProvider({ children }: { children: ReactNode }): ReactNod
       disconnect,
       reload,
       clearRequests,
+      scanSecurity,
       setInspection,
       focusBrowserWindow,
       dismissError,

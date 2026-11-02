@@ -2,6 +2,8 @@ import { ipcRenderer } from 'electron';
 import {
   BROWSER_PANEL_CHANNELS,
   INSPECTION_MODES,
+  handlerLabel,
+  handlerProfileTags,
   normalizeSearchText,
   requestStatusView,
   type CapturedBody,
@@ -491,7 +493,7 @@ function requestSteps(card: InspectionCard, request: InspectionRequest): Sequenc
   if (backendMatches && clickSession && card.execution !== null) {
     const at = card.execution.observedAt;
     if (at >= start - 50 && (end === null || at <= end + 500)) {
-      const name = card.execution.functionName ?? 'función anónima';
+      const name = card.execution.functionName ?? 'función en ejecución';
       steps.push({
         at,
         tag: 'BACKEND',
@@ -608,7 +610,7 @@ function renderExecution(
 
   container.hidden = false;
   empty.hidden = true;
-  const functionName = execution.functionName ?? 'función anónima';
+  const functionName = execution.functionName ?? 'función en ejecución';
   const location = element('execution-loc');
   location.replaceChildren(
     document.createTextNode(`${functionName} · `),
@@ -699,9 +701,11 @@ function renderHandler(card: InspectionCard): void {
         : card.handler.source === 'vue'
           ? 'Vue'
           : 'listener';
-    handler.textContent = `${card.handler.event} → ${
-      card.handler.name ?? 'función anónima'
-    } · ${source}`;
+    const tags = handlerProfileTags(card.handler.profile);
+    handler.textContent = `${card.handler.event} → ${handlerLabel(
+      card.handler.name,
+      card.handler.profile,
+    )}${tags.length === 0 ? '' : ` · ${tags.join(' · ')}`} · ${source}`;
   }
 
   const location = element('handler-loc');

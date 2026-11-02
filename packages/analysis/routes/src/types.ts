@@ -15,6 +15,7 @@ export interface StaticRoute {
   method: string;
   path: string;
   handlerName: string | null;
+  handlerSignature?: string | null;
   file: string;
   line: number;
   endLine: number;

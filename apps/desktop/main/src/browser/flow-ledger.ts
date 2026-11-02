@@ -1,4 +1,5 @@
 import type {
+  HandlerProfile,
   HandlerSource,
   InspectionBackend,
   InspectionBreakpoint,
@@ -25,6 +26,7 @@ export interface FlowTraceHandler {
   column: number | null;
   source: HandlerSource;
   note: string | null;
+  profile: HandlerProfile | null;
 }
 
 export interface FlowTraceRequest {
@@ -109,6 +111,7 @@ function projectHandler(handler: InspectionHandler | null): FlowTraceHandler | n
     column: handler.column,
     source: handler.source,
     note: handler.note,
+    profile: handler.profile,
   };
 }
 

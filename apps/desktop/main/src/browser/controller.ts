@@ -7,6 +7,8 @@ import {
   ERROR_CODES,
   IPC_CHANNELS,
   INSPECTION_MODES,
+  handlerLabel,
+  handlerProfileTags,
   requestStatusView,
   type ActivityCategory,
   type ActivityEvent,
@@ -35,6 +37,7 @@ import {
   type InspectionRequestPhase,
   type InspectionRuntime,
   type InspectionSqlQuery,
+  type SecurityScanReport,
 } from '@bdt/protocol';
 import {
   RequestBuffer,
@@ -47,6 +50,7 @@ import {
 import type { StaticRoute } from '@bdt/routes-index';
 import { analyzeSql } from '@bdt/sql-analyzer';
 import { createRootScope, type RootScope } from '../fs/root-guard';
+import { normalizeCodeLocation } from '../code-location';
 import type { Logger } from '../logger';
 import { AppLauncher, findFreeLoopbackPort, isUrlReachable } from '../process/app-launcher';
 import { parseAppLaunch, type LaunchProgram } from '../process/launch-command';
@@ -77,6 +81,7 @@ import {
   type PageElementRef,
 } from './page-inventory';
 import { BackendRouteIndex, type DatabaseHint } from './routes';
+import { SecurityScanner } from './security-scan';
 import { readCodeBlock } from './source-snippet';
 import type { CapturedSqlExecution, SqlCaptureInfo } from './sql-capture';
 import type {
@@ -215,6 +220,7 @@ interface BackendSource {
 
 export interface BrowserControllerOptions {
   getWorkspaceRoot(): string | null;
+  getWorkspaceFiles(): readonly string[];
   chromePreloadPath: string;
   panelPreloadPath: string;
   mapPreloadPath: string;
@@ -222,6 +228,7 @@ export interface BrowserControllerOptions {
 
 const PARTITION = 'bdt-inspector';
 const FLUSH_INTERVAL_MS = 150;
+const SECURITY_SCAN_DELAY_MS = 900;
 const CDP_COMMAND_TIMEOUT_MS = 5000;
 const CHROME_HEIGHT = 64;
 const PANEL_WIDTH = 430;
@@ -267,7 +274,12 @@ function inventorySignature(controls: readonly PageControl[]): string {
       control.formAction ?? '',
       control.formMethod ?? '',
       control.formKey ?? '',
-      control.handlers.map((hint) => `${hint.event}:${hint.source}:${hint.name ?? ''}`).join(','),
+      control.handlers
+        .map(
+          (hint) =>
+            `${hint.event}:${hint.source}:${hint.name ?? ''}:${hint.profile?.signature ?? ''}`,
+        )
+        .join(','),
     ].join('\u0000');
     for (let index = 0; index < text.length; index += 1) {
       hash ^= text.charCodeAt(index);
@@ -791,6 +803,10 @@ export class BrowserController {
   private frontendFrameworkUrl: string | null = null;
   private frontendDetection: Promise<string | null> | null = null;
   private frontendDetectionUrl: string | null = null;
+  private readonly security: SecurityScanner;
+  private securityTimer: ReturnType<typeof setTimeout> | null = null;
+  private securityGeneration = 0;
+  private readonly firstPartyUrls = new Map<string, boolean>();
 
   constructor(
     private readonly getWindow: () => BrowserWindow | null,
@@ -803,6 +819,7 @@ export class BrowserController {
       this.handleMapWindowClosed();
     });
     this.routes = new BackendRouteIndex(() => this.options.getWorkspaceRoot(), log);
+    this.security = new SecurityScanner(log, (url) => this.isWorkspaceUrl(url));
   }
 
   getState(): BrowserState {
@@ -817,7 +834,39 @@ export class BrowserController {
       requests: this.buffer?.all() ?? [],
       activity: [...this.activity],
       consoleEntries: [...this.consoleEntries],
+      security: this.security.current(),
     };
+  }
+
+  async scanSecurity(): Promise<SecurityScanReport> {
+    const view = this.view;
+    if (
+      view === null ||
+      view.webContents.isDestroyed() ||
+      !view.webContents.debugger.isAttached()
+    ) {
+      return this.security.current();
+    }
+    this.cancelSecurityScan();
+    const generation = ++this.securityGeneration;
+    const target = view.webContents.debugger;
+    this.send({
+      type: 'security',
+      report: { ...this.security.current(), status: 'scanning', error: null },
+    });
+    const report = await this.security.scan({
+      target,
+      config: this.state.config,
+      pageUrl: maskUrl(view.webContents.getURL()),
+      requests: this.buffer?.all() ?? [],
+    });
+    if (this.view !== view) {
+      this.security.markStale();
+      return this.security.current();
+    }
+    if (generation !== this.securityGeneration) return this.security.current();
+    this.send({ type: 'security', report });
+    return report;
   }
 
   async configure(request: BrowserTargetsRequest): Promise<BrowserSnapshot> {
@@ -854,7 +903,7 @@ export class BrowserController {
             detail: `No se lanzó el proceso detectado (${config.backend.url}).`,
           });
         } else {
-          await this.launchBackend(config, backendProgram);
+          config.backendLaunch = await this.launchBackend(config, backendProgram);
         }
       }
       if (frontendProgram !== null) {
@@ -865,7 +914,7 @@ export class BrowserController {
             detail: `No se lanzó el proceso detectado (${config.frontend.url}).`,
           });
         } else {
-          await this.launchFrontend(config, frontendProgram);
+          config.frontendLaunch = await this.launchFrontend(config, frontendProgram);
           if (sharedProgram && config.frontendLaunch !== null && config.backendLaunch !== null) {
             config.backendLaunch = { ...config.backendLaunch, pid: config.frontendLaunch.pid };
           }
@@ -1350,6 +1399,7 @@ export class BrowserController {
         revision: ++this.flowRevision,
         frontend: this.frontendFramework,
         workspaceOpen: this.options.getWorkspaceRoot() !== null,
+        workspaceFiles: this.options.getWorkspaceFiles(),
         inventory: this.inventory,
         interactions: this.flowInteractions.summariesAll(),
         references: this.flowInteractions.referencesAll(),
@@ -1547,6 +1597,30 @@ export class BrowserController {
     this.resetAutoResolve();
     this.markFlowDirty();
     if (this.mapOpen) this.scheduleInventoryRefresh(0);
+  }
+
+  private scheduleSecurityScan(delay = SECURITY_SCAN_DELAY_MS): void {
+    this.cancelSecurityScan();
+    this.securityTimer = setTimeout(() => {
+      this.securityTimer = null;
+      void this.scanSecurity();
+    }, delay);
+  }
+
+  private cancelSecurityScan(): void {
+    if (this.securityTimer === null) return;
+    clearTimeout(this.securityTimer);
+    this.securityTimer = null;
+  }
+
+  private isWorkspaceUrl(url: string): boolean {
+    const cached = this.firstPartyUrls.get(url);
+    if (cached !== undefined) return cached;
+    const root = this.options.getWorkspaceRoot();
+    const resolved = root === null ? null : normalizeCodeLocation(root, { path: url, line: 1 });
+    const firstParty = resolved !== null;
+    this.firstPartyUrls.set(url, firstParty);
+    return firstParty;
   }
 
   private async ensureFrontendFramework(): Promise<string | null> {
@@ -1884,6 +1958,10 @@ export class BrowserController {
     });
     contents.on('did-start-loading', () => {
       if (!isCurrent()) return;
+      this.cancelSecurityScan();
+      this.securityGeneration += 1;
+      this.security.markStale();
+      this.send({ type: 'security', report: this.security.current() });
       this.state = { ...this.state, loading: true };
       this.emitState();
     });
@@ -1901,6 +1979,7 @@ export class BrowserController {
       if (!isCurrent()) return;
       this.handlePageChanged();
       void this.ensureFrontendFramework();
+      this.scheduleSecurityScan();
     });
     contents.on('did-navigate', (_event, url) => {
       if (!isCurrent()) return;
@@ -2005,6 +2084,7 @@ export class BrowserController {
 
     target.on('message', (_event, method, params) => {
       if (this.view !== view) return;
+      this.security.handleMessage(method, params);
       this.inspector?.handleMessage(method, params);
       this.handleCdpMessage(method, params);
     });
@@ -2235,6 +2315,7 @@ export class BrowserController {
               line: handler.line,
               column: handler.column,
               source: handler.source,
+              profile: handler.profile,
               note: handler.note,
               at: Date.now(),
             });
@@ -2880,11 +2961,13 @@ export class BrowserController {
       }
     }
     if (handler !== null) {
+      const handlerName = handlerLabel(handler.name, handler.profile);
+      const handlerTags = handlerProfileTags(handler.profile);
       rows.push({
         label: 'Handler',
-        value: `${handler.event} → ${handler.name ?? 'función anónima'} · ${
-          HANDLER_SOURCE_LABEL[handler.source]
-        }`,
+        value: `${handler.event} → ${handlerName}${
+          handlerTags.length === 0 ? '' : ` · ${handlerTags.join(' · ')}`
+        } · ${HANDLER_SOURCE_LABEL[handler.source]}`,
         tone: 'ok',
       });
       const location =
@@ -2906,7 +2989,7 @@ export class BrowserController {
         element.text !== null && element.text !== ''
           ? `"${element.text}"`
           : handler !== null
-            ? `${handler.event} → ${handler.name ?? 'función anónima'}`
+            ? `${handler.event} → ${handlerLabel(handler.name, handler.profile)}`
             : staticCandidate !== undefined
               ? `${staticCandidate.method} ${staticCandidate.path}`
               : selector,
@@ -3657,7 +3740,12 @@ export class BrowserController {
     if (handler !== null && handler.code !== null) {
       const code = handler.code.lines.map((line) => line.text).join('\n');
       for (const found of extractRequestsFromCode(code)) {
-        add(found.method, found.url, found.source, handler.name ?? 'función anónima');
+        add(
+          found.method,
+          found.url,
+          found.source,
+          handlerLabel(handler.name, handler.profile, 'función sin nombre'),
+        );
       }
     }
     return candidates;
@@ -4244,7 +4332,10 @@ export class BrowserController {
       .join(', ');
     this.recordActivity({
       category: 'backend',
-      title: `Ejecución de ${execution.functionName ?? 'una función anónima'}`,
+      title:
+        execution.functionName === null
+          ? 'Ejecución en el backend'
+          : `Ejecución de ${execution.functionName}`,
       detail: [execution.file + ':' + String(execution.line), routes]
         .filter((part) => part !== '')
         .join(' · '),
@@ -4723,6 +4814,11 @@ export class BrowserController {
   }
 
   private teardownConnection(): void {
+    this.cancelSecurityScan();
+    this.securityGeneration += 1;
+    this.firstPartyUrls.clear();
+    const securityReport = this.security.reset();
+    this.send({ type: 'security', report: securityReport });
     this.resetFlow();
     this.mapWindow.close();
     this.dismissCard();

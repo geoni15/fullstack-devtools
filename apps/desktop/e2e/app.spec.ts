@@ -322,15 +322,19 @@ test('el renderer no expone Node, require ni canales IPC en bruto', async () => 
   expect(exposed.apiKeys).toEqual([
     'clearBrowserRequests',
     'configureBrowser',
+    'detectProjectSetup',
     'disconnectBrowser',
     'focusBrowserWindow',
     'getBrowserSnapshot',
     'getState',
     'onBrowserEvent',
+    'onRevealLocation',
     'onWorkspaceChanged',
     'openWorkspace',
     'readFile',
     'reloadBrowser',
+    'revealCode',
+    'scanBrowserSecurity',
     'setBrowserBounds',
     'setBrowserInspection',
   ]);
@@ -775,7 +779,10 @@ test('Registro: log cronológico con filtros y peticiones en pestaña propia', a
   await expect(page.locator('.request-row').first()).toBeVisible();
   const rowTime = await page.locator('.request-time').first().innerText();
   expect(rowTime).toMatch(/^\d{2}:\d{2}:\d{2}$/);
-  await page.locator('.request-row').first().click();
+  const firstRow = page.locator('.request-row').first();
+  if ((await firstRow.getAttribute('aria-expanded')) !== 'true') {
+    await firstRow.click();
+  }
   const timelineDetail = page.locator('.request-detail').first();
   await expect(timelineDetail).toContainText('Secuencia');
   await expect(timelineDetail).toContainText('HTTP');
@@ -826,6 +833,40 @@ test('Registro: log cronológico con filtros y peticiones en pestaña propia', a
 
   await page.getByTestId('activity-filter-all').click();
   await expect(page.getByTestId('activity-filter-all')).toHaveAttribute('aria-selected', 'true');
+});
+
+test('Mapa: alterna orden cronológico, estructural y jerárquico por archivo', async () => {
+  await panelEval('document.getElementById("map-toggle")?.click()');
+  const mapPage = await waitForWindowPage('#map-order-structural');
+
+  await expect(mapPage.locator('#map-order-structural')).toBeVisible();
+  await expect
+    .poll(
+      async () => {
+        const stats = await mapPage.locator('#map-stats').innerText();
+        const match = /(\d+) archivos/.exec(stats);
+        return match === null ? 0 : Number(match[1]);
+      },
+      { timeout: 20_000 },
+    )
+    .toBeGreaterThan(0);
+
+  await mapPage.locator('#map-order-structural').click();
+  await expect(mapPage.locator('#map-order-structural')).toHaveAttribute('aria-pressed', 'true');
+  await expect(mapPage.locator('#map-status')).toContainText('Orden estructural');
+  await expect(mapPage.locator('.flow-layer-label').first()).toContainText('ARCHIVO');
+
+  await mapPage.locator('#map-order-hierarchy').click();
+  await expect(mapPage.locator('#map-order-hierarchy')).toHaveAttribute('aria-pressed', 'true');
+  await expect(mapPage.locator('#map-status')).toContainText('Orden jerárquico');
+  await expect(mapPage.locator('.flow-layer-label').first()).toContainText('NIVEL 0');
+
+  await mapPage.locator('#map-order-chrono').click();
+  await expect(mapPage.locator('#map-order-chrono')).toHaveAttribute('aria-pressed', 'true');
+  await expect(mapPage.locator('#map-status')).not.toContainText('Orden estructural');
+
+  await mapPage.locator('#map-page').click();
+  await expect.poll(() => browserWindowCount()).toBe(2);
 });
 
 test('F2: la inspección OFF oculta el panel, la página recupera el ancho y desconectar cierra las vistas', async () => {

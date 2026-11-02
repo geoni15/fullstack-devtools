@@ -12,6 +12,7 @@ import {
   type FileContent,
   type IpcResult,
   type ProjectSetupDetection,
+  type SecurityScanReport,
   type WorkspaceSnapshot,
 } from '@bdt/protocol';
 
@@ -75,6 +76,8 @@ const api: BdtApi = {
     ipcRenderer.invoke(IPC_CHANNELS.browserSnapshot) as Promise<IpcResult<BrowserSnapshot>>,
   clearBrowserRequests: () =>
     ipcRenderer.invoke(IPC_CHANNELS.browserClearRequests) as Promise<IpcResult<BrowserState>>,
+  scanBrowserSecurity: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.browserSecurityScan) as Promise<IpcResult<SecurityScanReport>>,
   onBrowserEvent: (listener: (event: BrowserEvent) => void) => {
     if (typeof listener !== 'function') {
       throw new TypeError('El listener debe ser una función.');

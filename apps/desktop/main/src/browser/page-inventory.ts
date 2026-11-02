@@ -2,9 +2,13 @@ import {
   FLOW_INTERACTION_EVENTS,
   type FlowElementKind,
   type FlowInteractionEvent,
+  type HandlerProfile,
 } from '@bdt/protocol';
+import { HANDLER_PROFILE_HELPER_SOURCE, parseHandlerProfile } from './handler-profile';
 
 const ELEMENT_KINDS: readonly FlowElementKind[] = [
+  'structure',
+  'asset',
   'button',
   'link',
   'input',
@@ -46,6 +50,7 @@ export interface PageHandlerHint {
   event: FlowInteractionEvent;
   name: string | null;
   source: string;
+  profile: HandlerProfile | null;
 }
 
 export interface PageControl extends PageElementRef {
@@ -59,6 +64,7 @@ export interface PageControl extends PageElementRef {
  */
 export const PAGE_DOM_HELPERS_SOURCE = String.raw`
   const __bdtPage = (() => {
+${HANDLER_PROFILE_HELPER_SOURCE}
     const INTERACTIVE_ROLES = new Set([
       'button', 'link', 'checkbox', 'radio', 'switch', 'tab', 'menuitem',
       'menuitemcheckbox', 'menuitemradio', 'option', 'slider', 'spinbutton',
@@ -68,6 +74,11 @@ export const PAGE_DOM_HELPERS_SOURCE = String.raw`
       'onclick', 'ondblclick', 'oncontextmenu', 'onsubmit', 'oninput', 'onchange',
       'onfocus', 'onblur', 'onkeydown', 'onmouseenter', 'onmouseover', 'onscroll',
     ];
+    const STRUCTURE_TAGS = new Set([
+      'html', 'head', 'body', 'main', 'nav', 'header', 'footer', 'section', 'article',
+      'aside', 'div',
+    ]);
+    const pathCache = new WeakMap();
     const EVENT_MAP = {
       click: 'click',
       dblclick: 'dblclick',
@@ -130,6 +141,8 @@ export const PAGE_DOM_HELPERS_SOURCE = String.raw`
       if (!node) return '';
       if (node.nodeType === 9) return 'document';
       if (node.nodeType !== 1) return '';
+      const cached = pathCache.get(node);
+      if (cached !== undefined) return cached;
       const parts = [];
       const seen = new Set();
       let current = node;
@@ -173,7 +186,9 @@ export const PAGE_DOM_HELPERS_SOURCE = String.raw`
         }
         break;
       }
-      return parts.join('>');
+      const result = parts.join('>');
+      pathCache.set(node, result);
+      return result;
     };
     const keyFor = (node) => {
       const selector = pathOf(node);
@@ -421,22 +436,14 @@ export const PAGE_DOM_HELPERS_SOURCE = String.raw`
       if (name.indexOf('on') === 0 && name.length > 2) name = name.slice(2);
       return EVENT_MAP[name.toLowerCase()] ?? null;
     };
-    const handlerName = (fn) => {
-      try {
-        return typeof fn.name === 'string' && fn.name !== '' ? fn.name.slice(0, 128) : null;
-      } catch (error) {
-        void error;
-        return null;
-      }
-    };
     const addHandler = (list, event, fn, source) => {
       if (event === null || typeof fn !== 'function') return;
-      const name = handlerName(fn);
-      const key = event + '|' + source + '|' + (name ?? '');
-      if (list.some((item) => item.event + '|' + item.source + '|' + (item.name ?? '') === key)) {
-        return;
-      }
-      list.push({ event, name, source });
+      const info = profileOfHandler(fn);
+      const name = info.name === null ? null : info.name.slice(0, 128);
+      const signature = info.profile ? info.profile.signature : null;
+      const id = event + '|' + source + '|' + (name ?? signature ?? '');
+      if (list.some((item) => item.id === id)) return;
+      list.push({ id, event, name, source, profile: info.profile });
     };
     const collectProps = (list, props, source) => {
       if (!props || typeof props !== 'object') return;
@@ -583,6 +590,114 @@ export const PAGE_DOM_HELPERS_SOURCE = String.raw`
       }
       return list;
     };
+    const absoluteOf = (raw, max) => {
+      if (typeof raw !== 'string' || raw === '') return null;
+      if (raw.indexOf('javascript:') === 0) return null;
+      try {
+        const url = new URL(raw, pageUrl());
+        if (url.protocol === 'http:' || url.protocol === 'https:') {
+          return clean(url.origin + url.pathname, max);
+        }
+      } catch (error) {
+        void error;
+      }
+      return clean(raw, max);
+    };
+    const linkHrefOf = (node) => absoluteOf(attr(node, 'href') ?? '', 500);
+    const srcOf = (node) => absoluteOf(attr(node, 'src') ?? '', 500);
+    const fileNameOf = (raw) => {
+      if (typeof raw !== 'string' || raw === '') return '';
+      try {
+        const url = new URL(raw, pageUrl());
+        const parts = url.pathname.split('/');
+        const last = parts[parts.length - 1];
+        return last ? last.slice(0, 80) : url.hostname.slice(0, 80);
+      } catch (error) {
+        void error;
+        return raw.slice(0, 80);
+      }
+    };
+    const structureLabelOf = (node) => {
+      const tag = tagOf(node);
+      let label = tag;
+      try {
+        const id = typeof node.id === 'string' ? node.id : '';
+        if (id !== '') label += '#' + id.slice(0, 60);
+      } catch (error) {
+        void error;
+      }
+      if (label === tag) {
+        try {
+          const classes = node.classList ? Array.from(node.classList) : [];
+          const first = classes.find((name) => typeof name === 'string' && name !== '');
+          if (first) label += '.' + first.slice(0, 40);
+        } catch (error) {
+          void error;
+        }
+      }
+      return label.slice(0, 90);
+    };
+    const structureRefOf = (node) => {
+      const base = refOf(node);
+      if (base === null) return null;
+      return {
+        ...base,
+        kind: 'structure',
+        text: structureLabelOf(node),
+        href: null,
+        formAction: null,
+        formMethod: null,
+        formKey: null,
+        formSelector: null,
+      };
+    };
+    const assetRefOf = (node) => {
+      if (!node || node.nodeType !== 1) return null;
+      const tag = tagOf(node);
+      if (tag !== 'link' && tag !== 'style' && tag !== 'script') return null;
+      const selector = pathOf(node);
+      if (selector === '') return null;
+      let label = '';
+      let href = null;
+      let role = null;
+      const type = clean(attr(node, 'type'), 32);
+      if (tag === 'link') {
+        const rel = (attr(node, 'rel') ?? '').toLowerCase().split(/\s+/);
+        if (!rel.includes('stylesheet')) return null;
+        href = linkHrefOf(node);
+        label = href ? fileNameOf(href) : 'hoja de estilos';
+        role = 'stylesheet';
+      } else if (tag === 'style') {
+        label = 'style en línea';
+        role = 'style';
+      } else {
+        href = srcOf(node);
+        label = href ? fileNameOf(href) : 'script en línea';
+        role = (type ?? 'script').toLowerCase();
+        if (role === 'module') label += ' (módulo)';
+      }
+      return {
+        key: keyFor(node),
+        pageUrl: pageUrl(),
+        selector,
+        kind: 'asset',
+        tag,
+        text: label.slice(0, 120),
+        role,
+        ariaLabel: null,
+        inputType: type,
+        name: null,
+        href,
+        formAction: null,
+        formMethod: null,
+        formKey: null,
+        formSelector: null,
+        disabled: false,
+        visible: visibleOf(node),
+      };
+    };
+    const isStructureNode = (node) =>
+      Boolean(node) && node.nodeType === 1 && STRUCTURE_TAGS.has(tagOf(node));
     const isControlKey = (key) => CONTROL_KEYS.has(key);
 
     return {
@@ -594,6 +709,9 @@ export const PAGE_DOM_HELPERS_SOURCE = String.raw`
       interactive,
       closestInteractive,
       handlersOf,
+      structureRefOf,
+      assetRefOf,
+      isStructureNode,
       isControlKey,
     };
   })();
@@ -605,6 +723,40 @@ export const INVENTORY_SCRIPT = String.raw`
 ${PAGE_DOM_HELPERS_SOURCE}
     const results = [];
     const seen = new Set();
+    const controlKeys = new Set();
+    const structureKeys = new Set();
+    const assetKeys = new Set();
+    const addRef = (ref, handlers) => {
+      if (!ref || ref.key === '') return;
+      results.push({ ...ref, handlers: handlers ?? [] });
+    };
+    const addStructure = (node) => {
+      const key = __bdtPage.keyFor(node);
+      if (key === '' || controlKeys.has(key) || structureKeys.has(key)) return;
+      structureKeys.add(key);
+      addRef(__bdtPage.structureRefOf(node));
+    };
+    const addAncestors = (node) => {
+      let current = node ? node.parentElement : null;
+      let guard = 0;
+      while (current && guard < 500) {
+        guard += 1;
+        if (__bdtPage.isStructureNode(current)) addStructure(current);
+        const parent = current.parentElement;
+        if (parent) {
+          current = parent;
+          continue;
+        }
+        let root = null;
+        try {
+          root = current.getRootNode ? current.getRootNode() : null;
+        } catch (error) {
+          void error;
+          root = null;
+        }
+        current = root && root.host ? root.host : null;
+      }
+    };
     const documentRef = __bdtPage.refOf(document);
     if (documentRef !== null && documentRef.key !== '') {
       results.push({ ...documentRef, handlers: [] });
@@ -621,24 +773,39 @@ ${PAGE_DOM_HELPERS_SOURCE}
         if (seen.has(node)) continue;
         seen.add(node);
         try {
-          if (node.shadowRoot) visit(node.shadowRoot);
-        } catch (error) {
-          void error;
-        }
-        try {
+          const asset = __bdtPage.assetRefOf(node);
+          if (asset !== null) {
+            if (!assetKeys.has(asset.key)) {
+              assetKeys.add(asset.key);
+              addRef(asset);
+            }
+            addAncestors(node);
+          }
           const deep = __bdtPage.interactive(node);
           const handlers = __bdtPage.handlersOf(node, deep);
           if (!deep && handlers.length === 0) continue;
           const ref = __bdtPage.refOf(node);
           if (!ref || ref.key === '') continue;
-          results.push({ ...ref, handlers });
+          if (!controlKeys.has(ref.key)) {
+            controlKeys.add(ref.key);
+            addRef(ref, handlers);
+          }
+          addAncestors(node);
+        } catch (error) {
+          void error;
+        }
+        try {
+          if (node.shadowRoot) visit(node.shadowRoot);
         } catch (error) {
           void error;
         }
       }
     };
     visit(document);
-    return results;
+    for (const node of [document.documentElement, document.head, document.body]) {
+      if (node) addStructure(node);
+    }
+    return results.filter((item) => item.kind !== 'structure' || !controlKeys.has(item.key));
   } catch (error) {
     return [];
   }
@@ -708,6 +875,7 @@ function parseHandlerHint(value: unknown): PageHandlerHint | null {
     event: raw.event,
     name: text(raw.name, 128),
     source,
+    profile: parseHandlerProfile(raw.profile),
   };
 }
 
@@ -723,7 +891,7 @@ export function parseInventory(value: unknown): PageControl[] {
     for (const entry of Array.isArray(raw?.handlers) ? raw.handlers : []) {
       const hint = parseHandlerHint(entry);
       if (hint === null) continue;
-      const id = `${hint.event}|${hint.source}|${hint.name ?? ''}`;
+      const id = `${hint.event}|${hint.source}|${hint.name ?? hint.profile?.signature ?? ''}`;
       if (seen.has(id)) continue;
       seen.add(id);
       handlers.push(hint);

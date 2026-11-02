@@ -1140,3 +1140,235 @@ errónea. El resaltado es una decoración de lectura y no modifica el archivo. L
 responde al primer clic, con o sin evento seleccionado, y no queda silenciosamente desmarcada cuando el
 modelo se reconstruye; si aún no hay eventos, el estado queda visible en el aviso del mapa.
 
+## ADR-048 — Orden jerárquico con estructura DOM, CSS y JS
+
+**Contexto:** el mapa solo tenía un orden: columnas por tipo de nodo y filas por hora de primera
+aparición. Esa vista responde «qué ocurrió y cuándo», pero no «de qué depende cada cosa». El usuario pidió
+un modo jerárquico que reemplace la cronología: si `html` tiene `head` y `body`, un hijo debe abrirse a la
+izquierda y el otro a la derecha, y lo mismo debe repetirse con la estructura, los estilos, los controles,
+las peticiones, el backend y el SQL. Además, el inventario solo registraba controles; ni los contenedores
+del DOM ni las hojas de estilo o los scripts aparecían en el grafo.
+
+**Decisión:** (1) **Protocolo e inventario:** se añaden los tipos de nodo `structure` y `asset` y los
+kinds homónimos, más `pageUrl` en cada nodo. El script de inventario captura `html`, `head`, `body` y los
+contenedores semánticos (`main`, `nav`, `header`, `footer`, `section`, `article`, `aside`, `div`) que sean
+ancestros de un control o recurso; `html`, `head` y `body` se añaden siempre. También captura
+`link[rel~=stylesheet]`, `<style>` y `<script>`, con su URL cuando existe. Cada elemento produce un solo
+nodo: si una clave ya es control, la estructura no se duplica. El recorrido usa una caché de rutas por
+nodo y visita el shadow DOM después del host para que un host interactivo no quede duplicado. (2) **Grafo:**
+los nodos estructurales y de recurso se proyectan sin manejadores ni destinos declarados. La contención
+DOM se calcula para todos los elementos, estructuras y recursos de una misma `pageUrl`: cada nodo elige
+como padre al ancestro más cercano cuyo selector es un prefijo exacto del suyo, con el documento como
+último recurso; los recursos nunca son padres. La arista `CONTAINS` lleva evidencia RUNTIME si el nodo fue
+observado en ejecución y STATIC si solo proviene del inventario, y su nota aclara que describe jerarquía,
+no flujo de datos. (3) **Layout:** `layoutFlow(snapshot, mode)` acepta `chronological` o `hierarchical`.
+El modo jerárquico elige un único padre por nodo según la prioridad de la arista —`CONTAINS` 100,
+`TRIGGERS` 95, `SENDS` 90, `MATCHES` 85, `HANDLES` 80, `QUERIES` 75, `READS`/`WRITES` 70, `USES` 65,
+`SUBMITS`/`NAVIGATES` 60, `RENDERS` 55, `PROVENANCE` 50—, penaliza lo más reciente y evita ciclos; después
+construye un árbol ordenado por tipo y por orden del DOM, reparte los subárboles de cada padre de
+izquierda a derecha y apila los niveles de arriba abajo. Los nodos sin padre quedan como raíces y el
+documento se coloca primero. El modo no usa la hora para posicionar, solo para desempatar. (4) **Mapa:**
+la barra añade el grupo «Cronológico»/«Jerárquico»; el modo se conserva al cambiar de alcance, filtro,
+búsqueda o enfoque, y se re-aplica al layout visible. En jerárquico cada arista se dibuja individualmente,
+sin troncos agrupados: vertical si cambia de nivel y horizontal si conecta nodos del mismo nivel. Las
+etiquetas de capa pasan a `NIVEL n · cantidad · tecnología`; el detalle muestra selector y URL del
+recurso, la búsqueda y el resaltado en página aceptan estructuras y recursos, y el pie cuenta estructuras
+y recursos CSS/JS. (5) **Límites:** el inventario estructural no vuelca todos los nodos del DOM, las reglas
+CSS, las variables de JavaScript ni un grafo de llamadas entre librerías: solo incorpora lo que la
+evidencia disponible permite afirmar. Las relaciones sin arista siguen apareciendo como raíces, no como
+dependencias inventadas.
+
+**Consecuencia:** el orden cronológico queda intacto y el jerárquico permite leer la página como un árbol
+—documento, `html`, `head`/`body`, contenedores, estilos y scripts, controles, manejadores, peticiones,
+rutas, funciones, SQL, tablas y bases de datos—, con los hijos repartidos a ambos lados del padre. Un
+elemento ausente del inventario o una tecnología detectada solo en la cabecera no se convierte en padre de
+algo que no lo evidencia; el mapa distingue lo observado de lo estático como en el resto de vistas.
+
+## ADR-049 — Auditoría de exposición en el cliente y perfiles de manejador
+
+**Contexto:** la herramienta mostraba la cadena de ejecución, pero no advertía de un fallo frecuente:
+el HTML, el CSS o el JavaScript entregados al navegador podían contener la IP o el host internos del
+backend, credenciales o endpoints HTTP, de modo que el cliente llamaba al servidor directamente en vez
+de pasar por el frontend o su proxy. Además, los manejadores sin nombre aparecían como «función
+anónima» aunque fueran funciones flecha con parámetros, `async`, `await` o generadores; esa información
+ya estaba disponible en el objeto de la función y se estaba descartando.
+
+**Decisión:** (1) **Escaneo textual honesto:** `SecurityScanner` recibe los mensajes CDP
+`Debugger.scriptParsed`, `Debugger.globalObjectCleared` y `CSS.styleSheetAdded/Removed`, y al analizar
+lee el DOM serializado (`document.documentElement.outerHTML`), las hojas de estilo mediante
+`CSS.getStyleSheetText` —con el contenido accesible como respaldo—, todos los scripts con
+`Debugger.getScriptSource` y las peticiones ya capturadas. El análisis se ejecuta en `main`, sin enviar
+nada fuera del equipo, y se programa 900 ms después de cada carga; el botón «Reanalizar» lo repite. Los
+escaneos se serializan y un cambio de página invalida el resultado en curso para no publicar hallazgos de
+la página anterior. (2) **Reglas y severidad:** se marcan como críticas las direcciones privadas
+(`10/8`, `127/8`, `192.168/16`, `172.16/12`, `169.254/16`), los hosts `localhost` o `.local` cuando no
+coinciden con el origen de la página, y cualquier host que coincida con el backend configurado; como
+altas, las peticiones directas al backend o a un host interno; como medias, el transporte HTTP sin
+cifrar; y aparte se detectan secretos con forma conocida (Stripe, AWS, GitHub, GitLab, Google, JWT y
+claves privadas) y sumideros DOM (`eval`, `new Function`, `innerHTML`, `outerHTML`,
+`insertAdjacentHTML`, `document.write` y `dangerouslySetInnerHTML`) solo en código propio. Los secretos
+se enmascaran en la evidencia y las credenciales genéricas solo se buscan en código de primera parte.
+(3) **Origen de primera parte:** una URL es del proyecto si `normalizeCodeLocation` puede resolverla a un
+archivo existente de la raíz abierta; las URL relativas a `localhost`, `127.0.0.1` o `::1` se resuelven
+igual. Las líneas del HTML serializado se rotulan como tales, no como líneas del archivo fuente, y las
+coincidencias en código servido que no se puede resolver llevan la misma advertencia. (4) **Interfaz:** la
+pestaña «Seguridad» del panel inferior muestra los hallazgos con filtros exclusivos por gravedad y tipo,
+búsqueda, estado del análisis, contadores de críticas/altas en la pestaña y enlaces al código cuando la
+ubicación es resoluble. Los filtros ocultan y re-apilan, no atenúan. (5) **Perfiles de manejador:** el
+protocolo añade `HandlerProfile` (`async`, `await`, `generator`, `arrow`, `params`, `signature`) y los
+helpers `handlerLabel`/`handlerProfileTags`. El perfil se obtiene del objeto real de la función —en la
+página para las props de React/Vue y el inventario de controles, y por `Runtime.callFunctionOn` para los
+listeners de CDP—, con un respaldo que analiza el texto de la función cuando el objeto no está
+disponible. La etiqueta muestra el nombre si existe y, si no, la firma (`async (req, res) =>`,
+`function (e)`, `x =>`), seguida de las etiquetas `async`, `await`, `generador` y `flecha`. El mismo
+perfil se propaga a panel, tooltip, inventario, ledger de runtime, mapa y búsqueda. El índice estático de
+rutas añade `handlerSignature` para los manejadores anónimos del backend, de modo que el mapa ya no los
+rotula como «Función anónima».
+
+**Consecuencia:** la pestaña «Seguridad» señala la exposición del backend y los secretos que el navegador
+puede leer, con evidencia y ubicación, sin afirmar que un hallazgo sea explotable: la detección es
+textual y requiere revisar si el valor llega de una fuente no confiable. Escanear todos los scripts,
+incluidos los de terceros, puede producir ruido; el filtro por primera parte se aplica a los sumideros y
+a las credenciales genéricas, no a las claves con formato inequívoco, que se muestran en cualquier script
+entregado. Las firmas y etiquetas describen la función observada —su constructor, su texto o su AST—, no
+garantizan que se haya ejecutado; la evidencia STATIC/RUNTIME del resto de la herramienta sigue siendo la
+que decide qué se observó.
+
+## ADR-050 — Vista estructural y árbol por archivo
+
+**Contexto:** ADR-048 añadió el orden jerárquico, pero el árbol seguía siendo HTML-céntrico: la contención
+DOM solo relacionaba documento, estructuras, controles y recursos de una misma página; los manejadores,
+rutas, funciones y SQL sin una arista de contención quedaban como raíces sueltas. El usuario pidió un modo
+por orden estructural del archivo y que el árbol cubriera todos los archivos, no solo el HTML.
+
+**Decisión:** (1) **Protocolo:** `FlowNodeType` añade `file` y `FlowStats` añade `files`. El nodo de archivo
+tiene como título el nombre, como subtítulo la ruta relativa y como `file` la misma ruta, de modo que el
+detalle pueda abrirlo en el editor. (2) **Índice del proyecto:** `WorkspaceService.getFilePaths()` aplana
+el árbol ya ignorado por la configuración y lo cachea hasta que el observador detecta un cambio;
+`BrowserControllerOptions.getWorkspaceFiles` lo entrega al controlador y `buildFlowSnapshot` lo recibe como
+`workspaceFiles`. `createWorkspaceFileIndex` resuelve rutas relativas, URL `http(s)` locales, URL `file:`,
+rutas absolutas de Windows por sufijo y rutas SPA al `index.html` del proyecto; no toca el disco durante el
+mapa. (3) **Grafo:** `projectSourceFiles` crea un nodo `file` por cada archivo resuelto desde el documento
+HTML, los recursos CSS/JS, los manejadores, las rutas, las funciones y las SQL. El archivo contiene el
+documento raíz, los recursos y los nodos de código con aristas `CONTAINS`; la contención DOM existente se
+conserva para los controles, de modo que el árbol no aplana el HTML. Los nodos sin archivo resoluble
+—peticiones, tablas y bases de datos— siguen colgando de su cadena de evidencia. (4) **Layout:** el modo
+`structural` reutiliza las columnas por categoría del cronológico y ordena cada columna por ruta de archivo,
+línea, selector DOM, método/ruta o título, con la hora solo como desempate. El cronológico no cambia; el
+jerárquico usa los nodos de archivo como raíces y aplica ese mismo orden estructural dentro de cada tipo.
+(5) **Mapa:** la barra añade «Estructural»; el pie cuenta archivos, el buscador y el detalle aceptan nodos de
+archivo, y el estado explica el criterio. El alcance «Solo lo que interactuaste» no expande los hijos
+estructurales de un archivo: de lo contrario, un archivo con un solo nodo RUNTIME haría aparecer todos sus
+controles estáticos como si se hubieran usado. (6) **Límites:** el árbol cubre todos los archivos que
+aportan evidencia al mapa, no todos los archivos del repositorio; volcar archivos ajenos al flujo sería un
+explorador de archivos, no un mapa. Un recurso compilado o minimizado que no se puede resolver a una fuente
+del proyecto no inventa un nodo de archivo. Tampoco se extraen reglas CSS, variables internas de JavaScript
+ni un grafo de llamadas entre librerías.
+
+**Consecuencia:** el mapa deja de ser HTML-céntrico: el árbol muestra el archivo HTML con su DOM, el archivo
+CSS/JS con sus recursos y manejadores, y cada archivo de backend con sus rutas, funciones y SQL; el modo
+estructural permite comparar la misma categoría entre archivos por su posición real en el código o en el
+DOM. Las relaciones que no tienen evidencia siguen apareciendo como raíces, no como dependencias
+inventadas.
+
+## ADR-051 — El enfoque sobrevive al clic en el vacío y detección de `try/catch`
+
+**Contexto:** «Ver interacciones» aísla la cadena de un nodo y mantiene el subgrafo apilado, pero el clic
+en el vacío llamaba a `clearSelection()`, que también borraba `focusScope`, `focusOriginId` y el detalle:
+un clic fuera de las cajas deshacía el enfoque sin que el usuario lo pidiera. Además, el perfil del
+manejador describía `async`, `await`, `generador` y `flecha`, pero no distinguía una función con
+`try/catch`, aunque esa estructura cambia cómo se propaga el error en la cadena inspeccionada.
+
+**Decisión:** (1) **Clic en el vacío:** al terminar un arrastre sin movimiento, el mapa solo quita la
+selección cuando no hay enfoque activo. Con `focusScope` activo, el clic en el vacío no altera el
+enfoque, la selección ni el detalle, y el subgrafo sigue apilado y ajustado. La salida explícita se
+mantiene en «Quitar enfoque» del menú contextual y del estado; abrir el mapa, cambiar el modo de tráfico
+o la casilla «Solo esos» conservan su propio restablecimiento. (2) **`try/catch`:** `HandlerProfile` añade
+`tryCatch` como campo obligatorio. El helper de la página lo calcula del texto de la función con
+`/\btry\s*\{/` y `/\bcatch\s*(?:\(|\{)/` —ambos presentes—; `parseHandlerProfile` normaliza el campo y
+`profileFromSource` aplica la misma prueba cuando el objeto real no está disponible. `handlerProfileTags`
+añade la etiqueta `try/catch`, de modo que panel, tooltip, inventario, ledger, búsqueda y detalle del mapa
+la muestran junto a las etiquetas existentes sin cambios adicionales en cada vista.
+(3) **Límite honesto:** la prueba es textual, igual que `await`: un `try` y un `catch` dentro de funciones
+anidadas también marcan la función contenedora, un comentario o una cadena con ese texto puede producir
+una coincidencia, y la etiqueta no demuestra que la ruta de error se ejecutara ni que la excepción
+llegara al backend.
+
+**Consecuencia:** el enfoque de una caja permanece estable mientras se navega, se inspecciona la página o
+se hace clic en el fondo, y solo se abandona por una acción explícita. El perfil del manejador responde
+también qué funciones capturan errores con `try/catch`, con la misma evidencia descriptiva —no de
+ejecución— que el resto de etiquetas.
+
+## ADR-052 — Vista compacta y barra fija de tipos en el mapa
+
+**Contexto:** el mapa ya ocultaba lo que quedaba fuera del visor, pero cada tarjeta seguía mostrando tipo,
+título, subtítulo, hora y contador en 48 px de alto; con muchas rutas, la densidad seguía siendo baja y
+el texto pequeño dificultaba leer los cuadros. Además, las etiquetas de tipo de cada columna se dibujaban
+dentro del SVG: al arrastrar el mapa vertical u horizontalmente desaparecían de la vista, de modo que el
+usuario perdía la referencia de qué columna era HTML, frontend, backend o SQL.
+
+**Decisión:** (1) **Vista compacta:** la barra del mapa añade la casilla «Vista compacta». Marcada, cada
+nodo dibuja solo su título y su contador (`N×`) en una tarjeta de 30 px (`FLOW_NODE_COMPACT_HEIGHT`);
+se ocultan la etiqueta de tipo, el subtítulo y la hora. El layout acepta `{ compact }` y reduce también
+el hueco entre filas —de 10 a 6 px— y el hueco vertical del árbol jerárquico —de 82 a 48 px—, de modo que
+entran más nodos en la misma pantalla. Las aristas, el recorte por visor, el ajuste y el zoom usan la
+altura activa, no una constante. El detalle del nodo, el buscador, el tooltip y el rail conservan toda la
+información: la vista compacta es una presentación, no una pérdida de datos. (2) **Barra fija de tipos:**
+las etiquetas de capa dejan de dibujarse dentro del SVG y se renderizan en `#map-axis`, una franja opaca
+de 22 px en la parte superior del lienzo con `pointer-events: none`. En los órdenes cronológico y
+estructural, cada etiqueta se posiciona en la coordenada X de su columna y se desplaza con
+`view.x + layer.x * view.k`, así que sigue el arrastre horizontal y el zoom, pero permanece fija en la
+parte superior al desplazar en vertical. El ajuste (`fitView`/`fitToNodes`) reserva esos 22 px para que
+la barra no tape la primera fila, y el estado del mapa se desplaza debajo. En el orden jerárquico no hay
+columnas por tipo —sus capas son niveles—, así que las etiquetas de nivel se listan en la misma barra de
+izquierda a derecha. (3) **Persistencia:** la casilla conserva su estado mientras la ventana del mapa
+sigue abierta y se re-aplica al cambiar de orden, de alcance o de snapshot; el detalle no cambia.
+
+**Consecuencia:** el usuario puede compactar el mapa para ver y leer muchos más objetos a la vez, y
+mantiene siempre visible la referencia de tipo y tecnología de cada columna sin importar cuánto arrastre.
+La contrapartida es que la barra ocupa 22 px del visor y que, en modo compacto, el tipo, el subtítulo y
+la hora solo están disponibles en el detalle, el tooltip o al desmarcar la casilla. La barra sigue el
+movimiento horizontal, no el vertical: es una guía de columnas, no un nodo del grafo.
+
+
+
+## ADR-053 — Columnas medidas por su contenido y ajustables desde la barra fija
+
+**Contexto:** ADR-052 redujo la altura de las tarjetas en vista compacta, pero el ancho seguía fijo en
+210 px: títulos como «div» o nombres cortos dejaban la mayor parte del cuadro vacía, las columnas no se
+acercaban y el mapa desperdiciaba espacio horizontal. El usuario pidió eliminar ese espacio y poder
+cambiar el ancho de cada columna arrastrando el separador de su encabezado en la barra fija, como hace
+el Explorador de Windows, en lugar de un control global.
+
+**Decisión:** (1) **Anchos por contenido:** `FlowLayoutOptions` acepta `widthOf(node)`; `FlowPlacedNode`
+lleva su `width` y `FlowLayerInfo` el ancho de su columna. El preload mide el texto con un canvas 2D
+usando las mismas fuentes del SVG —título 600 11 px, tipo 600 8 px, subtítulo 10 px, contador 600 8 px y
+hora 9 px mono— y calcula el ancho necesario: en vista compacta, título y contador; en normal, el mayor
+de las filas tipo+contador, título y subtítulo+hora, con 10 px de margen izquierdo y 8 px de derecho. El
+ancho natural se acota entre 52 y 440 px. En los órdenes cronológico y estructural, todas las tarjetas de
+una columna usan el ancho de la columna —el mayor de sus anchos naturales o el ancho manual—; en el
+árbol, cada nodo conserva su propio ancho y se centra sobre su subárbol. Las aristas, el recorte por
+visor, el ajuste, las cajas de impacto y el dibujo usan el ancho de cada nodo en lugar de la constante.
+El texto que no cabe se recorta con «…» midiendo píxeles; el contenido completo sigue en el tooltip y el
+detalle. (2) **Columnas arrastrables:** la barra fija dibuja un separador en el borde derecho de cada
+encabezado de tipo. Arrastrarlo cambia el ancho de esa columna —el desplazamiento en pantalla se divide
+por el zoom para trabajar en unidades del mapa— entre 44 y 720 px; el ancho manual se guarda por tipo y
+se re-aplica al re-apilar. Durante el arrastre, un `requestAnimationFrame` recalcula el layout y redibuja
+el SVG sin cambiar el zoom, el desplazamiento, la selección ni el alcance activo. El doble clic en el
+separador borra el ancho manual y vuelve al ancho del contenido. En el orden jerárquico, que no tiene
+columnas por tipo, no hay separadores y se mantienen los anchos por contenido. (3) **Barra fija:** cada
+etiqueta se limita al ancho de su columna y reduce su texto —completo, tipo y contador, o solo tipo—
+cuando la columna es estrecha, además de recortarse con puntos suspensivos al hacer zoom, de modo que no
+se pisan entre sí; como el separador se coloca en el borde de la columna, sigue al encabezado mientras
+se arrastra o se desplaza la vista. (4) **Límites:** el ancho se mide con la fuente del sistema del
+renderizador, no con las métricas exactas del SVG, así que puede quedar una diferencia de pocos píxeles;
+el árbol puede mostrar bordes derechos irregulares porque cada tarjeta usa su propio ancho. No se
+inventan anchos para textos que no se han medido ni se guardan preferencias entre ventanas: el ajuste
+vive mientras la ventana del mapa sigue abierta.
+
+**Consecuencia:** cada columna ocupa solo lo que su contenido necesita por defecto, las columnas se
+acercan y el mapa deja de reservar espacio muerto; el usuario puede apretar o ensanchar cada columna
+arrastrando el separador de su encabezado, como en el Explorador de Windows, y recuperar el ajuste
+automático con doble clic. La contrapartida es que los textos largos se recortan visualmente, que una
+columna muy ancha puede empujar las siguientes fuera del visor y que el árbol jerárquico puede quedar
+con bordes derechos desiguales.

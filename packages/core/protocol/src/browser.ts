@@ -154,11 +154,61 @@ export interface ConsoleEntry {
   column: number | null;
 }
 
+export type SecuritySeverity = 'critical' | 'high' | 'medium' | 'low';
+
+export type SecurityCategory = 'server-exposure' | 'insecure-transport' | 'secret' | 'dom-sink';
+
+export type SecuritySource = 'html' | 'css' | 'js' | 'request';
+
+export interface SecurityFinding {
+  id: string;
+  category: SecurityCategory;
+  severity: SecuritySeverity;
+  title: string;
+  detail: string;
+  evidence: string;
+  source: SecuritySource;
+  url: string | null;
+  file: string | null;
+  line: number | null;
+  column: number | null;
+  host: string | null;
+  redacted: boolean;
+  note: string | null;
+}
+
+export type SecurityScanStatus = 'idle' | 'scanning' | 'done' | 'error';
+
+export interface SecurityScanReport {
+  status: SecurityScanStatus;
+  scannedAt: number | null;
+  pageUrl: string | null;
+  error: string | null;
+  findings: SecurityFinding[];
+  scripts: number;
+  styleSheets: number;
+  requests: number;
+}
+
+export function emptySecurityReport(): SecurityScanReport {
+  return {
+    status: 'idle',
+    scannedAt: null,
+    pageUrl: null,
+    error: null,
+    findings: [],
+    scripts: 0,
+    styleSheets: 0,
+    requests: 0,
+  };
+}
+
 export interface BrowserSnapshot {
   state: BrowserState;
   requests: CapturedRequest[];
   activity: ActivityEvent[];
   consoleEntries: ConsoleEntry[];
+  security: SecurityScanReport;
 }
 
 export type BrowserEvent =
@@ -168,7 +218,8 @@ export type BrowserEvent =
   | { type: 'activity'; activity: ActivityEvent[] }
   | { type: 'activity-cleared' }
   | { type: 'console'; entries: ConsoleEntry[] }
-  | { type: 'console-cleared' };
+  | { type: 'console-cleared' }
+  | { type: 'security'; report: SecurityScanReport };
 
 export type InspectionStatus = 'resolving' | 'listening' | 'done';
 
@@ -190,6 +241,39 @@ export interface InspectionElement {
 
 export type HandlerSource = 'listener' | 'react' | 'vue';
 
+export interface HandlerProfile {
+  async: boolean;
+  await: boolean;
+  generator: boolean;
+  arrow: boolean;
+  tryCatch: boolean;
+  params: string | null;
+  signature: string | null;
+}
+
+export function handlerLabel(
+  name: string | null,
+  profile: HandlerProfile | null,
+  fallback = 'función anónima',
+): string {
+  if (name !== null && name !== '') return name;
+  if (profile !== null && profile.signature !== null && profile.signature !== '') {
+    return profile.signature;
+  }
+  return fallback;
+}
+
+export function handlerProfileTags(profile: HandlerProfile | null): string[] {
+  if (profile === null) return [];
+  const tags: string[] = [];
+  if (profile.async) tags.push('async');
+  if (profile.await) tags.push('await');
+  if (profile.generator) tags.push('generador');
+  if (profile.arrow) tags.push('flecha');
+  if (profile.tryCatch) tags.push('try/catch');
+  return tags;
+}
+
 export interface InspectionHandler {
   event: 'click' | 'submit';
   name: string | null;
@@ -199,6 +283,7 @@ export interface InspectionHandler {
   source: HandlerSource;
   note: string | null;
   code: InspectionCodeBlock | null;
+  profile: HandlerProfile | null;
 }
 
 export type InspectionCorrelation = 'direct' | 'heuristic';

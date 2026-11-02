@@ -2,6 +2,8 @@ import { ipcRenderer } from 'electron';
 import {
   BROWSER_PANEL_CHANNELS,
   FLOW_INTERACTION_EVENTS,
+  handlerLabel,
+  handlerProfileTags,
   normalizeSearchText,
   requestStatusView,
   type FlowEdge,
@@ -14,10 +16,11 @@ import {
   type RequestStatusView,
 } from '@bdt/protocol';
 import {
+  FLOW_NODE_COMPACT_HEIGHT,
   FLOW_NODE_HEIGHT,
-  FLOW_NODE_WIDTH,
   layoutFlow,
   type FlowLayout,
+  type FlowLayoutMode,
   type FlowPlacedNode,
 } from './flow-layout';
 
@@ -27,6 +30,21 @@ const MAX_ZOOM = 2.5;
 const PAGE_SIZE = 20;
 const CULL_MARGIN = 280;
 const BUNDLE_JUNCTION_GAP = 44;
+const CARD_WIDTH_MIN = 52;
+const CARD_WIDTH_MAX = 440;
+const COLUMN_WIDTH_MIN = 44;
+const COLUMN_WIDTH_MAX = 720;
+const COLUMN_GRIP_WIDTH = 9;
+const CARD_TEXT_LEFT = 10;
+const CARD_TEXT_RIGHT = 8;
+const TITLE_FONT = '600 11px system-ui, "Segoe UI", sans-serif';
+const TYPE_FONT = '600 8px system-ui, "Segoe UI", sans-serif';
+const SUB_FONT = '10px system-ui, "Segoe UI", sans-serif';
+const BADGE_FONT = '600 8px system-ui, "Segoe UI", sans-serif';
+const TIME_FONT = '9px "Cascadia Mono", Consolas, monospace';
+const TYPE_LETTER_SPACING = 0.8;
+const AXIS_FONT = '600 9px system-ui, "Segoe UI", sans-serif';
+const AXIS_LETTER_SPACING = 0.9;
 
 type TrafficMode = 'all' | 'interacted';
 type FocusDirection = 'forward' | 'both';
@@ -41,17 +59,23 @@ const FLOW_CLASS_LABEL: Record<EdgeFlowClass, string> = {
 };
 
 const SEARCH_TYPE_ORDER: Record<FlowNodeType, number> = {
-  element: 0,
-  handler: 1,
-  request: 2,
-  route: 3,
-  function: 4,
-  query: 5,
-  table: 6,
-  database: 7,
+  file: 0,
+  structure: 1,
+  asset: 2,
+  element: 3,
+  handler: 4,
+  request: 5,
+  route: 6,
+  function: 7,
+  query: 8,
+  table: 9,
+  database: 10,
 };
 
 const TYPE_LABEL: Record<FlowNodeType, string> = {
+  file: 'ARCHIVO',
+  structure: 'ESTRUCTURA',
+  asset: 'RECURSO',
   element: 'ELEMENTO',
   handler: 'HANDLER',
   request: 'PETICIÓN',
@@ -63,6 +87,8 @@ const TYPE_LABEL: Record<FlowNodeType, string> = {
 };
 
 const KIND_LABEL: Record<FlowElementKind, string> = {
+  structure: 'ESTRUCTURA',
+  asset: 'RECURSO',
   button: 'BOTÓN',
   link: 'ENLACE',
   input: 'CAMPO',
@@ -188,6 +214,9 @@ let highlightScope: Set<string> | null = null;
 let currentCardRequests = new Set<string>();
 let searchTerm = '';
 let trafficMode: TrafficMode = 'all';
+let layoutMode: FlowLayoutMode = 'chronological';
+let compactMode = false;
+const columnWidths = new Map<FlowNodeType, number>();
 let eventFilter: FlowInteractionEvent | null = null;
 let eventOnly = false;
 let focusScope: Set<string> | null = null;
@@ -205,6 +234,11 @@ let viewport: SVGGElement | null = null;
 let branchLayer: SVGGElement | null = null;
 let trunkLayer: SVGGElement | null = null;
 let nodeLayer: SVGGElement | null = null;
+let axisEntries: Array<{ el: HTMLElement; x: number | null; width: number | null }> = [];
+let axisGrips: Array<{ el: HTMLElement; x: number }> = [];
+let columnResize: { type: FlowNodeType; startClientX: number; startWidth: number } | null = null;
+let columnFrame = 0;
+const AXIS_HEIGHT = 22;
 let edgePlans: EdgePlan[] = [];
 let planById = new Map<string, EdgePlan>();
 let respondedScope = new Set<string>();
@@ -268,6 +302,36 @@ function truncate(value: string, max: number): string {
   const clean = value.replace(/\s+/g, ' ').trim();
   if (clean.length <= max) return clean;
   return `${clean.slice(0, Math.max(1, max - 1))}…`;
+}
+
+let measureCanvas: CanvasRenderingContext2D | null = null;
+
+function textWidth(text: string, font: string, letterSpacing = 0): number {
+  if (text === '') return 0;
+  if (measureCanvas === null) {
+    measureCanvas = document.createElement('canvas').getContext('2d');
+  }
+  if (measureCanvas === null) return text.length * (6 + letterSpacing);
+  measureCanvas.font = font;
+  const spacing = Math.max(0, text.length - 1) * letterSpacing;
+  return measureCanvas.measureText(text).width + spacing;
+}
+
+function truncateToWidth(value: string, maxWidth: number, font: string, letterSpacing = 0): string {
+  const clean = value.replace(/\s+/g, ' ').trim();
+  if (clean === '' || maxWidth <= 0) return '';
+  if (textWidth(clean, font, letterSpacing) <= maxWidth) return clean;
+  let low = 0;
+  let high = clean.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (textWidth(`${clean.slice(0, mid)}…`, font, letterSpacing) <= maxWidth) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return low <= 0 ? '…' : `${clean.slice(0, low)}…`;
 }
 
 function clock(at: number): string {
@@ -501,6 +565,9 @@ function computeRuntimeReachable(snapshot: FlowSnapshot): Set<string> {
   const reachable = new Set<string>();
   const queue: string[] = [];
   const interactedElements = new Set<string>();
+  const fileNodes = new Set(
+    snapshot.nodes.filter((node) => node.type === 'file').map((node) => node.id),
+  );
   for (const node of snapshot.nodes) {
     if (!node.evidence.includes('RUNTIME')) continue;
     if (node.type === 'element') {
@@ -520,7 +587,7 @@ function computeRuntimeReachable(snapshot: FlowSnapshot): Set<string> {
   }
   while (queue.length > 0) {
     const current = queue.pop();
-    if (current === undefined) continue;
+    if (current === undefined || fileNodes.has(current)) continue;
     for (const next of outgoing.get(current) ?? []) {
       if (reachable.has(next)) continue;
       reachable.add(next);
@@ -530,8 +597,50 @@ function computeRuntimeReachable(snapshot: FlowSnapshot): Set<string> {
   return reachable;
 }
 
+function nodeHeight(): number {
+  return compactMode ? FLOW_NODE_COMPACT_HEIGHT : FLOW_NODE_HEIGHT;
+}
+
+function badgeText(node: FlowNode): string {
+  const total = nodeCount(node);
+  return total > 0 ? `${String(total)}×` : '';
+}
+
+function naturalNodeWidth(node: FlowNode): number {
+  const badge = badgeText(node);
+  const badgeWidth = badge === '' ? 0 : 8 + textWidth(badge, BADGE_FONT);
+  let required: number;
+  if (compactMode) {
+    required = CARD_TEXT_LEFT + textWidth(node.title, TITLE_FONT) + badgeWidth + CARD_TEXT_RIGHT;
+  } else {
+    const typeWidth = textWidth(nodeTypeLabel(node), TYPE_FONT, TYPE_LETTER_SPACING);
+    const seen = node.firstSeen > 0 ? clock(node.firstSeen) : '';
+    const timeWidth = seen === '' ? 0 : 8 + textWidth(seen, TIME_FONT);
+    const subtitle = node.subtitle ?? '';
+    const subWidth = subtitle === '' ? 0 : textWidth(subtitle, SUB_FONT) + timeWidth;
+    required = Math.max(
+      CARD_TEXT_LEFT + typeWidth + badgeWidth + CARD_TEXT_RIGHT,
+      CARD_TEXT_LEFT + textWidth(node.title, TITLE_FONT) + CARD_TEXT_RIGHT,
+      CARD_TEXT_LEFT + subWidth + CARD_TEXT_RIGHT,
+    );
+  }
+  return Math.round(clamp(required, CARD_WIDTH_MIN, CARD_WIDTH_MAX));
+}
+
+function nodeWidthOf(node: FlowNode): number {
+  if (layoutMode !== 'hierarchical') {
+    const manual = columnWidths.get(node.type);
+    if (manual !== undefined) return manual;
+  }
+  return naturalNodeWidth(node);
+}
+
+function layoutOptions(): { compact: boolean; widthOf: (node: FlowNode) => number } {
+  return { compact: compactMode, widthOf: nodeWidthOf };
+}
+
 function prepare(snapshot: FlowSnapshot): void {
-  const layout = layoutFlow(snapshot);
+  const layout = layoutFlow(snapshot, layoutMode, layoutOptions());
   const nodesById = new Map<string, FlowNode>();
   for (const node of snapshot.nodes) {
     nodesById.set(node.id, node);
@@ -590,9 +699,9 @@ function worldBounds(): WorldBounds | null {
 
 function nodeInBounds(placed: FlowPlacedNode, bounds: WorldBounds): boolean {
   return (
-    placed.x + FLOW_NODE_WIDTH >= bounds.minX &&
+    placed.x + placed.width >= bounds.minX &&
     placed.x <= bounds.maxX &&
-    placed.y + FLOW_NODE_HEIGHT >= bounds.minY &&
+    placed.y + nodeHeight() >= bounds.minY &&
     placed.y <= bounds.maxY
   );
 }
@@ -651,6 +760,7 @@ function applyView(): void {
     'transform',
     `translate(${String(view.x)} ${String(view.y)}) scale(${String(view.k)})`,
   );
+  positionAxis();
   scheduleViewportUpdate();
 }
 
@@ -666,15 +776,16 @@ function fitView(): void {
   const padding = 36;
   const width = Math.max(1, model.layout.width);
   const height = Math.max(1, model.layout.height);
+  const usableHeight = Math.max(1, rect.height - AXIS_HEIGHT);
   const k = clamp(
-    Math.min((rect.width - padding * 2) / width, (rect.height - padding * 2) / height),
+    Math.min((rect.width - padding * 2) / width, (usableHeight - padding * 2) / height),
     MIN_ZOOM,
     1.15,
   );
   view = {
     k,
     x: (rect.width - width * k) / 2,
-    y: (rect.height - height * k) / 2,
+    y: AXIS_HEIGHT + (usableHeight - height * k) / 2,
   };
   viewReady = true;
   applyView();
@@ -691,8 +802,8 @@ function fitToNodes(ids: readonly string[]): void {
     if (placed === undefined) continue;
     minX = Math.min(minX, placed.x);
     minY = Math.min(minY, placed.y);
-    maxX = Math.max(maxX, placed.x + FLOW_NODE_WIDTH);
-    maxY = Math.max(maxY, placed.y + FLOW_NODE_HEIGHT);
+    maxX = Math.max(maxX, placed.x + placed.width);
+    maxY = Math.max(maxY, placed.y + nodeHeight());
   }
   if (!Number.isFinite(minX) || !Number.isFinite(minY)) {
     fitView();
@@ -704,15 +815,16 @@ function fitToNodes(ids: readonly string[]): void {
   const padding = 56;
   const width = Math.max(1, maxX - minX);
   const height = Math.max(1, maxY - minY);
+  const usableHeight = Math.max(1, rect.height - AXIS_HEIGHT);
   const k = clamp(
-    Math.min((rect.width - padding * 2) / width, (rect.height - padding * 2) / height),
+    Math.min((rect.width - padding * 2) / width, (usableHeight - padding * 2) / height),
     MIN_ZOOM,
     MAX_ZOOM,
   );
   view = {
     k,
     x: rect.width / 2 - (minX + width / 2) * k,
-    y: rect.height / 2 - (minY + height / 2) * k,
+    y: AXIS_HEIGHT + usableHeight / 2 - (minY + height / 2) * k,
   };
   viewReady = true;
   applyView();
@@ -730,6 +842,12 @@ function zoomAt(px: number, py: number, factor: number): void {
 function layerTech(snapshot: FlowSnapshot, type: FlowNodeType): string | null {
   const stack = snapshot.stack;
   switch (type) {
+    case 'file':
+      return 'workspace';
+    case 'structure':
+      return 'DOM';
+    case 'asset':
+      return 'CSS / JS';
     case 'element':
       return 'HTML';
     case 'handler':
@@ -745,6 +863,85 @@ function layerTech(snapshot: FlowSnapshot, type: FlowNodeType): string | null {
     case 'table':
       return null;
   }
+}
+
+function positionAxis(): void {
+  if (model === null || model.layout.mode === 'hierarchical') return;
+  for (const entry of axisEntries) {
+    if (entry.x === null) continue;
+    const left = view.x + entry.x * view.k;
+    entry.el.style.transform = `translateX(${String(left)}px)`;
+    entry.el.style.maxWidth =
+      entry.width === null ? '' : `${String(Math.max(24, entry.width * view.k - 10))}px`;
+  }
+  for (const grip of axisGrips) {
+    const left = view.x + grip.x * view.k;
+    grip.el.style.transform = `translateX(${String(left - COLUMN_GRIP_WIDTH / 2)}px)`;
+  }
+}
+
+function renderAxis(): void {
+  const bar = document.getElementById('map-axis');
+  if (bar === null) return;
+  bar.replaceChildren();
+  axisEntries = [];
+  axisGrips = [];
+  if (model === null || model.layout.layers.length === 0) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  const hierarchical = model.layout.mode === 'hierarchical';
+  let flatLeft = 8;
+  for (const layer of model.layout.layers) {
+    const tech = layerTech(model.snapshot, layer.type);
+    const layerLabel =
+      layer.label ?? (layer.type === 'element' ? 'CONTROLES' : TYPE_LABEL[layer.type]);
+    const fullCaption = `${layerLabel} · ${String(layer.count)}${tech === null ? '' : ` · ${tech}`}`;
+    const countCaption = `${layerLabel} · ${String(layer.count)}`;
+    let caption = fullCaption;
+    if (!hierarchical && layer.width !== undefined) {
+      const available = Math.max(24, layer.width - 6);
+      if (textWidth(caption, AXIS_FONT, AXIS_LETTER_SPACING) > available) {
+        caption =
+          textWidth(countCaption, AXIS_FONT, AXIS_LETTER_SPACING) <= available
+            ? countCaption
+            : layerLabel;
+      }
+    }
+    const label = document.createElement('span');
+    label.className = 'axis-label';
+    label.textContent = caption;
+    label.title = fullCaption;
+    bar.append(label);
+    if (hierarchical) {
+      label.style.left = `${String(flatLeft)}px`;
+      flatLeft += label.offsetWidth + 16;
+      axisEntries.push({ el: label, x: null, width: null });
+      continue;
+    }
+    axisEntries.push({ el: label, x: layer.x, width: layer.width ?? null });
+    const grip = document.createElement('span');
+    grip.className = 'axis-grip';
+    grip.title = `${layerLabel}: arrastra para cambiar el ancho de la columna; doble clic para ajustarlo al contenido`;
+    if (columnResize !== null && columnResize.type === layer.type) {
+      grip.classList.add('is-active');
+    }
+    grip.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      beginColumnResize(layer.type, event.clientX);
+    });
+    grip.addEventListener('dblclick', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      resetColumnWidth(layer.type);
+    });
+    bar.append(grip);
+    axisGrips.push({ el: grip, x: layer.x + (layer.width ?? 0) });
+  }
+  positionAxis();
 }
 
 function mergeEvidence(edges: readonly FlowEdge[]): string[] {
@@ -873,11 +1070,12 @@ function receiveEdgePath(
 }
 
 function verticalEdgePath(source: FlowPlacedNode, target: FlowPlacedNode): string {
+  const height = nodeHeight();
   const downward = target.y >= source.y;
-  const sourceX = source.x + FLOW_NODE_WIDTH / 2;
-  const sourceY = downward ? source.y + FLOW_NODE_HEIGHT : source.y;
-  const targetX = target.x + FLOW_NODE_WIDTH / 2;
-  const targetY = downward ? target.y : target.y + FLOW_NODE_HEIGHT;
+  const sourceX = source.x + source.width / 2;
+  const sourceY = downward ? source.y + height : source.y;
+  const targetX = target.x + target.width / 2;
+  const targetY = downward ? target.y : target.y + height;
   const bend = Math.max(18, Math.abs(targetY - sourceY) / 2);
   const direction = downward ? 1 : -1;
   return `M ${String(sourceX)} ${String(sourceY)} C ${String(sourceX)} ${String(
@@ -901,18 +1099,19 @@ function buildSinglePlan(item: SingleEdgeItem): EdgePlan {
   let glyph: '↑' | '↓' | '' = '';
   let glyphX = 0;
   let glyphY = 0;
+  const height = nodeHeight();
   if (from.x === to.x) {
     d = verticalEdgePath(from, to);
     if (flowClass === 'receive') {
       glyph = '↓';
       glyphX = from.x - 9;
-      glyphY = from.y + FLOW_NODE_HEIGHT / 2;
+      glyphY = from.y + height / 2;
     }
   } else if (from.x > to.x) {
     const sourceX = from.x;
-    const sourceY = from.y + FLOW_NODE_HEIGHT / 2;
-    const targetX = to.x + FLOW_NODE_WIDTH;
-    const targetY = to.y + FLOW_NODE_HEIGHT / 2;
+    const sourceY = from.y + height / 2;
+    const targetX = to.x + to.width;
+    const targetY = to.y + height / 2;
     d = receiveEdgePath(sourceX, sourceY, targetX, targetY);
     if (flowClass === 'receive') {
       glyph = '↓';
@@ -920,10 +1119,10 @@ function buildSinglePlan(item: SingleEdgeItem): EdgePlan {
       glyphY = sourceY - 6;
     }
   } else {
-    const sourceX = from.x + FLOW_NODE_WIDTH;
-    const sourceY = from.y + FLOW_NODE_HEIGHT / 2;
+    const sourceX = from.x + from.width;
+    const sourceY = from.y + height / 2;
     const targetX = to.x;
-    const targetY = to.y + FLOW_NODE_HEIGHT / 2;
+    const targetY = to.y + height / 2;
     d = edgePath(sourceX, sourceY, targetX, targetY);
     if (flowClass === 'send' || flowClass === 'gateway' || flowClass === 'server') {
       glyph = '↑';
@@ -955,7 +1154,52 @@ function buildSinglePlan(item: SingleEdgeItem): EdgePlan {
     glyph: roundTrip ? '' : glyph,
     glyphX,
     glyphY,
-    bbox: planBBox(from.x, from.y, to.x + FLOW_NODE_WIDTH, to.y + FLOW_NODE_HEIGHT),
+    bbox: planBBox(from.x, from.y, to.x + to.width, to.y + height),
+  });
+}
+
+function hierarchyEdgePath(source: FlowPlacedNode, target: FlowPlacedNode): string {
+  if (Math.abs(source.y - target.y) < 1 && source.x !== target.x) {
+    const height = nodeHeight();
+    const sourceY = source.y + height / 2;
+    const targetY = target.y + height / 2;
+    if (target.x > source.x) {
+      return edgePath(source.x + source.width, sourceY, target.x, targetY);
+    }
+    return receiveEdgePath(source.x, sourceY, target.x + target.width, targetY);
+  }
+  return verticalEdgePath(source, target);
+}
+
+function buildHierarchyPlan(item: SingleEdgeItem): EdgePlan {
+  const { edge, flowClass } = item;
+  const roundTrip = edgeRoundTrip(edge, item.targetNode, flowClass);
+  const marker = flowClass === 'neutral' ? '' : flowClassMarker(flowClass);
+  return makePlan({
+    id: `edge:${edge.id}`,
+    kind: 'edge',
+    sources: [edge.from],
+    to: edge.to,
+    edgeIds: [edge.id],
+    tooltip: edgeTooltip(edge, flowClass, roundTrip),
+    d: hierarchyEdgePath(item.source, item.target),
+    marker,
+    startMarker: roundTrip ? marker : '',
+    className: edgeClassName(
+      edge.evidence,
+      edge.correlation === 'heuristic',
+      false,
+      flowClass,
+      roundTrip,
+    ),
+    flowClass,
+    roundTrip,
+    bbox: planBBox(
+      item.source.x,
+      item.source.y,
+      item.target.x + item.target.width,
+      item.target.y + nodeHeight(),
+    ),
   });
 }
 
@@ -992,10 +1236,10 @@ function buildForwardPlans(group: ForwardGroup): EdgePlan[] {
   if (entries.length === 1) {
     const entry = entries[0];
     if (entry === undefined) return plans;
-    const sourceX = entry.source.x + FLOW_NODE_WIDTH;
-    const sourceY = entry.source.y + FLOW_NODE_HEIGHT / 2;
+    const sourceX = entry.source.x + entry.source.width;
+    const sourceY = entry.source.y + nodeHeight() / 2;
     const targetX = target.x;
-    const targetY = target.y + FLOW_NODE_HEIGHT / 2;
+    const targetY = target.y + nodeHeight() / 2;
     const evidence = mergeEvidence(entry.edges);
     const first = entry.edges[0];
     plans.push(
@@ -1041,8 +1285,8 @@ function buildForwardPlans(group: ForwardGroup): EdgePlan[] {
   }> = [];
   let sumY = 0;
   for (const entry of entries) {
-    const sourceX = entry.source.x + FLOW_NODE_WIDTH;
-    const sourceY = entry.source.y + FLOW_NODE_HEIGHT / 2;
+    const sourceX = entry.source.x + entry.source.width;
+    const sourceY = entry.source.y + nodeHeight() / 2;
     sumY += sourceY;
     placedSources.push({
       sourceId: entry.sourceId,
@@ -1097,7 +1341,7 @@ function buildForwardPlans(group: ForwardGroup): EdgePlan[] {
   const allEdges = placedSources.flatMap((item) => item.edges);
   const trunkEvidence = mergeEvidence(allEdges);
   const targetX = target.x;
-  const targetY = target.y + FLOW_NODE_HEIGHT / 2;
+  const targetY = target.y + nodeHeight() / 2;
   const trunkBend = Math.max(18, (targetX - junctionX) / 2);
   const latest = lastSeenOf(allEdges);
   const tooltipParts = [
@@ -1144,6 +1388,7 @@ function buildEdgePlans(): EdgePlan[] {
   }
   respondedScope = computeRespondedScope();
   const positions = model.layout.positions;
+  const hierarchical = model.layout.mode === 'hierarchical';
   const groups = new Map<string, ForwardGroup>();
   const singles: SingleEdgeItem[] = [];
 
@@ -1162,9 +1407,10 @@ function buildEdgePlans(): EdgePlan[] {
     }
     const flowClass = flowClassFor(edge, sourceNode, targetNode);
     if (
+      hierarchical ||
       flowClass === 'receive' ||
       flowClass === 'neutral' ||
-      target.x < source.x + FLOW_NODE_WIDTH
+      target.x < source.x + source.width
     ) {
       singles.push({ edge, source, target, targetNode, flowClass });
       continue;
@@ -1183,7 +1429,9 @@ function buildEdgePlans(): EdgePlan[] {
     }
   }
 
-  const plans = singles.map((item) => buildSinglePlan(item));
+  const plans = singles.map((item) =>
+    hierarchical ? buildHierarchyPlan(item) : buildSinglePlan(item),
+  );
   for (const group of groups.values()) {
     plans.push(...buildForwardPlans(group));
   }
@@ -1239,6 +1487,7 @@ function renderGraph(): void {
   hoverText = '';
   hideTip();
   closeNodeMenu();
+  renderAxis();
   if (model === null) return;
 
   const defs = svgElement('defs');
@@ -1276,13 +1525,6 @@ function renderGraph(): void {
   nodeLayer = nodes;
   group.append(branches, trunks, nodes);
 
-  for (const layer of model.layout.layers) {
-    const tech = layerTech(model.snapshot, layer.type);
-    const layerLabel = layer.type === 'element' ? 'CONTROLES' : TYPE_LABEL[layer.type];
-    const caption = `${layerLabel} · ${String(layer.count)}${tech === null ? '' : ` · ${tech}`}`;
-    group.append(svgText('flow-layer-label', layer.x, 24, caption));
-  }
-
   edgePlans = buildEdgePlans();
   planById = new Map(edgePlans.map((plan) => [plan.id, plan]));
   applyFiltersAndSelection();
@@ -1305,13 +1547,16 @@ function createNodeGroup(placed: FlowPlacedNode): SVGGElement {
     group.classList.toggle('is-hidden', node.visible === false);
     group.classList.toggle('is-disabled', node.disabled === true);
   }
+  group.classList.toggle('is-compact', compactMode);
+  const width = placed.width;
+  const height = nodeHeight();
   group.append(
     svgElement('rect', {
       class: 'box',
       x: '0',
       y: '0',
-      width: String(FLOW_NODE_WIDTH),
-      height: String(FLOW_NODE_HEIGHT),
+      width: String(width),
+      height: String(height),
     }),
   );
   group.append(
@@ -1320,21 +1565,60 @@ function createNodeGroup(placed: FlowPlacedNode): SVGGElement {
       x: '0',
       y: '0',
       width: '3',
-      height: String(FLOW_NODE_HEIGHT),
+      height: String(height),
     }),
   );
-  group.append(svgText('type', 10, 14, nodeTypeLabel(node)));
-  const total = nodeCount(node);
-  if (total > 0) {
-    group.append(svgText('badge', FLOW_NODE_WIDTH - 8, 14, `${String(total)}×`));
-  }
-  const seen = node.firstSeen > 0 ? clock(node.firstSeen) : '';
-  group.append(svgText('title', 10, 28, truncate(node.title, 28)));
-  if (node.subtitle !== null && node.subtitle !== '') {
-    group.append(svgText('sub', 10, 41, truncate(node.subtitle, seen === '' ? 33 : 21)));
-  }
-  if (seen !== '') {
-    group.append(svgText('time', FLOW_NODE_WIDTH - 8, 41, seen));
+  const badge = badgeText(node);
+  const badgeWidth = badge === '' ? 0 : 8 + textWidth(badge, BADGE_FONT);
+  if (compactMode) {
+    const middle = height / 2 + 4;
+    const titleMax = width - CARD_TEXT_LEFT - CARD_TEXT_RIGHT - badgeWidth;
+    group.append(
+      svgText('title', CARD_TEXT_LEFT, middle, truncateToWidth(node.title, titleMax, TITLE_FONT)),
+    );
+    if (badge !== '') {
+      group.append(svgText('badge', width - CARD_TEXT_RIGHT, middle, badge));
+    }
+  } else {
+    const typeMax = width - CARD_TEXT_LEFT - CARD_TEXT_RIGHT - badgeWidth;
+    group.append(
+      svgText(
+        'type',
+        CARD_TEXT_LEFT,
+        14,
+        truncateToWidth(nodeTypeLabel(node), typeMax, TYPE_FONT, TYPE_LETTER_SPACING),
+      ),
+    );
+    if (badge !== '') {
+      group.append(svgText('badge', width - CARD_TEXT_RIGHT, 14, badge));
+    }
+    const seen = node.firstSeen > 0 ? clock(node.firstSeen) : '';
+    const timeWidth = seen === '' ? 0 : 8 + textWidth(seen, TIME_FONT);
+    group.append(
+      svgText(
+        'title',
+        CARD_TEXT_LEFT,
+        28,
+        truncateToWidth(node.title, width - CARD_TEXT_LEFT - CARD_TEXT_RIGHT, TITLE_FONT),
+      ),
+    );
+    if (node.subtitle !== null && node.subtitle !== '') {
+      group.append(
+        svgText(
+          'sub',
+          CARD_TEXT_LEFT,
+          41,
+          truncateToWidth(
+            node.subtitle,
+            width - CARD_TEXT_LEFT - CARD_TEXT_RIGHT - timeWidth,
+            SUB_FONT,
+          ),
+        ),
+      );
+    }
+    if (seen !== '') {
+      group.append(svgText('time', width - CARD_TEXT_RIGHT, 41, seen));
+    }
   }
   group.addEventListener('click', (event) => {
     event.stopPropagation();
@@ -1364,12 +1648,18 @@ function matchesSearch(node: FlowNode): boolean {
     node.selector,
     node.href,
     node.formAction,
-    node.type === 'element' ? nodeTypeLabel(node) : null,
+    nodeTypeLabel(node),
   ];
   for (const table of node.tablesRead ?? []) parts.push(table);
   for (const table of node.tablesWritten ?? []) parts.push(table);
   for (const hint of node.handlers ?? []) {
-    parts.push(hint.name, hint.source, hint.event);
+    parts.push(
+      hint.name,
+      hint.source,
+      hint.event,
+      hint.profile?.signature ?? null,
+      ...handlerProfileTags(hint.profile ?? null),
+    );
   }
   const status = requestStatus(node);
   if (status !== null) parts.push(status.search);
@@ -1494,6 +1784,111 @@ function syncTrafficButtons(): void {
   interacted.classList.toggle('is-on', trafficMode === 'interacted');
   all.setAttribute('aria-pressed', trafficMode === 'all' ? 'true' : 'false');
   interacted.setAttribute('aria-pressed', trafficMode === 'interacted' ? 'true' : 'false');
+}
+
+function syncOrderButtons(): void {
+  const chrono = document.getElementById('map-order-chrono');
+  const structural = document.getElementById('map-order-structural');
+  const hierarchy = document.getElementById('map-order-hierarchy');
+  chrono?.classList.toggle('is-on', layoutMode === 'chronological');
+  chrono?.setAttribute('aria-pressed', layoutMode === 'chronological' ? 'true' : 'false');
+  structural?.classList.toggle('is-on', layoutMode === 'structural');
+  structural?.setAttribute('aria-pressed', layoutMode === 'structural' ? 'true' : 'false');
+  hierarchy?.classList.toggle('is-on', layoutMode === 'hierarchical');
+  hierarchy?.setAttribute('aria-pressed', layoutMode === 'hierarchical' ? 'true' : 'false');
+}
+
+function setLayoutMode(mode: FlowLayoutMode): void {
+  if (layoutMode === mode) return;
+  layoutMode = mode;
+  syncOrderButtons();
+  if (!state.open || model === null) {
+    renderStatus();
+    return;
+  }
+  const scope = scopeForView();
+  applyDisplayScope(scope);
+  renderGraph();
+  if (scope === null) {
+    fitView();
+  } else {
+    fitToNodes([...scope]);
+  }
+  renderStatus();
+}
+
+function syncCompact(): void {
+  const box = document.getElementById('map-compact') as HTMLInputElement | null;
+  if (box !== null) box.checked = compactMode;
+}
+
+function setCompactMode(next: boolean): void {
+  if (compactMode === next) return;
+  compactMode = next;
+  syncCompact();
+  if (!state.open || model === null) {
+    renderStatus();
+    return;
+  }
+  const scope = scopeForView();
+  applyDisplayScope(scope);
+  renderGraph();
+  if (scope === null) {
+    fitView();
+  } else {
+    fitToNodes([...scope]);
+  }
+  renderStatus();
+}
+
+function scheduleColumnRelayout(): void {
+  if (columnFrame !== 0) return;
+  columnFrame = requestAnimationFrame(() => {
+    columnFrame = 0;
+    if (!state.open || model === null) return;
+    applyDisplayScope(scopeForView());
+    renderGraph();
+  });
+}
+
+function setColumnWidth(type: FlowNodeType, width: number): void {
+  const next = Math.round(clamp(width, COLUMN_WIDTH_MIN, COLUMN_WIDTH_MAX));
+  if (columnWidths.get(type) === next) return;
+  columnWidths.set(type, next);
+  scheduleColumnRelayout();
+}
+
+function resetColumnWidth(type: FlowNodeType): void {
+  if (!columnWidths.delete(type)) return;
+  scheduleColumnRelayout();
+}
+
+function beginColumnResize(type: FlowNodeType, startClientX: number): void {
+  if (model === null) return;
+  if (columnResize !== null) endColumnResize();
+  const layer = model.layout.layers.find((entry) => entry.type === type);
+  columnResize = { type, startClientX, startWidth: layer?.width ?? CARD_WIDTH_MIN };
+  document.body.classList.add('is-column-resizing');
+  window.addEventListener('pointermove', moveColumnResize);
+  window.addEventListener('pointerup', endColumnResize);
+  window.addEventListener('pointercancel', endColumnResize);
+  window.addEventListener('blur', endColumnResize);
+}
+
+function moveColumnResize(event: PointerEvent): void {
+  if (columnResize === null) return;
+  event.preventDefault();
+  const delta = (event.clientX - columnResize.startClientX) / Math.max(view.k, 0.01);
+  setColumnWidth(columnResize.type, columnResize.startWidth + delta);
+}
+
+function endColumnResize(): void {
+  columnResize = null;
+  document.body.classList.remove('is-column-resizing');
+  window.removeEventListener('pointermove', moveColumnResize);
+  window.removeEventListener('pointerup', endColumnResize);
+  window.removeEventListener('pointercancel', endColumnResize);
+  window.removeEventListener('blur', endColumnResize);
 }
 
 function setTrafficMode(mode: TrafficMode): void {
@@ -1841,6 +2236,11 @@ function renderDetail(node: FlowNode): void {
   }
   detail.append(chips);
 
+  if (node.type === 'structure' || node.type === 'asset') {
+    addRow(detail, 'Selector', node.selector ?? null);
+    if (node.type === 'asset') addRow(detail, 'Archivo', node.href ?? null);
+  }
+
   if (node.type === 'element') {
     addRow(detail, 'Selector', node.selector ?? null);
     addRow(detail, 'Destino del enlace', node.href ?? null);
@@ -1851,9 +2251,11 @@ function renderDetail(node: FlowNode): void {
     }
     if (node.disabled === true) addRow(detail, 'Estado', 'deshabilitado');
     if (node.visible === false) addRow(detail, 'Estado', 'oculto en el DOM');
-    const handlers = (node.handlers ?? []).map(
-      (hint) => `${eventLabel(hint.event)} → ${hint.name ?? 'anónimo'} (${hint.source})`,
-    );
+    const handlers = (node.handlers ?? []).map((hint) => {
+      const tags = handlerProfileTags(hint.profile ?? null);
+      const suffix = tags.length === 0 ? '' : ` · ${tags.join(' · ')}`;
+      return `${eventLabel(hint.event)} → ${handlerLabel(hint.name, hint.profile ?? null)}${suffix} (${hint.source})`;
+    });
     addListRow(detail, 'Manejadores', handlers, null);
     addRow(detail, 'Eventos', eventSummary(node));
     addListRow(
@@ -1973,7 +2375,12 @@ function renderDetail(node: FlowNode): void {
 }
 
 function pageSelector(node: FlowNode | undefined): string | null {
-  if (node === undefined || node.type !== 'element') return null;
+  if (
+    node === undefined ||
+    (node.type !== 'element' && node.type !== 'structure' && node.type !== 'asset')
+  ) {
+    return null;
+  }
   const selector = node.selector;
   return typeof selector === 'string' && selector !== '' ? selector : null;
 }
@@ -2004,7 +2411,8 @@ function highlightInPage(node: FlowNode): void {
   if (target === null) return;
   const selector = pageSelector(target);
   if (selector === null) return;
-  const key = target.id.startsWith('element:') ? target.id.slice('element:'.length) : null;
+  const prefix = `${target.type}:`;
+  const key = target.id.startsWith(prefix) ? target.id.slice(prefix.length) : null;
   ipcRenderer.send(BROWSER_PANEL_CHANNELS.highlight, { key, selector });
 }
 
@@ -2239,14 +2647,14 @@ function applyDisplayScope(scope: Set<string> | null): void {
   if (scope === null) {
     model.viewNodes = model.snapshot.nodes;
     model.viewEdges = model.snapshot.edges;
-    model.layout = layoutFlow(model.snapshot);
+    model.layout = layoutFlow(model.snapshot, layoutMode, layoutOptions());
     return;
   }
   const nodes = model.snapshot.nodes.filter((node) => scope.has(node.id));
   const edges = model.snapshot.edges.filter((edge) => scope.has(edge.from) && scope.has(edge.to));
   model.viewNodes = nodes;
   model.viewEdges = edges;
-  model.layout = layoutFlow({ ...model.snapshot, nodes, edges });
+  model.layout = layoutFlow({ ...model.snapshot, nodes, edges }, layoutMode, layoutOptions());
 }
 
 function hideSearchResults(): void {
@@ -2443,9 +2851,14 @@ function renderStats(): void {
     return;
   }
   const data = snapshot.stats;
+  const structures = snapshot.nodes.filter((node) => node.type === 'structure').length;
+  const assets = snapshot.nodes.filter((node) => node.type === 'asset').length;
   const parts = [
     `${String(data.interactions)} interacciones`,
+    `${String(data.files)} archivos`,
     `${String(data.controls)} controles`,
+    `${String(structures)} estructuras`,
+    `${String(assets)} recursos CSS/JS`,
     `${String(data.forms)} formularios`,
     `${String(data.clicks)} clics`,
     `${String(data.requests)} peticiones`,
@@ -2511,6 +2924,18 @@ function renderStatus(): void {
   if (!state.open) return;
   if (state.error !== null) {
     addStatusBox(`Error al construir el mapa: ${state.error}`, 'is-error');
+  }
+  if (layoutMode === 'structural' && !state.building) {
+    addStatusBox(
+      'Orden estructural: mismas columnas por categoría, filas ordenadas por archivo, línea y posición en el DOM.',
+      '',
+    );
+  }
+  if (layoutMode === 'hierarchical' && !state.building) {
+    addStatusBox(
+      'Orden jerárquico: cada archivo agrupa sus nodos y cada padre abre a sus hijos a izquierda y derecha; las flechas bajan por la cadena de evidencia.',
+      '',
+    );
   }
   if (state.building) {
     addStatusBox(
@@ -2636,6 +3061,9 @@ interface StackStage {
 
 function stackStages(snapshot: FlowSnapshot): StackStage[] {
   const counts: Record<FlowNodeType, number> = {
+    file: 0,
+    structure: 0,
+    asset: 0,
     element: 0,
     handler: 0,
     request: 0,
@@ -2661,7 +3089,7 @@ function stackStages(snapshot: FlowSnapshot): StackStage[] {
       tech: 'HTML',
       meta: pageMeta,
       title: 'Página HTML inspeccionada',
-      types: ['element'],
+      types: ['structure', 'asset', 'element'],
       missing: false,
       runtime: interactions > 0,
     },
@@ -2805,6 +3233,7 @@ function applyFlowMapState(next: FlowMapState): void {
   state = next;
   setOpenUi(state.open);
   if (!state.open) {
+    endColumnResize();
     hideTip();
     closeNodeMenu();
     renderStats();
@@ -2832,6 +3261,7 @@ function applyFlowMapState(next: FlowMapState): void {
     hideTip();
     closeNodeMenu();
     svgById('map-svg').replaceChildren();
+    renderAxis();
     if (selectedId !== null || focusScope !== null) {
       selectedId = null;
       selectionHighlight = false;
@@ -2950,6 +3380,21 @@ function initFlowMap(): void {
   element<HTMLButtonElement>('map-scope-interacted').addEventListener('click', () => {
     setTrafficMode('interacted');
   });
+  element<HTMLButtonElement>('map-order-chrono').addEventListener('click', () => {
+    setLayoutMode('chronological');
+  });
+  element<HTMLButtonElement>('map-order-structural').addEventListener('click', () => {
+    setLayoutMode('structural');
+  });
+  element<HTMLButtonElement>('map-order-hierarchy').addEventListener('click', () => {
+    setLayoutMode('hierarchical');
+  });
+  syncOrderButtons();
+  const compactBox = element<HTMLInputElement>('map-compact');
+  compactBox.addEventListener('change', () => {
+    setCompactMode(compactBox.checked);
+  });
+  syncCompact();
 
   search.addEventListener('input', () => {
     searchTerm = normalizeSearchText(search.value.trim());
@@ -3036,7 +3481,7 @@ function initFlowMap(): void {
     { passive: false },
   );
   svg.addEventListener('pointermove', (event) => {
-    if (!state.open || pan !== null) return;
+    if (!state.open || pan !== null || columnResize !== null) return;
     trackHover(event);
   });
   svg.addEventListener('pointerleave', () => {
@@ -3095,7 +3540,7 @@ function initFlowMap(): void {
     if (svg.hasPointerCapture(event.pointerId)) {
       svg.releasePointerCapture(event.pointerId);
     }
-    if (!moved) clearSelection();
+    if (!moved && focusScope === null) clearSelection();
   };
   svg.addEventListener('pointerup', endPan);
   svg.addEventListener('pointercancel', endPan);

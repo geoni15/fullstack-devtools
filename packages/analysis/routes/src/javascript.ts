@@ -32,10 +32,37 @@ interface FunctionLocation {
 
 interface HandlerLocation {
   name: string | null;
+  signature: string | null;
   line: number;
   endLine: number;
   resolved: boolean;
   note: string | null;
+}
+
+const MAX_SIGNATURE_CHARS = 160;
+
+function clipSignature(value: string): string {
+  return value.length > MAX_SIGNATURE_CHARS ? `${value.slice(0, MAX_SIGNATURE_CHARS)}…` : value;
+}
+
+function signatureOfHandler(node: Node): string | null {
+  const text = node.text.replace(/\s+/g, ' ').trim();
+  if (text === '') {
+    return null;
+  }
+  const arrow = /^(async\s+)?(?:\(([^)]*)\)|([A-Za-z0-9_$]+))\s*=>/.exec(text);
+  if (arrow !== null) {
+    const prefix = arrow[1] ?? '';
+    const params = (arrow[2] ?? arrow[3] ?? '').trim();
+    return clipSignature(
+      arrow[2] === undefined ? `${prefix}${params} =>` : `${prefix}(${params}) =>`,
+    );
+  }
+  const declared = /^(async\s+)?function\s*\*?\s*[A-Za-z0-9_$]*\s*\(([^)]*)\)/.exec(text);
+  if (declared !== null) {
+    return clipSignature(`${declared[1] ?? ''}function (${(declared[2] ?? '').trim()})`);
+  }
+  return null;
 }
 
 function pathValue(node: Node | null): string | null {
@@ -85,6 +112,7 @@ function resolveHandler(argument: Node, functions: Map<string, FunctionLocation>
     if (found !== undefined) {
       return {
         name: argument.text,
+        signature: null,
         line: found.line,
         endLine: found.endLine,
         resolved: true,
@@ -93,6 +121,7 @@ function resolveHandler(argument: Node, functions: Map<string, FunctionLocation>
     }
     return {
       name: argument.text,
+      signature: null,
       line: argument.startPosition.row + 1,
       endLine: argument.endPosition.row + 1,
       resolved: false,
@@ -106,6 +135,7 @@ function resolveHandler(argument: Node, functions: Map<string, FunctionLocation>
   ) {
     return {
       name: null,
+      signature: signatureOfHandler(argument),
       line: argument.startPosition.row + 1,
       endLine: argument.endPosition.row + 1,
       resolved: true,
@@ -117,6 +147,7 @@ function resolveHandler(argument: Node, functions: Map<string, FunctionLocation>
     const name = parts[parts.length - 1] ?? null;
     return {
       name,
+      signature: null,
       line: argument.startPosition.row + 1,
       endLine: argument.endPosition.row + 1,
       resolved: false,
@@ -125,6 +156,7 @@ function resolveHandler(argument: Node, functions: Map<string, FunctionLocation>
   }
   return {
     name: null,
+    signature: null,
     line: argument.startPosition.row + 1,
     endLine: argument.endPosition.row + 1,
     resolved: false,
@@ -247,6 +279,7 @@ export function extractJavaScriptRoutes(input: ParsedSource): StaticRoute[] {
       method: method === 'del' ? 'DELETE' : method.toUpperCase(),
       path: routePath,
       handlerName: handler.name,
+      handlerSignature: handler.signature,
       file: input.filePath,
       line: handler.line,
       endLine: handler.endLine,

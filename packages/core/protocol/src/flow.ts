@@ -1,7 +1,22 @@
-import type { InspectionSqlOperation, RequestOrigin, RequestOutcome } from './browser';
+import type {
+  HandlerProfile,
+  InspectionSqlOperation,
+  RequestOrigin,
+  RequestOutcome,
+} from './browser';
 
 export type FlowNodeType =
-  'element' | 'handler' | 'request' | 'route' | 'function' | 'query' | 'table' | 'database';
+  | 'file'
+  | 'structure'
+  | 'asset'
+  | 'element'
+  | 'handler'
+  | 'request'
+  | 'route'
+  | 'function'
+  | 'query'
+  | 'table'
+  | 'database';
 
 export type FlowEdgeType =
   | 'TRIGGERS'
@@ -23,6 +38,8 @@ export type FlowEvidenceKind = 'STATIC' | 'RUNTIME';
 export type FlowCorrelation = 'direct' | 'heuristic';
 
 export type FlowElementKind =
+  | 'structure'
+  | 'asset'
   | 'button'
   | 'link'
   | 'input'
@@ -55,6 +72,7 @@ export interface FlowHandlerHint {
   event: string;
   name: string | null;
   source: string;
+  profile?: HandlerProfile | null;
 }
 
 export interface FlowNodeEvent {
@@ -99,6 +117,7 @@ export interface FlowNode {
   database?: string | null;
   kind?: FlowElementKind | null;
   selector?: string | null;
+  pageUrl?: string | null;
   href?: string | null;
   formAction?: string | null;
   formMethod?: string | null;
@@ -124,6 +143,7 @@ export interface FlowEdge {
 
 export interface FlowStats {
   clicks: number;
+  files: number;
   requests: number;
   externalRequests: number;
   preflightRequests: number;

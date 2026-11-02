@@ -1,6 +1,7 @@
 import type { Debugger as CdpDebugger } from 'electron';
 import type {
   FlowInteractionEvent,
+  HandlerProfile,
   HandlerSource,
   InspectionCodeBlock,
   InspectionElement,
@@ -8,6 +9,12 @@ import type {
   InspectionMode,
 } from '@bdt/protocol';
 import type { Logger } from '../logger';
+import {
+  HANDLER_PROFILE_CALL_SOURCE,
+  HANDLER_PROFILE_HELPER_SOURCE,
+  parseHandlerProfile,
+  profileFromSource,
+} from './handler-profile';
 import {
   PAGE_DOM_HELPERS_SOURCE,
   isFlowInteractionEvent,
@@ -825,24 +832,9 @@ function () {
 
 const HINT_FUNCTION = String.raw`
 function (eventType) {
+  ${HANDLER_PROFILE_HELPER_SOURCE}
   const prop = 'on' + eventType.charAt(0).toUpperCase() + eventType.slice(1);
-  const result = { kind: null, name: null, source: null };
-  const describe = (fn) => {
-    let name = null;
-    try {
-      name = typeof fn.name === 'string' && fn.name !== '' ? fn.name : null;
-    } catch (error) {
-      void error;
-    }
-    let source = null;
-    try {
-      const text = Function.prototype.toString.call(fn);
-      if (text.trim() !== '') source = text.slice(0, 6000);
-    } catch (error) {
-      void error;
-    }
-    return { name, source };
-  };
+  const result = { kind: null, name: null, source: null, profile: null };
   let keys = [];
   try {
     keys = Object.keys(this);
@@ -855,10 +847,11 @@ function (eventType) {
         const props = this[key];
         const fn = props ? props[prop] : null;
         if (typeof fn === 'function') {
-          const info = describe(fn);
+          const info = profileOfHandler(fn);
           result.kind = 'react';
           result.name = info.name;
           result.source = info.source;
+          result.profile = info.profile;
           return result;
         }
       } catch (error) {
@@ -878,10 +871,11 @@ function (eventType) {
                 ? entry.value
                 : null;
           if (fn !== null) {
-            const info = describe(fn);
+            const info = profileOfHandler(fn);
             result.kind = 'vue';
             result.name = info.name;
             result.source = info.source;
+            result.profile = info.profile;
             return result;
           }
         }
@@ -898,33 +892,19 @@ const CANCELLED_ERROR = 'Object id does not exist';
 
 const FIBER_HINT_FUNCTION = String.raw`
 function (eventType) {
+  ${HANDLER_PROFILE_HELPER_SOURCE}
   const prop = 'on' + eventType.charAt(0).toUpperCase() + eventType.slice(1);
-  const result = { kind: null, name: null, source: null };
-  const describe = (fn) => {
-    let name = null;
-    try {
-      name = typeof fn.name === 'string' && fn.name !== '' ? fn.name : null;
-    } catch (error) {
-      void error;
-    }
-    let source = null;
-    try {
-      const text = Function.prototype.toString.call(fn);
-      if (text.trim() !== '') source = text.slice(0, 6000);
-    } catch (error) {
-      void error;
-    }
-    return { name, source };
-  };
+  const result = { kind: null, name: null, source: null, profile: null };
   const readProps = (props) => {
     if (!props || typeof props !== 'object') return false;
     let fn = null;
     try { fn = props[prop]; } catch (error) { fn = null; }
     if (typeof fn !== 'function') return false;
-    const info = describe(fn);
+    const info = profileOfHandler(fn);
     result.kind = 'react';
     result.name = info.name;
     result.source = info.source;
+    result.profile = info.profile;
     return true;
   };
   let keys = [];
@@ -950,10 +930,11 @@ function (eventType) {
       let fn = null;
       try { fn = props[prop]; } catch (error) { fn = null; }
       if (typeof fn === 'function') {
-        const info = describe(fn);
+        const info = profileOfHandler(fn);
         result.kind = 'vue';
         result.name = info.name;
         result.source = info.source;
+        result.profile = info.profile;
         return result;
       }
     }
@@ -1307,6 +1288,7 @@ interface HintValue {
   kind: 'react' | 'vue' | null;
   name: string | null;
   source: string | null;
+  profile: HandlerProfile | null;
 }
 
 function hintHandler(eventType: 'click' | 'submit', hint: HintValue): InspectionHandler {
@@ -1323,6 +1305,7 @@ function hintHandler(eventType: 'click' | 'submit', hint: HintValue): Inspection
       hint.source === null
         ? null
         : functionCodeBlock(hint.source, kind === 'react' ? '(React)' : '(Vue)'),
+    profile: hint.profile,
   };
 }
 
@@ -1334,6 +1317,7 @@ function parseHintValue(value: unknown): HintValue | null {
     kind,
     name: cleanString(record.name, 120),
     source: cleanString(record.source, MAX_HANDLER_SOURCE),
+    profile: parseHandlerProfile(record.profile),
   };
 }
 
@@ -2560,6 +2544,11 @@ export class ClickInspector {
             nameFromDescription(candidate.handler?.description) ??
             (source === null ? null : nameFromSource(source, candidate, script));
           if (name !== null && INTERNAL_HANDLER_NAMES.has(name)) continue;
+          const profile = await this.profileHandlerObject(
+            target,
+            candidate.handler?.objectId,
+            source,
+          );
           const notes: string[] = [];
           if (candidate.passive) notes.push('Listener pasivo');
           if (script === undefined) notes.push('Sin ubicación en el código');
@@ -2579,6 +2568,7 @@ export class ClickInspector {
             source: 'listener',
             note: notes.length > 0 ? notes.join(' · ') : null,
             code: source === null ? null : listenerCodeBlock(source, candidate, script),
+            profile,
           };
         }
       } finally {
@@ -2586,6 +2576,31 @@ export class ClickInspector {
       }
     }
     return null;
+  }
+
+  private async profileHandlerObject(
+    target: CdpDebugger,
+    objectId: string | undefined,
+    source: string | null,
+  ): Promise<HandlerProfile | null> {
+    if (objectId !== undefined) {
+      try {
+        const response = (await target.sendCommand('Runtime.callFunctionOn', {
+          objectId,
+          functionDeclaration: HANDLER_PROFILE_CALL_SOURCE,
+          returnByValue: true,
+          silent: true,
+        })) as { result?: { value?: unknown } };
+        const profile = parseHandlerProfile(response.result?.value);
+        if (profile !== null) return profile;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes(CANCELLED_ERROR)) {
+          this.log.debug('No se pudo perfilar el listener', { message });
+        }
+      }
+    }
+    return profileFromSource(source);
   }
 
   private async scriptSource(target: CdpDebugger, scriptId: string): Promise<string | null> {

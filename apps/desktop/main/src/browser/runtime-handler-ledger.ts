@@ -1,4 +1,4 @@
-import type { HandlerSource } from '@bdt/protocol';
+import type { HandlerProfile, HandlerSource } from '@bdt/protocol';
 import type { PageElementRef } from './page-inventory';
 
 export interface RuntimeHandlerLink {
@@ -9,6 +9,7 @@ export interface RuntimeHandlerLink {
   line: number | null;
   column: number | null;
   source: HandlerSource;
+  profile: HandlerProfile | null;
   note: string | null;
   at: number;
 }
@@ -25,6 +26,7 @@ export class RuntimeHandlerLedger {
       String(link.column ?? ''),
       link.source,
       link.name ?? '',
+      link.profile?.signature ?? '',
     ].join('\u0000');
     const existing = this.links.get(key);
     if (existing === undefined) {
@@ -34,6 +36,7 @@ export class RuntimeHandlerLedger {
     existing.element = link.element;
     existing.at = Math.max(existing.at, link.at);
     existing.note = link.note ?? existing.note;
+    existing.profile = link.profile ?? existing.profile;
     return false;
   }
 

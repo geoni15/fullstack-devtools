@@ -16,6 +16,7 @@ export const IPC_CHANNELS = {
   browserClearRequests: 'browser:clear-requests',
   browserSetInspection: 'browser:set-inspection',
   browserFocus: 'browser:focus',
+  browserSecurityScan: 'browser:security-scan',
   browserEvent: 'browser:event',
 } as const;
 

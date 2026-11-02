@@ -15,7 +15,7 @@ import type {
   InspectionSqlQuery,
   RequestOutcome,
 } from '@bdt/protocol';
-import { requestStatusView } from '@bdt/protocol';
+import { handlerLabel, handlerProfileTags, requestStatusView } from '@bdt/protocol';
 import { matchRoute, type StaticRoute } from '@bdt/routes-index';
 import { pickDatabaseHint } from './database-hints';
 import type { FlowTrace, FlowTraceHandler, FlowTraceQuery } from './flow-ledger';
@@ -25,6 +25,7 @@ import type { RuntimeHandlerLink } from './runtime-handler-ledger';
 import type { RuntimeProvenanceLink } from './runtime-link-ledger';
 import { normalizeSqlText, staticQueriesForRoute } from './sql-queries';
 import type { DatabaseHint } from './routes';
+import { createWorkspaceFileIndex } from './workspace-file-index';
 
 export interface FlowGraphInput {
   traces: FlowTrace[];
@@ -34,6 +35,7 @@ export interface FlowGraphInput {
   revision: number;
   frontend: string | null;
   workspaceOpen: boolean;
+  workspaceFiles?: readonly string[];
   inventory: PageControl[];
   interactions: FlowInteractionSummary[];
   references: PageElementRef[];
@@ -73,6 +75,8 @@ const FRAMEWORK_LABEL: Record<string, string> = {
 const SUFFIX_NOTE = 'coincidencia por sufijo';
 
 const KIND_LABEL: Record<FlowElementKind, string> = {
+  structure: 'estructura',
+  asset: 'recurso',
   button: 'botón',
   link: 'enlace',
   input: 'campo',
@@ -197,6 +201,25 @@ function clipText(value: string, max: number): string {
   return `${clean.slice(0, Math.max(1, max - 1))}…`;
 }
 
+function relativeWorkspacePath(value: string | null | undefined): string | null {
+  if (value === null || value === undefined) return null;
+  const clean = value
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\/+/, '');
+  if (clean === '' || clean === '..' || clean.startsWith('../')) return null;
+  if (clean.startsWith('/')) return null;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(clean)) return null;
+  return clean.replace(/\/+/g, '/');
+}
+
+function rootStructureSelector(selector: string | null | undefined): boolean {
+  if (selector === null || selector === undefined) return false;
+  const clean = selector.startsWith('shadow>') ? selector.slice('shadow>'.length) : selector;
+  if (clean.includes('>')) return false;
+  return clean === 'html' || clean.startsWith('html:');
+}
+
 export function routeNodeId(
   route: Pick<StaticRoute, 'method' | 'path' | 'file' | 'routeLine'>,
 ): string {
@@ -301,10 +324,24 @@ function elementSubtitle(element: ElementDetail): string {
 }
 
 function refNodeId(ref: PageElementRef): string {
+  if (ref.kind === 'structure') return `structure:${ref.key}`;
+  if (ref.kind === 'asset') return `asset:${ref.key}`;
   return `element:${ref.key}`;
 }
 
 function controlSubtitle(control: PageControl): string {
+  if (control.kind === 'structure') {
+    const parts = ['estructura DOM', `<${control.tag}>`];
+    if (!control.visible) parts.push('sin caja visible');
+    return parts.join(' · ');
+  }
+  if (control.kind === 'asset') {
+    const parts = [KIND_LABEL[control.kind], `<${control.tag}>`];
+    if (control.role !== null && control.role !== '') parts.push(control.role);
+    if (control.inputType !== null && control.inputType !== '') parts.push(control.inputType);
+    if (control.href !== null && control.href !== '') parts.push(control.href);
+    return parts.join(' · ');
+  }
   const parts = [KIND_LABEL[control.kind], `<${control.tag}>`];
   if (control.inputType !== null && control.inputType !== '') parts.push(control.inputType);
   if (control.role !== null && control.role !== '') parts.push(control.role);
@@ -320,13 +357,15 @@ function controlSubtitle(control: PageControl): string {
 }
 
 function declaredHandlerId(control: PageControl, hint: PageHandlerHint): string {
-  const name = hint.name ?? 'anónimo';
+  const name = hint.name ?? hint.profile?.signature ?? 'anónimo';
   return `handler:declared:${hint.source}:${hint.event}:${name}:${control.key}`;
 }
 
 function handlerHintLabel(hint: PageHandlerHint): string {
-  const name = hint.name ?? 'función anónima';
-  return `${name} · ${hint.source} · ${hint.event}`;
+  const name = handlerLabel(hint.name, hint.profile);
+  const tags = handlerProfileTags(hint.profile);
+  const suffix = tags.length === 0 ? '' : ` · ${tags.join(' · ')}`;
+  return `${name} · ${hint.source} · ${hint.event}${suffix}`;
 }
 
 function isSubmitControl(control: PageElementRef): boolean {
@@ -345,16 +384,20 @@ function handlerNodeIdFor(handler: FlowTraceHandler, traceId: string): string {
   if (handler.name !== null) {
     return `handler:${handler.source}:${handler.event}:${handler.name}`;
   }
+  if (handler.profile?.signature !== null && handler.profile?.signature !== undefined) {
+    return `handler:${handler.source}:${handler.event}:${handler.profile.signature}`;
+  }
   return `handler:trace:${traceId}`;
 }
 
 function handlerTitle(handler: FlowTraceHandler): string {
-  if (handler.name !== null && handler.name !== '') return handler.name;
-  return `Listener ${handler.event} sin nombre`;
+  return handlerLabel(handler.name, handler.profile, `Listener ${handler.event}`);
 }
 
 function handlerSubtitle(handler: FlowTraceHandler): string {
   const parts: string[] = [handler.source, handler.event];
+  const tags = handlerProfileTags(handler.profile);
+  if (tags.length > 0) parts.push(tags.join(' · '));
   if (handler.url !== null) {
     parts.push(handler.line === null ? handler.url : `${handler.url}:${String(handler.line)}`);
   }
@@ -497,6 +540,7 @@ class FlowGraphBuilder {
     this.projectRuntimeHandlers();
     this.projectHandlerInitiators();
     this.projectContainment();
+    this.projectSourceFiles();
     this.finalizeNodeNotes();
     return {
       revision: this.input.revision,
@@ -569,7 +613,7 @@ class FlowGraphBuilder {
       const routeNode = baseNode(routeId, 'route', `${route.method.toUpperCase()} ${route.path}`, [
         'STATIC',
       ]);
-      routeNode.subtitle = `${route.framework} · ${route.handlerName ?? 'sin nombre'} · ${route.file}:${String(route.line)}`;
+      routeNode.subtitle = `${route.framework} · ${route.handlerName ?? route.handlerSignature ?? 'sin nombre'} · ${route.file}:${String(route.line)}`;
       routeNode.file = route.file;
       routeNode.line = route.line;
       routeNode.endLine = route.endLine;
@@ -596,7 +640,7 @@ class FlowGraphBuilder {
         const functionNode = baseNode(
           functionId,
           'function',
-          route.handlerName ?? 'Función anónima',
+          route.handlerName ?? route.handlerSignature ?? 'Manejador sin nombre',
           ['STATIC'],
         );
         functionNode.subtitle = `${route.file}:${String(route.line)}-${String(route.endLine)}`;
@@ -617,11 +661,14 @@ class FlowGraphBuilder {
 
   private projectInventory(resolved: ReadonlySet<string>): void {
     for (const control of this.input.inventory) {
+      const nodeType: FlowNodeType =
+        control.kind === 'structure' ? 'structure' : control.kind === 'asset' ? 'asset' : 'element';
       const id = refNodeId(control);
-      const node = baseNode(id, 'element', elementTitle(control), ['STATIC']);
+      const node = baseNode(id, nodeType, elementTitle(control), ['STATIC']);
       node.subtitle = controlSubtitle(control);
       node.kind = control.kind;
       node.selector = control.selector;
+      node.pageUrl = control.pageUrl;
       node.href = control.href;
       node.formAction = control.formAction;
       node.formMethod = control.formMethod;
@@ -629,15 +676,23 @@ class FlowGraphBuilder {
       node.disabled = control.disabled;
       node.visible = control.visible;
       node.occurrences = 0;
-      node.handlers = control.handlers.map((hint) => ({
-        event: hint.event,
-        name: hint.name,
-        source: hint.source,
-      }));
-      if (control.kind === 'form' && control.formAction === null && control.handlers.length === 0) {
-        node.note = 'Formulario sin action ni manejador declarado.';
+      if (nodeType === 'element') {
+        node.handlers = control.handlers.map((hint) => ({
+          event: hint.event,
+          name: hint.name,
+          source: hint.source,
+          profile: hint.profile,
+        }));
+        if (
+          control.kind === 'form' &&
+          control.formAction === null &&
+          control.handlers.length === 0
+        ) {
+          node.note = 'Formulario sin action ni manejador declarado.';
+        }
       }
       this.addNode(node);
+      if (nodeType !== 'element') continue;
 
       for (const hint of control.handlers) {
         if (resolved.has(`${control.key}|${hint.event}`)) continue;
@@ -645,7 +700,7 @@ class FlowGraphBuilder {
         const handlerNode = baseNode(
           handlerId,
           'handler',
-          hint.name ?? `Listener ${hint.event} sin nombre`,
+          handlerLabel(hint.name, hint.profile, `Listener ${hint.event}`),
           ['STATIC'],
         );
         handlerNode.subtitle = handlerHintLabel(hint);
@@ -766,6 +821,7 @@ class FlowGraphBuilder {
     node.subtitle = elementSubtitle(ref);
     node.kind = ref.kind;
     node.selector = ref.selector;
+    node.pageUrl = ref.pageUrl;
     node.href = ref.href;
     node.formAction = ref.formAction;
     node.formMethod = ref.formMethod;
@@ -954,63 +1010,134 @@ class FlowGraphBuilder {
     }
   }
 
-  private selectorAncestor(parent: FlowNode, child: FlowNode): boolean {
-    const parentSelector = parent.selector;
-    const childSelector = child.selector;
-    if (parentSelector === undefined || parentSelector === null || parentSelector === '') {
-      return false;
-    }
-    if (childSelector === undefined || childSelector === null || childSelector === '') {
-      return false;
-    }
-    if (parentSelector === childSelector) return false;
-    if (parentSelector === 'document') return childSelector !== 'document';
-    return childSelector.startsWith(`${parentSelector}>`);
-  }
-
   private projectContainment(): void {
-    const elements: FlowNode[] = [];
+    const groups = new Map<string, FlowNode[]>();
     for (const node of this.nodes.values()) {
-      if (node.type !== 'element') continue;
+      if (node.type !== 'element' && node.type !== 'structure' && node.type !== 'asset') continue;
       if (node.selector === undefined || node.selector === null || node.selector === '') continue;
-      elements.push(node);
+      const page = node.pageUrl ?? '';
+      const group = groups.get(page);
+      if (group === undefined) {
+        groups.set(page, [node]);
+      } else {
+        group.push(node);
+      }
     }
-    if (elements.length < 2) return;
-    const connected = new Set<string>();
-    for (const edge of this.edges.values()) {
-      connected.add(edge.from);
-      connected.add(edge.to);
-    }
-    const isolated = elements.filter((node) => !connected.has(node.id));
-    for (const node of isolated) {
-      let ancestor: FlowNode | null = null;
-      let descendant: FlowNode | null = null;
-      for (const other of elements) {
-        if (other.id === node.id || !connected.has(other.id)) continue;
-        if (this.selectorAncestor(other, node)) {
-          if (
-            ancestor === null ||
-            (other.selector?.length ?? 0) > (ancestor.selector?.length ?? 0)
-          ) {
-            ancestor = other;
-          }
-          continue;
-        }
-        if (!this.selectorAncestor(node, other)) continue;
-        if (
-          descendant === null ||
-          (other.selector?.length ?? 0) < (descendant.selector?.length ?? 0)
-        ) {
-          descendant = other;
+    for (const group of groups.values()) {
+      if (group.length < 2) continue;
+      const bySelector = new Map<string, FlowNode>();
+      for (const node of group) {
+        if (node.selector !== undefined && node.selector !== null) {
+          bySelector.set(node.selector, node);
         }
       }
-      const parent = ancestor ?? node;
-      const child = ancestor === null ? descendant : node;
-      if (child === null) continue;
-      this.addEdge('CONTAINS', parent.id, child.id, ['RUNTIME'], 'direct', {
-        note: 'Contención en el DOM; no implica flujo de datos.',
+      for (const node of group) {
+        const selector = node.selector;
+        if (selector === undefined || selector === null) continue;
+        let parent: FlowNode | null = null;
+        let index = selector.lastIndexOf('>');
+        while (index > 0) {
+          const candidate = bySelector.get(selector.slice(0, index));
+          if (candidate !== undefined && candidate.id !== node.id && candidate.type !== 'asset') {
+            parent = candidate;
+            break;
+          }
+          index = selector.lastIndexOf('>', index - 1);
+        }
+        if (parent === null && selector !== 'document') {
+          const page = bySelector.get('document');
+          if (page !== undefined && page.id !== node.id && page.type !== 'asset') {
+            parent = page;
+          }
+        }
+        if (parent === null) continue;
+        const evidence: FlowEvidenceKind[] = node.evidence.includes('RUNTIME')
+          ? ['RUNTIME']
+          : ['STATIC'];
+        this.addEdge('CONTAINS', parent.id, node.id, evidence, 'direct', {
+          note: 'Contención en el DOM; no implica flujo de datos.',
+        });
+      }
+    }
+  }
+
+  private projectSourceFiles(): void {
+    const index = createWorkspaceFileIndex(this.input.workspaceFiles ?? []);
+    const attachments = new Map<string, FlowNode[]>();
+    const pageDocuments = new Set<string>();
+
+    const attach = (file: string | null, node: FlowNode): void => {
+      if (file === null) return;
+      const list = attachments.get(file);
+      if (list === undefined) {
+        attachments.set(file, [node]);
+        return;
+      }
+      if (!list.includes(node)) list.push(node);
+    };
+
+    for (const node of this.nodes.values()) {
+      if (node.type === 'file') continue;
+      if (node.type === 'element' || node.type === 'structure') {
+        if (node.type === 'element' && node.kind === 'page') {
+          pageDocuments.add(node.pageUrl ?? '');
+          attach(index.page(node.pageUrl), node);
+        }
+        continue;
+      }
+      if (node.type === 'asset') {
+        const file = index.resolve(node.href) ?? relativeWorkspacePath(node.file);
+        if (file === null) continue;
+        node.file = file;
+        attach(file, node);
+        continue;
+      }
+      if (node.file === null) continue;
+      const file = index.resolve(node.file) ?? relativeWorkspacePath(node.file);
+      if (file === null) continue;
+      node.file = file;
+      attach(file, node);
+    }
+
+    for (const node of this.nodes.values()) {
+      if (node.type !== 'structure' || !rootStructureSelector(node.selector)) continue;
+      if (pageDocuments.has(node.pageUrl ?? '')) continue;
+      attach(index.page(node.pageUrl), node);
+    }
+
+    for (const [file, nodes] of attachments) {
+      this.projectFileNode(file, nodes);
+    }
+  }
+
+  private projectFileNode(file: string, nodes: readonly FlowNode[]): void {
+    const id = `file:${file}`;
+    const evidence: FlowEvidenceKind[] = ['STATIC'];
+    let firstSeen = 0;
+    let lastSeen = 0;
+    for (const node of nodes) {
+      mergeEvidence(evidence, node.evidence);
+      firstSeen = earliest(firstSeen, node.firstSeen);
+      lastSeen = latest(lastSeen, node.lastSeen);
+    }
+    const name = file.slice(file.lastIndexOf('/') + 1) || file;
+    const node = baseNode(id, 'file', name, evidence);
+    node.subtitle = file;
+    node.file = file;
+    node.line = 1;
+    node.occurrences = 0;
+    node.firstSeen = firstSeen;
+    node.lastSeen = lastSeen;
+    node.note =
+      nodes.length === 1
+        ? 'Archivo del proyecto; agrupa 1 nodo del flujo por origen.'
+        : `Archivo del proyecto; agrupa ${String(nodes.length)} nodos del flujo por origen.`;
+    this.addNode(node);
+    for (const child of nodes) {
+      this.addEdge('CONTAINS', id, child.id, child.evidence, 'direct', {
+        lastSeen: child.lastSeen,
+        note: 'El archivo agrupa este nodo por origen; no implica flujo de datos.',
       });
-      connected.add(node.id);
     }
   }
 
@@ -1639,6 +1766,14 @@ class FlowGraphBuilder {
     if (existing.selector === undefined || existing.selector === null) {
       existing.selector = node.selector ?? existing.selector;
     }
+    if (
+      (existing.pageUrl === undefined || existing.pageUrl === null || existing.pageUrl === '') &&
+      node.pageUrl !== undefined &&
+      node.pageUrl !== null &&
+      node.pageUrl !== ''
+    ) {
+      existing.pageUrl = node.pageUrl;
+    }
     if (existing.href === undefined || existing.href === null) {
       existing.href = node.href ?? existing.href;
     }
@@ -1663,7 +1798,8 @@ class FlowGraphBuilder {
             (entry) =>
               entry.event === hint.event &&
               entry.source === hint.source &&
-              entry.name === hint.name,
+              entry.name === hint.name &&
+              entry.profile?.signature === hint.profile?.signature,
           )
         ) {
           handlers.push(hint);
@@ -1763,6 +1899,7 @@ class FlowGraphBuilder {
     const stats: FlowStats = {
       clicks,
       interactions,
+      files: 0,
       controls: 0,
       forms: 0,
       requests: 0,
@@ -1776,6 +1913,9 @@ class FlowGraphBuilder {
     };
     for (const node of this.nodes.values()) {
       switch (node.type) {
+        case 'file':
+          stats.files += 1;
+          break;
         case 'request':
           stats.requests += 1;
           break;

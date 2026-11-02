@@ -5,6 +5,7 @@ import type {
   BrowserState,
   BrowserTargetsRequest,
   ProjectSetupDetection,
+  SecurityScanReport,
 } from './browser';
 
 export interface IpcError {
@@ -78,5 +79,6 @@ export interface BdtApi {
   focusBrowserWindow(): Promise<IpcResult<void>>;
   getBrowserSnapshot(): Promise<IpcResult<BrowserSnapshot>>;
   clearBrowserRequests(): Promise<IpcResult<BrowserState>>;
+  scanBrowserSecurity(): Promise<IpcResult<SecurityScanReport>>;
   onBrowserEvent(listener: (event: BrowserEvent) => void): () => void;
 }
