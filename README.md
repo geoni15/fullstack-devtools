@@ -54,8 +54,8 @@ La segunda demo se centra en el mapa de flujo en su propia ventana: capas ordena
 
 Binarios para Windows x64 en [Releases](https://github.com/geoni15/fullstack-devtools/releases/latest):
 
-- [Instalador](https://github.com/geoni15/fullstack-devtools/releases/download/v0.3.0/Backend-DevTools-Desktop-0.3.0-setup.exe): instala por usuario y permite elegir la carpeta.
-- [Versión portable](https://github.com/geoni15/fullstack-devtools/releases/download/v0.3.0/Backend-DevTools-Desktop-0.3.0-portable.exe): un solo ejecutable, sin instalación.
+- [Instalador](https://github.com/geoni15/fullstack-devtools/releases/download/v0.4.0/Backend-DevTools-Desktop-0.4.0-setup.exe): instala por usuario y permite elegir la carpeta.
+- [Versión portable](https://github.com/geoni15/fullstack-devtools/releases/download/v0.4.0/Backend-DevTools-Desktop-0.4.0-portable.exe): un solo ejecutable, sin instalación.
 
 Los binarios no están firmados; Windows SmartScreen puede mostrar una advertencia.
 
