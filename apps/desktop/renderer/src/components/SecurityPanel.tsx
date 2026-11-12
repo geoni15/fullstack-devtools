@@ -221,8 +221,8 @@ export function SecurityPanel() {
           <p className="empty-text">Analizando HTML, CSS y JavaScript de la página…</p>
         ) : report.status === 'idle' && report.scannedAt === null ? (
           <p className="empty-text">
-            El análisis de seguridad se ejecutará cuando la página termine de cargar o al pulsar
-            Reanalizar.
+            El análisis de seguridad se ejecuta al pulsar Reanalizar, para no cargar trabajo sobre
+            la página mientras navegas.
           </p>
         ) : findings.length === 0 ? (
           <p className="empty-text">

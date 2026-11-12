@@ -68,10 +68,71 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
     parsed: new WeakMap(),
     xhr: new WeakMap(),
     pendingTexts: new Map(),
+    tagQueue: [],
+    tagSeen: new WeakSet(),
+    tagScheduled: false,
   };
 
   const PENDING_PRUNE_AFTER_MS = 60000;
   const STACK_LIMIT = Infinity;
+  const TAG_SLICE_MS = 4;
+  /*
+   * La instrumentación de red solo alimenta la procedencia del inspector. Con la
+   * inspección apagada se desactiva por completo: sin captura de pilas, sin
+   * seguimiento de respuestas y sin etiquetado de JSON en el hilo de la página.
+   */
+  let runtimeEnabled = true;
+  try {
+    if (globalThis.__BDT_RUNTIME_ENABLED__ === false) runtimeEnabled = false;
+  } catch (error) {
+    void error;
+  }
+  const setRuntimeEnabled = function (value) {
+    runtimeEnabled = value === true;
+    state.pendingTexts.clear();
+    state.tagQueue.length = 0;
+    state.tagSeen = new WeakSet();
+    state.tagScheduled = false;
+    state.responses = new WeakMap();
+    state.xhr = new WeakMap();
+    state.parsed = new WeakMap();
+  };
+  globalThis.__bdtRuntimeSetEnabled = setRuntimeEnabled;
+  const SCAN_SLICE_MS = 8;
+  /*
+   * Recorrer props y estado de React puede abarcar cientos de miles de objetos.
+   * Se hace en tandas de ~8 ms: entre tandas la página recupera el hilo para
+   * pintar y atender clics, en vez de quedarse congelada varios segundos.
+   */
+  const scanYield = (() => {
+    if (typeof MessageChannel !== 'function') {
+      return function () {
+        return new Promise(function (resolve) {
+          setTimeout(resolve, 0);
+        });
+      };
+    }
+    const channel = new MessageChannel();
+    const pending = [];
+    channel.port1.onmessage = function () {
+      const resolve = pending.shift();
+      if (resolve !== undefined) resolve();
+    };
+    return function () {
+      return new Promise(function (resolve) {
+        pending.push(resolve);
+        channel.port2.postMessage(0);
+      });
+    };
+  })();
+  const createClock = function () {
+    return { at: Date.now() };
+  };
+  const breathe = async function (clock) {
+    if (Date.now() - clock.at < SCAN_SLICE_MS) return;
+    await scanYield();
+    clock.at = Date.now();
+  };
 
   function __bdtClip(value, max) {
     const text = value === null || value === undefined ? '' : String(value);
@@ -182,62 +243,98 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
   }
 
   function __bdtRegisterText(text, info) {
+    if (!runtimeEnabled) return;
     if (typeof text !== 'string' || text.length === 0) return;
     const clean = text.replace(/^\s+/, '');
     if (clean.charAt(0) !== '{' && clean.charAt(0) !== '[') return;
     state.pendingTexts.delete(text);
     state.pendingTexts.set(text, { info: info, at: Date.now() });
-    if (state.pendingTexts.size > 256) {
-      const cutoff = Date.now() - PENDING_PRUNE_AFTER_MS;
-      for (const entry of state.pendingTexts) {
-        if (entry[1].at <= cutoff) state.pendingTexts.delete(entry[0]);
-      }
+    // Los textos pendientes retienen cuerpos completos en memoria: se sueltan
+    // en cuanto dejan de ser útiles para evitar pausas largas del recolector.
+    const cutoff = Date.now() - PENDING_PRUNE_AFTER_MS;
+    for (const entry of state.pendingTexts) {
+      if (entry[1].at <= cutoff) state.pendingTexts.delete(entry[0]);
     }
   }
 
-  function __bdtTag(root, info, rootPath) {
-    if (root === null || typeof root !== 'object') return;
-    const stack = [{ value: root, path: rootPath }];
-    const seen = new WeakSet();
-    while (stack.length > 0) {
-      const item = stack.pop();
-      if (item === undefined) continue;
-      const value = item.value;
-      if (value === null || typeof value !== 'object') continue;
-      if (seen.has(value)) continue;
-      seen.add(value);
-      if (!state.parsed.has(value)) {
-        state.parsed.set(value, { info: info, jsonPath: item.path });
+  /*
+   * Etiquetar un JSON enorme de golpe bloquea el hilo de la página. Se procesa en
+   * tandas: la primera es síncrona (la mayoría de respuestas cabe entera) y el resto
+   * se reparte en macrotareas para que la página siga respondiendo.
+   */
+  function __bdtTagStep() {
+    const item = state.tagQueue.pop();
+    if (item === undefined) return;
+    const value = item.value;
+    if (value === null || typeof value !== 'object') return;
+    if (state.tagSeen.has(value)) return;
+    state.tagSeen.add(value);
+    if (!state.parsed.has(value)) {
+      state.parsed.set(value, { info: item.info, jsonPath: item.path });
+    }
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        state.tagQueue.push({
+          value: value[index],
+          path: item.path + '[' + String(index) + ']',
+          info: item.info,
+        });
       }
-      if (Array.isArray(value)) {
-        for (let index = 0; index < value.length; index += 1) {
-          stack.push({ value: value[index], path: item.path + '[' + String(index) + ']' });
-        }
-        continue;
-      }
-      let keys = [];
+      return;
+    }
+    let keys = [];
+    try {
+      keys = Object.keys(value);
+    } catch (error) {
+      return;
+    }
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
+      let child;
       try {
-        keys = Object.keys(value);
+        child = value[key];
       } catch (error) {
         continue;
       }
-      for (let index = 0; index < keys.length; index += 1) {
-        const key = keys[index];
-        let child;
-        try {
-          child = value[key];
-        } catch (error) {
-          continue;
-        }
-        stack.push({ value: child, path: item.path + '.' + key });
-      }
+      state.tagQueue.push({ value: child, path: item.path + '.' + key, info: item.info });
     }
+  }
+
+  function __bdtDrainTagQueue() {
+    state.tagScheduled = false;
+    if (!runtimeEnabled) {
+      state.tagQueue.length = 0;
+      state.tagSeen = new WeakSet();
+      return;
+    }
+    const started = Date.now();
+    let processed = 0;
+    while (state.tagQueue.length > 0) {
+      __bdtTagStep();
+      processed += 1;
+      if ((processed & 255) === 0 && Date.now() - started >= TAG_SLICE_MS) break;
+    }
+    if (state.tagQueue.length > 0) {
+      state.tagScheduled = true;
+      scanYield().then(__bdtDrainTagQueue);
+      return;
+    }
+    state.tagSeen = new WeakSet();
+  }
+
+  function __bdtTag(root, info, rootPath) {
+    if (!runtimeEnabled) return;
+    if (root === null || typeof root !== 'object') return;
+    state.tagQueue.push({ value: root, path: rootPath, info: info });
+    if (state.tagScheduled) return;
+    __bdtDrainTagQueue();
   }
 
   try {
     const nativeParse = JSON.parse;
     JSON.parse = function __bdtJsonParse(text, reviver) {
       const value = nativeParse.apply(this, arguments);
+      if (!runtimeEnabled) return value;
       if (typeof text === 'string' && state.pendingTexts.size > 0) {
         const pending = state.pendingTexts.get(text);
         if (pending !== undefined) {
@@ -260,6 +357,7 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
           const response = this;
           const info = state.responses.get(response);
           const result = nativeJson.apply(response, arguments);
+          if (!runtimeEnabled) return result;
           if (info === undefined || result === null || typeof result.then !== 'function') return result;
           return result.then(function (value) {
             __bdtTag(value, info, '$');
@@ -273,6 +371,7 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
           const response = this;
           const info = state.responses.get(response);
           const result = nativeText.apply(response, arguments);
+          if (!runtimeEnabled) return result;
           if (info === undefined || result === null || typeof result.then !== 'function') return result;
           return result.then(function (value) {
             __bdtRegisterText(value, info);
@@ -284,6 +383,7 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
       if (typeof nativeClone === 'function') {
         proto.clone = function __bdtResponseClone() {
           const clone = nativeClone.apply(this, arguments);
+          if (!runtimeEnabled) return clone;
           const info = state.responses.get(this);
           if (info !== undefined) state.responses.set(clone, info);
           return clone;
@@ -298,6 +398,7 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
     const nativeFetch = globalThis.fetch;
     if (typeof nativeFetch === 'function') {
       globalThis.fetch = function __bdtFetch(input, init) {
+        if (!runtimeEnabled) return nativeFetch.apply(this, arguments);
         const info = __bdtMakeInfo(input, init);
         const result = nativeFetch.apply(this, arguments);
         if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
@@ -329,6 +430,7 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
       if (typeof nativeOpen === 'function') {
         xhrProto.open = function __bdtXhrOpen(method, url) {
           const result = nativeOpen.apply(this, arguments);
+          if (!runtimeEnabled) return result;
           try {
             state.xhr.set(this, __bdtMakeInfo(url, { method: method }));
           } catch (error) {
@@ -340,6 +442,7 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
       const nativeSend = xhrProto.send;
       if (typeof nativeSend === 'function') {
         xhrProto.send = function __bdtXhrSend() {
+          if (!runtimeEnabled) return nativeSend.apply(this, arguments);
           const xhr = this;
           const info = state.xhr.get(xhr);
           if (info !== undefined) {
@@ -365,6 +468,7 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
           enumerable: textDescriptor.enumerable,
           get: function __bdtXhrText() {
             const value = textDescriptor.get.call(this);
+            if (!runtimeEnabled) return value;
             const info = state.xhr.get(this);
             if (info !== undefined) {
               try {
@@ -385,6 +489,7 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
           enumerable: responseDescriptor.enumerable,
           get: function __bdtXhrResponse() {
             const value = responseDescriptor.get.call(this);
+            if (!runtimeEnabled) return value;
             const info = state.xhr.get(this);
             if (info !== undefined) {
               try {
@@ -446,11 +551,13 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
     return false;
   }
 
-  function __bdtContainsIdentity(root, keys) {
+  async function __bdtContainsIdentity(root, keys, clock) {
     if (root === null || typeof root !== 'object') return false;
     const stack = [root];
     const seen = new WeakSet();
+    let ticks = 0;
     while (stack.length > 0) {
+      if ((++ticks & 1023) === 0) await breathe(clock);
       const value = stack.pop();
       if (value === null || typeof value !== 'object') continue;
       if (seen.has(value)) continue;
@@ -479,12 +586,14 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
     return false;
   }
 
-  function __bdtIdentityRoots(root, keys) {
+  async function __bdtIdentityRoots(root, keys, clock) {
     const roots = [];
     if (root === null || typeof root !== 'object') return roots;
     const stack = [{ value: root, path: '$' }];
     const seen = new WeakSet();
+    let ticks = 0;
     while (stack.length > 0) {
+      if ((++ticks & 1023) === 0) await breathe(clock);
       const item = stack.pop();
       if (item === undefined) continue;
       const value = item.value;
@@ -604,12 +713,14 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
     return false;
   }
 
-  function __bdtMatchValues(root, text, numbers) {
+  async function __bdtMatchValues(root, text, numbers, clock) {
     const matches = [];
     if (root === null || typeof root !== 'object') return matches;
     const stack = [{ value: root, path: '$' }];
     const seen = new WeakSet();
+    let ticks = 0;
     while (stack.length > 0) {
+      if ((++ticks & 1023) === 0) await breathe(clock);
       const item = stack.pop();
       if (item === undefined) continue;
       const value = item.value;
@@ -787,15 +898,16 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
     );
   }
 
-  function __bdtWalkComponent(props, states, onFound) {
+  async function __bdtWalkComponent(props, states, onFound, clock, seen) {
     const stack = [];
     if (props !== null && typeof props === 'object') stack.push({ value: props, path: 'props' });
     for (let index = 0; index < states.length; index += 1) {
       const state = states[index];
       stack.push({ value: state.value, path: state.path });
     }
-    const seen = new WeakSet();
+    let ticks = 0;
     while (stack.length > 0) {
+      if ((++ticks & 1023) === 0) await breathe(clock);
       const item = stack.pop();
       if (item === undefined) continue;
       const value = item.value;
@@ -893,7 +1005,9 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
     }
   }
 
-  function __bdtProvenance(element) {
+  async function __bdtProvenance(element) {
+    const clock = createClock();
+    const componentSeen = new WeakSet();
     const result = {
       framework: null,
       render: null,
@@ -1024,9 +1138,15 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
             );
             reactFound = true;
             const states = __bdtHookStates(fiber);
-            __bdtWalkComponent(props, states, function (value, path, tag) {
-              noteCandidate(value, name, 'react', path, tag);
-            });
+            await __bdtWalkComponent(
+              props,
+              states,
+              function (value, path, tag) {
+                noteCandidate(value, name, 'react', path, tag);
+              },
+              clock,
+              componentSeen,
+            );
           }
           try {
             fiber = fiber.return;
@@ -1080,9 +1200,15 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
             } catch (error) {
               void error;
             }
-            __bdtWalkComponent(props, states, function (value, path, tag) {
-              noteCandidate(value, name, 'vue', path, tag);
-            });
+            await __bdtWalkComponent(
+              props,
+              states,
+              function (value, path, tag) {
+                noteCandidate(value, name, 'vue', path, tag);
+              },
+              clock,
+              componentSeen,
+            );
             try {
               component = component.parent;
             } catch (error) {
@@ -1127,7 +1253,9 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
         const matched = [];
         for (let index = 0; index < candidates.length; index += 1) {
           const candidate = candidates[index];
-          if (__bdtContainsIdentity(candidate.value, identityKeys)) matched.push(candidate);
+          if (await __bdtContainsIdentity(candidate.value, identityKeys, clock)) {
+            matched.push(candidate);
+          }
         }
         if (matched.length > 0) {
           selected = matched;
@@ -1161,12 +1289,14 @@ export const RUNTIME_NETWORK_SOURCE = String.raw`
       for (let candidateIndex = 0; candidateIndex < selected.length; candidateIndex += 1) {
         const candidate = selected[candidateIndex];
         const identityRoots =
-          identityKeys.size > 0 ? __bdtIdentityRoots(candidate.value, identityKeys) : [];
+          identityKeys.size > 0
+            ? await __bdtIdentityRoots(candidate.value, identityKeys, clock)
+            : [];
         const roots =
           identityRoots.length > 0 ? identityRoots : [{ value: candidate.value, path: '$' }];
         for (let rootIndex = 0; rootIndex < roots.length; rootIndex += 1) {
           const root = roots[rootIndex];
-          const matches = __bdtMatchValues(root.value, target, numbers);
+          const matches = await __bdtMatchValues(root.value, target, numbers, clock);
           for (let matchIndex = 0; matchIndex < matches.length; matchIndex += 1) {
             const match = matches[matchIndex];
             const rootSuffix = root.path === '$' ? '' : root.path.slice(1);

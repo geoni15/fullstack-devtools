@@ -7,6 +7,7 @@ import { normalizeCodeLocation } from './code-location';
 import { registerAppProtocol, registerAppScheme } from './app-protocol';
 import { APP_INDEX_URL, DEV_SERVER_URL } from './config';
 import { registerIpcHandlers } from './ipc';
+import { LaunchSettingsStore } from './launch-settings';
 import { createLogger } from './logger';
 import { createMainWindow, type MainWindowOptions } from './window';
 import { WorkspaceService } from './workspace';
@@ -35,6 +36,7 @@ if (!app.requestSingleInstanceLock()) {
   let mainWindowOptions: MainWindowOptions | null = null;
 
   const browserHolder: { current: BrowserController | null } = { current: null };
+  const launchSettings = new LaunchSettingsStore(createLogger('launch-settings'));
   const workspace = new WorkspaceService(() => {
     const window = mainWindow;
     if (window !== null && !window.isDestroyed()) {
@@ -66,7 +68,7 @@ if (!app.requestSingleInstanceLock()) {
     getWorkspaceFiles: () => workspace.getFilePaths(),
     chromePreloadPath: fileURLToPath(new URL('../preload/browser-chrome.cjs', import.meta.url)),
     panelPreloadPath: fileURLToPath(new URL('../preload/inspection-panel.cjs', import.meta.url)),
-    mapPreloadPath: fileURLToPath(new URL('../preload/map.cjs', import.meta.url)),
+    unifiedPreloadPath: fileURLToPath(new URL('../preload/unified.cjs', import.meta.url)),
   });
   browserHolder.current = browser;
 
@@ -100,6 +102,7 @@ if (!app.requestSingleInstanceLock()) {
         getMainWindow: () => mainWindow,
         workspace,
         browser,
+        launchSettings,
         revealCode,
         logger: createLogger('ipc'),
       });
@@ -110,6 +113,20 @@ if (!app.requestSingleInstanceLock()) {
       mainWindow.on('closed', () => {
         browser.handleWindowClosed();
         mainWindow = null;
+      });
+
+      void launchSettings.getLastWorkspace().then(async (root) => {
+        if (root === null || workspace.getSnapshot() !== null) return;
+        try {
+          await workspace.open(root);
+          log.info('Último espacio de trabajo reabierto', { root });
+        } catch (error) {
+          log.warn('No se pudo reabrir el último espacio de trabajo', {
+            root,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          await launchSettings.setLastWorkspace(null);
+        }
       });
 
       app.on('activate', () => {

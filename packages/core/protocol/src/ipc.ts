@@ -8,6 +8,8 @@ export const IPC_CHANNELS = {
   revealLocation: 'code:reveal-location',
   workspaceChanged: 'workspace:changed',
   detectProjectSetup: 'project:detect-setup',
+  loadStoredSetup: 'project:setup-load',
+  saveStoredSetup: 'project:setup-save',
   browserConfigure: 'browser:configure',
   browserDisconnect: 'browser:disconnect',
   browserReload: 'browser:reload',
@@ -77,3 +79,18 @@ export const BROWSER_BOUNDS_SCHEMA = z.strictObject({
 });
 
 export type ParsedBrowserBounds = z.infer<typeof BROWSER_BOUNDS_SCHEMA>;
+
+export const STORED_LAUNCH_SETUP_SCHEMA = z.strictObject({
+  frontendBase: z.string().max(2048),
+  frontendPort: z.string().max(16),
+  frontendCommand: z.string().max(2048),
+  frontendCwd: z.string().max(1024),
+  backendBase: z.string().max(2048),
+  backendPort: z.string().max(16),
+  backendCommand: z.string().max(2048),
+  backendCwd: z.string().max(1024),
+  inspectorPort: z.string().max(16),
+  mode: z.enum(['window', 'embedded']),
+});
+
+export type ParsedStoredLaunchSetup = z.infer<typeof STORED_LAUNCH_SETUP_SCHEMA>;

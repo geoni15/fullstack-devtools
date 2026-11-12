@@ -1423,6 +1423,11 @@ button:focus-visible {
   background: #2a2113;
 }
 
+.tag-json {
+  color: #39c5cf;
+  background: #10292c;
+}
+
 .activity-main {
   display: flex;
   flex-direction: column;

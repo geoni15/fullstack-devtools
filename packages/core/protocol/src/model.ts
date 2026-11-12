@@ -1,6 +1,7 @@
 import type {
   BrowserBounds,
   BrowserEvent,
+  BrowserMode,
   BrowserSnapshot,
   BrowserState,
   BrowserTargetsRequest,
@@ -63,6 +64,19 @@ export interface CodeLocation {
   endLine: number | null;
 }
 
+export interface StoredLaunchSetup {
+  frontendBase: string;
+  frontendPort: string;
+  frontendCommand: string;
+  frontendCwd: string;
+  backendBase: string;
+  backendPort: string;
+  backendCommand: string;
+  backendCwd: string;
+  inspectorPort: string;
+  mode: BrowserMode;
+}
+
 export interface BdtApi {
   openWorkspace(): Promise<IpcResult<WorkspaceSnapshot | null>>;
   getState(): Promise<IpcResult<WorkspaceSnapshot | null>>;
@@ -71,6 +85,8 @@ export interface BdtApi {
   onRevealLocation(listener: (location: CodeLocation) => void): () => void;
   onWorkspaceChanged(listener: () => void): () => void;
   detectProjectSetup(): Promise<IpcResult<ProjectSetupDetection | null>>;
+  loadStoredSetup(): Promise<IpcResult<StoredLaunchSetup | null>>;
+  saveStoredSetup(setup: StoredLaunchSetup): Promise<IpcResult<void>>;
   configureBrowser(targets: BrowserTargetsRequest): Promise<IpcResult<BrowserSnapshot>>;
   disconnectBrowser(): Promise<IpcResult<BrowserState>>;
   reloadBrowser(): Promise<IpcResult<void>>;

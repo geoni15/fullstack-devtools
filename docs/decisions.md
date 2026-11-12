@@ -396,6 +396,13 @@ falso, y comprueba el registro cronológico, los filtros, la pestaña de peticio
 (ORM con motor propio como Prisma queda fuera), SQL dinámico se muestra tal cual se ejecuta sin
 parámetros, y un búfer lleno descarta lo más antiguo.
 
+**Revisión:** la detección de drivers y el mecanismo de carga del punto (2) quedaron sustituidos por
+ADR-058 —registro de adaptadores, escaneo del caché de módulos y `process.getBuiltinModule`—, que
+además amplía los drivers, conserva los últimos 2000 eventos y ya no depende del esquema `require`
+del punto de entrada. El propósito y los límites de evidencia N2 siguen vigentes; el registro
+cronológico sigue mostrando solo texto SQL, y las muestras de filas que añadieron ADR-055/ADR-057 son
+exclusivas del mapa y de la ventana «Datos».
+
 ## ADR-030 — Peticiones de fondo y selección por petición en la tarjeta de inspección
 
 **Contexto:** en una aplicación real con formularios largos, un pie fijo para agregar registros
@@ -1372,3 +1379,400 @@ arrastrando el separador de su encabezado, como en el Explorador de Windows, y r
 automático con doble clic. La contrapartida es que los textos largos se recortan visualmente, que una
 columna muy ancha puede empujar las siguientes fuera del visor y que el árbol jerárquico puede quedar
 con bordes derechos desiguales.
+
+## ADR-054 — Vista de datos de la base de datos
+
+**Revisión:** el «sin valores de filas» del contexto y de la presentación, la orientación origen →
+tabla y la ausencia de aislamiento por clic quedaron sustituidos por ADR-055. El resto sigue vigente.
+La ventana propia separada y el ciclo `flowOpen = mapOpen || dataOpen` quedaron sustituidos por
+ADR-062 y, después, por ADR-064, que integra la rejilla de tablas en el único mapa.
+
+**Contexto:** el mapa dibuja la dirección natural del flujo —elemento → manejador → petición → ruta →
+SQL → tabla—, pero para entender qué datos extrae una aplicación conviene la vista inversa: dada una
+tabla o una columna, qué acciones, rutas o funciones la leen o la escriben. El usuario pidió esa
+visualización y aportó un boceto con acciones, dos tablas con columnas y una base de datos, sin
+intención de copiar su diseño. Debía adaptarse a la interfaz plana existente, usar la misma evidencia
+que el mapa y no mostrar valores de filas ni credenciales.
+
+**Decisión:** (1) **Ventana propia y snapshot compartido:** «Datos» abre una `BrowserWindow` separada,
+igual que el mapa, con su preload y su HTML. El controlador mantiene un solo ciclo de flujo mediante
+`flowOpen = mapOpen || dataOpen`: abrir cualquiera de las dos ventanas inicia la captura, el inventario
+y la resolución automática, y cerrar una no los detiene mientras la otra siga abierta; al cerrar ambas,
+al desactivar la inspección o al limpiar la sesión, el flujo se detiene y ambas ventanas se cierran. Las
+dos ventanas reciben el mismo `FlowMapState` en cada revisión; no hay una segunda captura ni un análisis
+paralelo. (2) **Derivación desde el grafo, sin inventar datos:** se recorren los nodos `query` del
+snapshot y sus tablas leídas/escritas se resuelven por nombre contra los nodos `table`. Las columnas
+provienen del análisis SQL y se adjuntan a la tabla que declaran o, si no la declaran, a la única tabla
+de la consulta; con varias tablas una columna sin tabla se descarta y la tabla se rotula «columnas no
+identificadas». `SELECT *` se rotula como tal y no enumera columnas; el respaldo del analizador aporta
+tablas pero no columnas. Las consultas sin tabla identificada se cuentan en el pie y no se dibujan. Los
+orígenes se derivan del elemento con traza o, en su defecto, de la ruta o función más cercana que alimenta
+la consulta. Se conservan las etiquetas STATIC/RUNTIME: las aristas heurísticas son discontinuas y las
+solo estáticas se atenúan. (3) **Presentación:** origen → tabla con columnas → base de datos; cada
+columna lista sus usos SQL (`SELECT`, `RETURNING`, `INSERT`, `SET`, `WHERE`, `JOIN`, `GROUP`, `ORDER`)
+en verde para lectura, ámbar para escritura y gris para esquema. Los filtros «Todo/Lecturas/Escrituras»
+y «Todo el tráfico/Solo lo que interactuaste» son exclusivos y re-apilan el grafo al ocultar; la
+búsqueda encuentra orígenes, tablas, columnas y SQL y solo atenúa. El rail de orígenes y las listas
+cargan de 20 en 20 al desplazarse. El detalle de cada nodo enlaza al código y permite resaltar el control
+en la página; el pie declara que solo se muestran tablas y columnas, sin valores de filas. El texto del
+SVG no es seleccionable, igual que en el mapa. (4) **Límites:** solo aparecen las columnas declaradas en
+el SQL, así que los alias y las expresiones calculadas no figuran con el nombre que tendrían en la
+respuesta; una columna sin tabla en una consulta con varias tablas no se adjunta; la orientación
+origen → tabla es la del grafo y no prueba que esa ruta se ejecutara; la vista no persiste zoom,
+desplazamiento ni preferencias entre ventanas.
+
+**Consecuencia:** el usuario puede partir de una tabla o una columna y ver qué acciones, rutas o
+funciones la extraen, con sus usos SQL y su evidencia, sin leer el SQL crudo ni abrir el mapa. La
+contrapartida es que la vista hereda las limitaciones del análisis SQL: un `SELECT *`, un modo de
+respaldo o una asociación ambigua dejan columnas sin dibujar, y la vista lo declara en lugar de
+rellenarlas con suposiciones.
+
+## ADR-055 — Valores devueltos y trazado direccional en la vista de datos
+
+**Revisión:** los puntos (3) y (4) quedaron sustituidos por ADR-056: la tabla se dibuja como rejilla
+SQL con celdas reales dentro del nodo y el clic izquierdo solo resalta; el aislamiento pasa al menú
+contextual. El resto sigue vigente.
+
+**Contexto:** tras la primera versión de «Datos», el usuario pidió ver exactamente qué dato trae cada
+tabla y hacia dónde se dirige, y poder aislar la cadena de una tabla al hacer clic, como «Ver
+interacciones» del mapa. También pidió que los valores se muestren sin enmascarar, incluidos hashes y
+datos sensibles: la herramienta es observacional, el administrador de MySQL ya permite verlos y un
+valor oculto impide comprobar precisamente lo que se quiere auditar —por ejemplo, si una contraseña
+está hasheada—. La seguridad de esos datos corresponde a la base de datos, no a la vista.
+
+**Decisión:** (1) **Captura de muestras en el punto de instrumentación:** el código inyectado que ya
+registra el SQL envuelve además el resultado de los drivers soportados —callback en `mysql`,
+`sqlite3` y `better-sqlite3`; promesa en `pg` y `mysql2`; `prepare().all/get` síncrono en
+`better-sqlite3`— y guarda una muestra JSON-safe de las filas devueltas: máximo 12 filas, 24
+columnas, 240 caracteres por celda y 200 KB por vaciado. Las muestras de un mismo SQL repetido en 20
+ms se descartan para no duplicar ejecuciones. No se guardan parámetros, solo las filas que el driver
+devuelve. (2) **Propagación con la misma evidencia:** la muestra viaja como `InspectionSqlResult` —
+columnas, filas, recuento, truncado, hora y driver— desde la ejecución capturada hasta el nodo
+`query` del snapshot (`FlowNode.result`). Las consultas estáticas llevan `result: null`; cuando una
+ejecución observada actualiza una consulta ya conocida, su resultado se reemplaza por el último
+observado. No hay una segunda captura ni una fuente de datos distinta de la del mapa. (3)
+**Presentación sin enmascarar:** el detalle de tabla, columna y origen muestra «Datos devueltos» o
+«Valores de <columna>» con la operación, el driver, la hora, el recuento de filas y el tamaño de la
+muestra; dibuja todas las columnas o solo la de la columna elegida, distingue `null` de cadena vacía
+y avisa de muestra truncada. Una nota declara que son valores reales del driver, sin enmascarar, que
+pueden contener datos sensibles y que permanecen en memoria. Si no hubo ejecución observada, la vista
+lo dice; no inventa filas. El enmascarado de cuerpos de petición, cabeceras y secretos de la
+auditoría sigue intacto: esta excepción cubre solo las filas devueltas. (4) **Dirección e
+aislamiento:** las lecturas se dibujan de tabla a origen —el dato sale de la tabla hacia quien lo
+consume— y las escrituras de origen a tabla; la tabla apunta a su base de datos. El clic en cualquier
+nodo lo selecciona y aísla su cadena completa —ancestros y descendientes—, la vuelve a apilar y la
+ajusta a la pantalla. El enfoque se quita con el botón «Ver cadena completa» del estado, con
+`Escape`, con un clic en el vacío, volviendo a pulsar el nodo o cambiando un filtro; los filtros
+también limpian la selección. (5) **Límites:** solo hay filas de consultas observadas durante la
+inspección; `Prisma` y los ORM que no pasan por los drivers instrumentados no aportan muestras; la
+muestra refleja lo que devolvió el driver, no el cuerpo HTTP final ni transformaciones posteriores;
+los topes de filas, columnas y celdas recortan resultados grandes y se rotulan como muestra.
+
+**Consecuencia:** el usuario ve el valor exacto que sale de la base de datos —incluidos hashes, nulos
+y formatos— y puede seguir su dirección y aislar la cadena como en el mapa. La contrapartida es que
+la ventana puede mostrar información sensible en pantalla o en una grabación, y que las consultas sin
+ejecución observada siguen sin filas; ambos límites se declaran en la interfaz y en la documentación
+en lugar de simularse.
+
+## ADR-056 — Rejilla SQL y selección sin aislamiento en la vista de datos
+
+**Contexto:** tras ADR-055 el usuario corrigió tres cosas: el clic izquierdo debía solo resaltar el
+nodo, y el aislamiento debía ir en un menú de clic derecho con «Ver interacciones», copiando exactamente
+la interacción del mapa de flujo; la tabla solo enumeraba columnas, y hacía falta ver los datos como en
+SQL —columnas en horizontal, el tipo de petición debajo del nombre, sin una sola línea— con las celdas
+reales sobre las que se interactuó; y el mismo par clic izquierdo/menú contextual debía funcionar en los
+orígenes, las listas y las celdas concretas.
+
+**Decisión:** (1) **Interacción idéntica al mapa:** el clic izquierdo en una tabla, columna, celda,
+origen, base de datos o fila de las listas solo selecciona y muestra el detalle; no aísla ni re-apila.
+El clic derecho abre un menú fijo con «Ver interacciones» —aísla ancestros y descendientes, re-apila y
+ajusta la vista—, «Resaltar en la página» para un origen con selector y «Quitar selección» o «Quitar
+enfoque» según el estado. Un clic en el vacío solo limpia la selección cuando no hay enfoque activo;
+`Escape` cierra primero el menú, después los resultados de búsqueda y por último la ventana; perder el
+foco de la ventana cierra el menú. (2) **Rejilla dentro del nodo:** la tabla se dibuja como una rejilla
+horizontal con los nombres de columna en la cabecera y sus usos SQL apilados debajo, uno por línea, con
+color por operación; las celdas reales de las ejecuciones observadas se dibujan como filas con
+numeración, franjas alternas y `·` para las ausentes; las columnas que solo trae la respuesta se añaden
+al final con la etiqueta RESULTADO; las filas de todas las muestras de la tabla se fusionan emparejando
+por nombre de columna en minúsculas; el ancho de cada columna se calcula por su contenido, con recorte y
+`<title>` para los textos largos; la celda elegida se marca sobre la columna seleccionada. Una nota al
+pie del nodo declara filas, ejecuciones, driver y truncado, o la ausencia de muestras. (3) **Detalle
+coherente:** la tabla de muestra del detalle apila también los usos bajo cada nombre de columna y sus
+encabezados y celdas comparten el clic de selección y el menú contextual, con el mismo enlace a la
+columna del grafo.
+
+**Consecuencia:** la vista «Datos» se comporta como el mapa —seleccionar no aísla— y muestra el valor
+real dentro de la tabla, no solo en el panel lateral. La contrapartida es que los nodos de tabla son
+más anchos y altos, que la captura sigue limitada a las ejecuciones observadas y que el emparejamiento
+por nombre en minúsculas no distingue dos columnas homónimas de la misma tabla.
+
+## ADR-057 — Muestras SQL de toda la sesión en la vista de datos
+
+**Contexto:** con ADR-055 y ADR-056 una tabla como `warehouses` seguía mostrando «Sin celdas
+observadas» aunque el backend hubiera leído sus filas. La muestra solo viajaba dentro de una traza de
+clic: `applyCapturedSql` la descartaba si no había una inspección activa y la ejecución caía fuera de
+la ventana de 3 s. Las consultas que se ejecutan al cargar una página o en segundo plano nunca llegaban
+al grafo, así que sus tablas quedaban solo con columnas estáticas.
+
+**Decisión:** (1) **Registro de sesión por SQL:** el controlador guarda en un mapa cada ejecución
+capturada del driver, indexada por el texto SQL normalizado. Conserva la última muestra de filas, el
+recuento de ejecuciones, el driver, la hora, el análisis de tablas y columnas y el primer marco de pila
+resoluble; una ejecución sin muestra no borra la última muestra conocida. (2) **Fusión en el grafo:**
+el snapshot recibe ese registro además de las trazas. Cada entrada se compara con las consultas ya
+proyectadas —estáticas, de tarjeta o de traza— por texto SQL normalizado; la primera coincidencia
+recibe la muestra y el recuento para no duplicar filas al agregar varias consultas de la misma tabla, y
+las demás solo se marcan como ejecutadas. Si no hay coincidencia, se crea un nodo de consulta RUNTIME
+con el análisis del SQL y, si la pila lo permite, se enlaza a la función que la ejecutó; la consulta
+proyecta sus tablas y su base de datos. Las consultas, tablas, bases de datos y aristas de lectura o
+escritura que toca una ejecución pasan a evidencia RUNTIME. (3) **Refresco:** cada captura marca el
+flujo como sucio y el mapa o la vista «Datos» se reconstruyen con el refresco ya retardado, sin exigir
+un clic. El registro se vacía al limpiar la sesión o al cerrar ambas ventanas, como el resto del flujo.
+
+**Consecuencia:** las celdas reales aparecen para cualquier consulta que el backend ejecute mientras la
+inspección esté activa, incluidas las de carga inicial y las de segundo plano, sin depender de haber
+hecho clic en la página. La ventana «Datos» muestra además el estado de la captura: sin inspector
+conectado, sin drivers compatibles, con error o con la captura activa pero aún sin filas devueltas, de
+modo que una tabla vacía nunca queda sin explicación. La contrapartida es que la asociación es por texto
+SQL y no por sitio de llamada —dos rutas con el mismo SQL aparecen ambas como ejecutadas—, que no hay
+muestras retroactivas anteriores a la conexión del inspector y que los ORM con motor propio siguen sin
+exponer filas.
+
+## ADR-058 — Detección general de drivers SQL en el proceso inspeccionado
+
+**Contexto:** con ADR-057 la ventana «Datos» podía seguir sin detectar `mysql2` en un backend ESM. La
+captura obtenía el cargador con `await import('node:module')`, pero `Runtime.evaluate` del inspector no
+admite `import()` dinámico sin callback («A dynamic import callback was not specified»): el error se
+capturaba en silencio, no quedaba ningún cargador, `require` y `process.mainModule` no existen en un
+entorno ESM y la detección terminaba con cero drivers. Además, la lista de drivers era fija y solo
+miraba el módulo raíz resuelto desde un par de rutas, de modo que no cubría copias anidadas ni paquetes
+nuevos.
+
+**Decisión:** (1) **Cargador síncrono:** se obtiene el módulo `node:module` con
+`process.getBuiltinModule('node:module')` (Node 22.3+) y, como respaldo, con `process.mainModule`; con
+`createRequire` sobre `process.argv[1]` y el `cwd` se resuelven paquetes de un backend ESM o CommonJS.
+Si no hay ningún cargador, la captura informa el motivo en lugar de decir simplemente que no hay
+drivers. (2) **Registro de adaptadores:** la lista fija se sustituye por un registro
+`adapters[paquete] → patch(módulo)`; añadir un driver nuevo es añadir una entrada. El registro inicial
+cubre `pg`, `mysql2`, `mysql`, `mariadb`, `mssql`, `sqlite3` y `better-sqlite3`. (3) **Caché real de
+módulos:** se recorre `require.cache` de todos los cargadores, se agrupa por paquete —incluidas copias
+anidadas en `node_modules` y `pnpm`— y se parchea cada copia cargada, no solo la que resuelve la ruta
+del punto de entrada. (4) **Cargas futuras:** se envuelve `Module._load` para instrumentar drivers o
+paquetes SQL que se carguen después de conectar la inspección. (5) **Detección genérica:** un paquete
+cargado con pistas de base de datos (`sql`, `database`, `postgres`, `mysql`, `sqlite`, `oracle`, `libsql`…)
+que exporte clases con `query` o `execute` y nombre de conexión, cliente, pool, base de datos o sesión
+se instrumenta con el nombre del paquete aunque no tenga adaptador; los ORM y clientes que delegan en
+un driver ya parcheado se excluyen para no duplicar filas. (6) **Compatibilidad en caliente:** el estado
+global lleva versión; al reconectar con una captura anterior se instala la nueva y su drenaje fusiona el
+búfer antiguo, así que una versión nueva de la app no exige reiniciar el backend ya instrumentado. (7)
+**Límites de memoria:** el búfer conserva las últimas 2000 ejecuciones sin drenar y el mapa de
+deduplicación los últimos 1000 textos SQL, para que la instrumentación no crezca sin límite si la app se
+desconecta y el backend sigue ejecutando consultas.
+
+**Consecuencia:** la captura funciona igual en backends CommonJS y ESM (en ESM requiere Node 22.3+ para
+obtener el cargador), detecta drivers ya cargados y futuros, e incorpora motores nuevos mediante el
+registro o la detección genérica. La ruta de instalación de MySQL no interviene en ningún paso: la
+captura ocurre dentro del proceso Node, no en el servidor de base de datos. Siguen fuera de alcance los
+drivers empaquetados dentro de un bundle (no hay módulo que parchear), las APIs sin clases exportadas
+(por ejemplo, clientes HTTP que solo exponen una función) y los ORM con motor propio como Prisma; para
+esos casos el estado de la captura lo declara en vez de simular columnas.
+
+**Revisión:** el adaptador `mysql2` parchea toda la cadena de prototipos de `Connection` (incluidas
+`BaseConnection` y `BasePoolConnection`) y no las clases `Pool`/`PoolCluster`. `pool.query(sql, cb)`
+crea un objeto `Query` y llama a `conn.query(cmdQuery)`; en ese modo las filas no se emiten como eventos
+sino que quedan en `query._rows`/`query._fields` al terminar. La captura conserva una referencia a ese
+objeto y lee ahí la muestra, sin muestrear el `Query` en sí. Además, el drenaje de una captura nueva
+descarta las entradas del estado anterior creadas después de su instalación (`at >= installedAt`): los
+wrappers antiguos que sigan vivos en el proceso dejan de aportar filas falsas aunque el backend no se
+reinicie. Verificado en vivo contra un backend ESM con `mysql2/promise`: `SELECT 1` produce
+`columns: ["1"], rows: 1` sin entradas espurias.
+
+## ADR-059 — Aristas ancladas a la celda observada en la vista de datos
+
+**Contexto:** con ADR-056 la tabla se dibuja como una rejilla con celdas reales, pero las aristas de
+lectura y escritura seguían entrando por la cabecera del nodo de tabla. Al mirar una ejecución concreta
+no se veía a qué fila —a qué celda— pertenecía el dato que había viajado entre la base de datos y el
+origen.
+
+**Decisión:** (1) **Ancla por celda:** cada arista origen-tabla termina en el borde izquierdo del nodo
+alineada con la celda concreta que tocó su SQL, no con la cabecera de la tabla. Para lecturas se toma la
+muestra más reciente del origen y se elige una columna leída de esa muestra (primero `SELECT`/`RETURNING`,
+después condiciones y por último cualquier columna devuelta) en su primera fila; para escrituras se usa
+una muestra con filas de la propia escritura si existe (`RETURNING`) y, si no, la celda de cabecera de la
+columna escrita. Las columnas del análisis estático sin muestra apuntan a su celda de cabecera. (2)
+**Clic en una celda:** cuando el usuario elige una celda, las aristas del mismo sentido cuya consulta
+devolvió esa fila y usa esa columna se anclan a la fila elegida; la celda sigue marcada en la rejilla y
+las aristas ajenas conservan su ancla. (3) **Marca en el borde:** el borde izquierdo del nodo pinta un
+segmento del color de cada arista en la fila de anclaje, de modo que la conexión se lee aunque la línea
+quede dibujada bajo la tabla. (4) **Tooltip:** la arista nombra la celda (`tabla.columna · fila N = valor`)
+o la columna sin fila observada, junto a la dirección, el recuento, la correlación y la evidencia.
+
+**Consecuencia:** las flechas muestran el dato concreto que salió o entró de la tabla en lugar de la
+tabla entera, y al seleccionar una celda se ve exactamente a qué valor llega cada arista. La
+contrapartida es que una consulta que devuelve varias filas se representa por su primera fila —la celda
+elegida manda— y que una escritura sin `RETURNING` no tiene celda de valor observada y solo puede apuntar
+a la columna escrita.
+
+## ADR-060 — Operación por celda, resaltado permanente y ruta al hacer clic
+
+**Contexto:** con ADR-059 las aristas se anclan a la celda observada, pero la rejilla solo mostraba los
+usos bajo el nombre de la columna. Al mirar una fila no se sabía qué había hecho su consulta con cada
+celda, qué celdas había tocado el backend ni cuál era el recorrido exacto de un valor concreto; y el clic
+en una celda no trazaba ese recorrido por separado.
+
+**Decisión:** (1) **Etiquetas por celda:** cada celda apila bajo su valor las operaciones que la consulta
+de esa fila realizó sobre su columna —`SELECT`, `INSERT`, `SET`, `UPDATE`, `DELETE`, `WHERE`, `JOIN`,
+`GROUP`, `ORDER`—. Si la fila viene de una consulta sin columnas declaradas (resultado suelto o
+`SELECT *`), se usa la operación de la consulta. La altura de la fila crece con el máximo de etiquetas de
+sus celdas y no se recorta. (2) **Resaltado permanente:** las celdas que una consulta tocó quedan
+pintadas por tipo —lectura, escritura o condición— aunque no haya selección; las demás conservan su
+fondo normal. Ninguna se atenúa al elegir una celda. (3) **Ruta al hacer clic:** sin selección no se
+dibuja ninguna flecha por celda. Al hacer clic en una celda se traza una sola ruta azul desde esa celda
+hasta el origen que ejecutó la consulta de su fila —o desde el origen hasta la celda si es escritura—,
+con un punto en la celda y el SQL en el tooltip; la ruta se calcula solo para la celda elegida y se
+sustituye al elegir otra. (4) **Sin aislamiento:** el clic no filtra ni reencuadra el mapa; un clic en el
+vacío limpia selección y ruta pero conserva el paneo y el zoom. (5) **Arrastre robusto:** el paneo captura
+el puntero solo tras 3 px de movimiento para no robar el clic a celdas y columnas, y descarta un arrastre
+cuyo `pointermove` llegue sin botones, de modo que un `pointerup` perdido no desplace el mapa después.
+
+**Consecuencia:** se lee de un vistazo qué hizo el backend con cada celda y cuál fue el recorrido de un
+valor, sin flechas cruzadas ni perder el resto del contenido. La contrapartida es que una misma columna
+puede mostrar etiquetas distintas por fila si otra consulta la tocó de otra forma, y que las filas con
+varias etiquetas son más altas.
+
+## ADR-061 — Resaltado de página con un solo clic izquierdo y destello sincronizado de las celdas
+
+**Contexto:** con ADR-060 el resaltado en la página seguía viviendo en el menú contextual («Resaltar en
+la página») y en el botón del detalle del origen, y al pulsarlo solo se marcaba el recuadro del control:
+las celdas SQL que esa interacción había tocado no se encendían, así que no se podía emparejar el
+control de la página con el dato concreto de la rejilla. El usuario corrigió las dos cosas: resaltar es
+literalmente un solo clic izquierdo, y el resaltado debe marcar también las celdas con las que se
+interactuó. Se aclaró que las celdas a marcar son las de la rejilla «Datos» —no celdas del DOM de la
+página— y que cualquier nodo de Datos (origen, tabla, columna, celda o base de datos) debe resaltar.
+
+**Decisión:** (1) **Un clic, sin menú:** cualquier selección de la vista «Datos» —clic izquierdo en un
+nodo del grafo, una entrada del rail, una columna, una cabecera, una celda o una arista— resuelve sus
+objetivos de página y los envía en el mismo acto. Un origen apunta a su propio elemento; una tabla, una
+columna o una base de datos apuntan a todos los orígenes de elemento que la usan; una celda apunta a los
+orígenes que ejecutaron la consulta de su fila y, si no hay ninguno, a los de su tabla. Los objetivos se
+deduplican por selector. El menú contextual y el botón del detalle conservan «Resaltar en la página» como
+repetición explícita del mismo efecto. (2) **Varios controles a la vez:** el IPC de resaltado acepta una
+lista `targets` además del payload suelto `{key, selector}` que sigue enviando el mapa de flujo, valida
+cada entrada en el proceso principal y el inspector evalúa un solo `__bdtMapHighlightMany` que dibuja un
+recuadro plano por control —mismo azul translúcido, posición fija, z-index 2147483646—, desplaza el
+primero a la vista y hace parpadear todos a la vez; la variante de un solo objetivo se retiró. (3)
+**Destello de celdas:** la selección enciende durante 2.600 ms —el mismo tiempo que el recuadro— una
+capa `grid-cell-flash` sobre las celdas tocadas de la rejilla: un origen enciende las celdas con uso de
+las filas de sus consultas, una tabla todas las suyas, una columna solo esa columna, una base de datos
+las de sus tablas y una celda exactamente esa celda. El destello se dibuja sobre el resaltado permanente
+y sobre la marca de celda elegida, se sustituye al elegir otra selección, se cancela al cerrar la vista o
+al cambiar de filtros y deja intactos el paneo y el zoom. (4) **Alcance honesto:** solo se resaltan
+orígenes de tipo elemento con selector declarado; un origen de ruta, función o consulta no aporta
+recuadro.
+
+**Consecuencia:** un clic izquierdo muestra a la vez el control de la página y el dato SQL exacto que
+participó, sin pasos intermedios. La contrapartida es que un control puede quedar fuera del viewport
+cuando varios controles comparten tabla —solo el primero se desplaza a la vista—, que el emparejamiento
+de columnas sigue siendo por nombre en minúsculas y que el destello no marca cabeceras ni filas
+completas, solo las celdas con uso de la selección.
+
+## ADR-062 — Ventana unificada de mapa y datos con selección cruzada
+
+**Revisión:** la ventana con dos mitades, el divisor arrastrable y la selección cruzada quedaron
+sustituidos por ADR-064, que fusiona ambos grafos en un solo lienzo y convierte cada tabla en una
+rejilla dentro del mapa. La ventana única, el `FlowMapState` compartido y el cierre con
+«Cerrar ventana»/X/`Escape` siguen vigentes.
+
+**Contexto:** mapa de flujo y vista de datos vivían en ventanas separadas para ahorrar trabajo de render.
+En uso real el coste se trasladaba a la persona: debía buscar el mismo nodo en dos mapas que nunca se
+unían, sin poder seguir de un tirón la cadena HTML → frontend → backend → SQL → base de datos, y sin
+selección compartida entre ambas vistas. El rendimiento no es una restricción en esta etapa.
+
+**Decisión:** (1) **Una sola ventana:** `UNIFIED_HTML` monta el mapa en la mitad superior y la vista de
+datos en la inferior, con un divisor de 7 px arrastrable, doble clic que restaura la proporción por
+defecto (56/44) y flechas ↑/↓ que lo mueven por teclado. Ambos preloads comparten el proceso de preload
+`unified.ts`, que inicializa las dos vistas y recibe un único `FlowMapState`. (2) **Mismos nodos:** las
+dos vistas siguen usando los identificadores del grafo —`table:`, `database:`, `route:`, `function:`—,
+de modo que una tabla o una función es el mismo nodo en mapa y en datos en lugar de una copia.
+(3) **Selección cruzada sin bucles:** al seleccionar un nodo en el mapa se enfoca el nodo equivalente en
+datos y viceversa —incluidos tabla, columna, celda, origen y base de datos— mediante un indicador de
+sincronización que envuelve ambas llamadas y corta la reentrada. Cada enfoque reutiliza la selección y
+el resaltado ya existentes: no inventa un estado nuevo. (4) **Un solo botón:** «Mapa» abre la ventana
+unificada; «Cerrar ventana», la X o `Escape` la cierran y el mapa deja de refrescarse. (5) **Divisor
+accesible:** el separador es un `role="separator"` con `tabindex`, y el cuerpo bloquea la selección de
+texto mientras se arrastra.
+
+**Consecuencia:** la cadena completa se lee en un solo lugar y una selección sirve para las dos vistas.
+La contrapartida es que ambas vistas renderizan a la vez y comparten un proceso de preload, lo que
+aumenta el trabajo por refresco —aceptado a cambio de la continuidad y pendiente de la optimización
+prevista—.
+
+## ADR-063 — Captura de todos los movimientos JSON del backend en runtime
+
+**Contexto:** la instrumentación de ADR-057 capturaba todas las ejecuciones SQL del backend, también las
+que no colgaban de un clic. Los cuerpos JSON —peticiones salientes, respuestas del servidor y llamadas a
+`JSON.parse`/`JSON.stringify`— solo se veían de forma indirecta en las peticiones capturadas por el
+navegador. Faltaba el equivalente del lado del servidor para seguir un dato desde el cuerpo HTTP hasta
+el objeto que lo parseó o serializó, y la petición del usuario fue explícita: hacer con JSON lo que se
+hizo con SQL.
+
+**Decisión:** (1) **Misma vía:** se inyecta un global `__bdtJsonCapture` mediante `Runtime.evaluate` en
+el objetivo del Node Inspector, con versión de captura, información honesta de hooks instalados y un
+búfer acotado con deduplicación reciente. (2) **Qué se captura:** `JSON.parse` y `JSON.stringify`
+—etiquetados como `parse`/`stringify`— cuando el valor es un objeto o una cadena con forma JSON; las
+escrituras de `http`/`https` `ServerResponse` —respuestas, `response`—; las escrituras de
+`ClientRequest` —peticiones salientes, `request`—; y `fetch` en ambos sentidos, con el cuerpo de la
+respuesta leído desde un clon para no consumir el original. Cada entrada guarda tipo, dirección,
+método, ruta limpia, estado, hora, cuerpo, marca de truncado y pila. (3) **Drenaje periódico:** cada
+400 ms se ejecuta `serialize(drain())` y el proceso principal parsea el resultado con topes de tamaño y
+de entradas. (4) **Enmascarado en el proceso principal:** los cuerpos pasan por `sanitizeJsonBody` de
+`@bdt/network-capture` antes de guardarse o mostrarse; un cuerpo truncado se oculta, nunca se muestra
+sin enmascarar. La clave de deduplicación combina tipo, dirección, método, ruta, estado y cuerpo, y
+cada repetición incrementa un contador. (5) **Anclaje al grafo:** el movimiento se asocia por pila a la
+función correspondiente y, si no hay función, a la ruta por método y patrón —incluidos `:param` y `*`—
+o al nodo de petición por método y ruta exactos. Parseos y serializaciones sin destino siguen
+visibles en un rail global de movimientos JSON, con hora, tipo, método, ruta, estado, recuento,
+ubicación con enlace al código y cuerpo enmascarado. (6) **Evidencia honesta:** el estado del hook se
+muestra junto al de SQL —hooks activos o error—; nada se presenta como capturado si el inspector no
+está conectado. (7) **Actividad:** cada movimiento nuevo aparece en el registro con categoría `json`,
+filtro propio y aviso de backend si la instalación de hooks falla.
+
+**Consecuencia:** se ve todo el tráfico JSON del backend —entrante, saliente y transformaciones en
+memoria— con los mismos enlaces al código y el mismo rigor STATIC/RUNTIME que el resto del inspector,
+sin tocar el proyecto inspeccionado. La contrapartida es que el búfer y el drenaje periódico añaden
+trabajo constante al proceso instrumentado y que los cuerpos solo se conservan enmascarados y acotados,
+de modo que un valor sensible no puede recuperarse desde la interfaz.
+
+## ADR-064 — Un solo grafo con las tablas como rejilla completa
+
+**Contexto:** ADR-062 unificó mapa y datos en una ventana con dos mitades y un divisor, pero el usuario
+rechazó esa solución: seguir viendo dos mapas obliga a buscar el mismo nodo por separado y no une la
+cadena del frontend con el backend. La petición fue literal: unir los mapas y que los nodos se vean
+enteros, desde el HTML hasta la base de datos. El rendimiento no es una restricción en esta etapa.
+
+**Decisión:** (1) **Un lienzo, sin vista paralela:** se elimina la ventana «Datos», su preload, su HTML,
+su módulo de render y el divisor; `UNIFIED_HTML` monta solo el mapa y los dos preloads comparten el
+mismo `FlowMapState`. Los canales `dataOpen` y `pane`, el tipo `InspectPane` y la sincronización de
+selección entre vistas desaparecen: no hay una segunda captura, un segundo layout ni un segundo grafo.
+(2) **Tabla = rejilla en el grafo:** cada nodo `table` se dibuja como rejilla SQL completa —cabecera con
+usos por columna, filas reales con numeración, operación por celda y columnas RESULTADO— dentro del
+mismo SVG, con la misma evidencia que usaba la vista de datos. `tableIndex.heightOf` alimenta la altura
+del nodo para layout, recorte por visor, ajuste y re-apilado; en vista compacta la tabla se reduce a su
+cabecera. (3) **Aristas a la fila observada:** las aristas READ/WRITE siguen yendo de consulta a tabla,
+pero se anclan con `anchorYOf` a la fila de la ejecución observada o a la columna escrita si no hubo
+filas, de modo que el destino se lee dentro de la rejilla y no en un borde genérico. (4) **Interacción de
+celda:** el clic izquierdo en una celda la selecciona, la deja iluminada de forma permanente y traza una
+única ruta azul entre la celda y la consulta que la ejecutó —o entre la consulta y la celda si es
+escritura—; las demás celdas conservan su fondo normal y solo muestran sus etiquetas de uso. La ruta se
+sustituye al elegir otra celda y se limpia con un clic en el vacío sin reencuadrar; el clic derecho
+conserva el menú del mapa —«Ver interacciones», «Resaltar en la página», «Quitar selección»/«Quitar
+enfoque»— y el resaltado de página usa la lista `targets` para marcar todos los controles implicados.
+(5) **Filtros y búsqueda:** «Todo/Lecturas/Escrituras», «Todo el tráfico/Solo lo que interactuaste» y la
+casilla «Solo esos» ocultan y re-apilan nodos, celdas y aristas; la búsqueda encuentra nodos, tablas,
+columnas, usos y SQL y solo atenúa. El rail «Movimientos JSON» y el detalle por nodo siguen alimentándose
+del mismo snapshot.
+
+**Consecuencia:** la cadena completa HTML → frontend → backend → SQL → base de datos se lee en un único
+grafo y una celda se sigue hasta la consulta que la produjo sin cambiar de ventana ni de vista. La
+contrapartida es que un snapshot con muchas tablas y filas hace más pesado el layout y el dibujo; se
+acepta a cambio de la continuidad, con la optimización prevista pendiente.
+

@@ -12,8 +12,10 @@ import type {
   InspectionLevel,
   InspectionRequest,
   InspectionRequestBackend,
+  InspectionSqlColumn,
   InspectionSqlOperation,
   InspectionSqlQuery,
+  InspectionSqlResult,
   InspectionStatus,
   RequestOutcome,
 } from '@bdt/protocol';
@@ -63,6 +65,7 @@ export interface FlowTraceQuery {
   operation: InspectionSqlOperation;
   tablesRead: string[];
   tablesWritten: string[];
+  columns: InspectionSqlColumn[];
   dialect: string | null;
   parse: 'ast' | 'fallback';
   selectStar: boolean;
@@ -74,6 +77,7 @@ export interface FlowTraceQuery {
   callObject: string | null;
   note: string | null;
   observedAt: number | null;
+  result: InspectionSqlResult | null;
 }
 
 export interface FlowTraceExecution {
@@ -155,6 +159,7 @@ function projectQuery(query: InspectionSqlQuery): FlowTraceQuery {
     operation: query.operation,
     tablesRead: [...query.tablesRead],
     tablesWritten: [...query.tablesWritten],
+    columns: query.columns.map((column) => ({ ...column })),
     dialect: query.dialect,
     parse: query.parse,
     selectStar: query.selectStar,
@@ -166,6 +171,17 @@ function projectQuery(query: InspectionSqlQuery): FlowTraceQuery {
     callObject: query.callObject,
     note: query.note,
     observedAt: query.observedAt,
+    result:
+      query.result === null
+        ? null
+        : {
+            columns: [...query.result.columns],
+            rows: query.result.rows.map((row) => [...row]),
+            rowCount: query.result.rowCount,
+            truncated: query.result.truncated,
+            observedAt: query.result.observedAt,
+            driver: query.result.driver,
+          },
   };
 }
 

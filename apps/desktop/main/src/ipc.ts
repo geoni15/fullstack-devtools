@@ -9,6 +9,7 @@ import {
   IPC_CHANNELS,
   NO_PAYLOAD_SCHEMA,
   READ_FILE_REQUEST_SCHEMA,
+  STORED_LAUNCH_SETUP_SCHEMA,
   toIpcError,
   type BrowserSnapshot,
   type BrowserState,
@@ -18,9 +19,11 @@ import {
   type IpcResult,
   type ProjectSetupDetection,
   type SecurityScanReport,
+  type StoredLaunchSetup,
   type WorkspaceSnapshot,
 } from '@bdt/protocol';
 import type { BrowserController } from './browser/controller';
+import type { LaunchSettingsStore } from './launch-settings';
 import type { Logger } from './logger';
 import { detectProjectSetup } from './project/detect-setup';
 import type { WorkspaceService } from './workspace';
@@ -29,6 +32,7 @@ export interface IpcDependencies {
   getMainWindow(): BrowserWindow | null;
   workspace: WorkspaceService;
   browser: BrowserController;
+  launchSettings: LaunchSettingsStore;
   revealCode(request: CodeLocationRequest): CodeLocation | null;
   logger: Logger;
 }
@@ -57,6 +61,12 @@ function unauthorized<T>(): IpcResult<T> {
   };
 }
 
+const NO_WORKSPACE_KEY = 'global';
+
+function setupKey(workspace: WorkspaceService): string {
+  return workspace.getSnapshot()?.workspace.id ?? NO_WORKSPACE_KEY;
+}
+
 function invalidPayload<T>(): IpcResult<T> {
   return {
     ok: false,
@@ -78,7 +88,7 @@ function reportFailure<T>(error: unknown, logger: Logger, channel: string): IpcR
 }
 
 export function registerIpcHandlers(dependencies: IpcDependencies): void {
-  const { getMainWindow, workspace, browser, revealCode, logger } = dependencies;
+  const { getMainWindow, workspace, browser, launchSettings, revealCode, logger } = dependencies;
 
   ipcMain.handle(
     IPC_CHANNELS.openWorkspace,
@@ -102,6 +112,7 @@ export function registerIpcHandlers(dependencies: IpcDependencies): void {
           return { ok: true, value: null };
         }
         const snapshot = await workspace.open(selectedPath);
+        await launchSettings.setLastWorkspace(snapshot.workspace.rootPath);
         return { ok: true, value: snapshot };
       } catch (error) {
         return reportFailure(error, logger, IPC_CHANNELS.openWorkspace);
@@ -177,6 +188,52 @@ export function registerIpcHandlers(dependencies: IpcDependencies): void {
       }
     },
   );
+
+  ipcMain.handle(
+    IPC_CHANNELS.loadStoredSetup,
+    async (event, payload): Promise<IpcResult<StoredLaunchSetup | null>> => {
+      if (!isTrustedSender(event, getMainWindow())) {
+        return unauthorized();
+      }
+      if (!NO_PAYLOAD_SCHEMA.safeParse(payload).success) {
+        return invalidPayload();
+      }
+      try {
+        const key = setupKey(workspace);
+        const stored = await launchSettings.get(key);
+        // Sin setup propio del proyecto se reutiliza el último comando usado:
+        // el proyecto puede abrirse después de conectar y no debe pisar lo escrito.
+        const fallback =
+          stored !== null || key === NO_WORKSPACE_KEY
+            ? null
+            : await launchSettings.get(NO_WORKSPACE_KEY);
+        return { ok: true, value: stored ?? fallback };
+      } catch (error) {
+        return reportFailure(error, logger, IPC_CHANNELS.loadStoredSetup);
+      }
+    },
+  );
+
+  ipcMain.handle(IPC_CHANNELS.saveStoredSetup, async (event, payload): Promise<IpcResult<void>> => {
+    if (!isTrustedSender(event, getMainWindow())) {
+      return unauthorized();
+    }
+    const parsed = STORED_LAUNCH_SETUP_SCHEMA.safeParse(payload);
+    if (!parsed.success) {
+      return invalidPayload();
+    }
+    try {
+      const key = setupKey(workspace);
+      await launchSettings.set(key, parsed.data);
+      // La copia global mantiene el último comando aunque el proyecto se abra después.
+      if (key !== NO_WORKSPACE_KEY) {
+        await launchSettings.set(NO_WORKSPACE_KEY, parsed.data);
+      }
+      return { ok: true, value: undefined };
+    } catch (error) {
+      return reportFailure(error, logger, IPC_CHANNELS.saveStoredSetup);
+    }
+  });
 
   ipcMain.handle(
     IPC_CHANNELS.browserConfigure,

@@ -6,13 +6,16 @@ import type {
   FlowElementKind,
   FlowEvidenceKind,
   FlowInteractionEvent,
+  FlowJsonMovement,
   FlowNode,
   FlowNodeType,
   FlowSnapshot,
   FlowStack,
   FlowStats,
+  InspectionSqlColumn,
   InspectionSqlOperation,
   InspectionSqlQuery,
+  InspectionSqlResult,
   RequestOutcome,
 } from '@bdt/protocol';
 import { handlerLabel, handlerProfileTags, requestStatusView } from '@bdt/protocol';
@@ -26,6 +29,24 @@ import type { RuntimeProvenanceLink } from './runtime-link-ledger';
 import { normalizeSqlText, staticQueriesForRoute } from './sql-queries';
 import type { DatabaseHint } from './routes';
 import { createWorkspaceFileIndex } from './workspace-file-index';
+
+export interface FlowRuntimeSql {
+  sql: string;
+  driver: string;
+  observedAt: number;
+  count: number;
+  file: string | null;
+  line: number;
+  column: number;
+  operation: InspectionSqlOperation;
+  tablesRead: string[];
+  tablesWritten: string[];
+  columns: InspectionSqlColumn[];
+  dialect: string | null;
+  parse: 'ast' | 'fallback';
+  selectStar: boolean;
+  result: InspectionSqlResult | null;
+}
 
 export interface FlowGraphInput {
   traces: FlowTrace[];
@@ -42,6 +63,8 @@ export interface FlowGraphInput {
   occurrences: readonly FlowInteractionOccurrence[];
   runtimeLinks: RuntimeProvenanceLink[];
   runtimeHandlers: RuntimeHandlerLink[];
+  runtimeSql?: readonly FlowRuntimeSql[];
+  runtimeJson?: readonly FlowJsonMovement[];
 }
 
 const EVIDENCE_ORDER: readonly FlowEvidenceKind[] = ['STATIC', 'RUNTIME'];
@@ -201,6 +224,18 @@ function clipText(value: string, max: number): string {
   return `${clean.slice(0, Math.max(1, max - 1))}…`;
 }
 
+function copyResult(result: InspectionSqlResult | null | undefined): InspectionSqlResult | null {
+  if (result === null || result === undefined) return null;
+  return {
+    columns: [...result.columns],
+    rows: result.rows.map((row) => [...row]),
+    rowCount: result.rowCount,
+    truncated: result.truncated,
+    observedAt: result.observedAt,
+    driver: result.driver,
+  };
+}
+
 function relativeWorkspacePath(value: string | null | undefined): string | null {
   if (value === null || value === undefined) return null;
   const clean = value
@@ -250,6 +285,22 @@ function dialectEngine(dialect: string | null): string | null {
 function stripQuery(value: string): string {
   const index = value.indexOf('?');
   return index === -1 ? value : value.slice(0, index);
+}
+
+function jsonPathMatches(pattern: string, path: string): boolean {
+  const left = stripQuery(pattern);
+  const right = stripQuery(path);
+  if (left === right) return true;
+  const leftParts = left.split('/');
+  const rightParts = right.split('/');
+  if (leftParts.length !== rightParts.length) return false;
+  for (let index = 0; index < leftParts.length; index += 1) {
+    const part = leftParts[index] ?? '';
+    if (part === (rightParts[index] ?? '')) continue;
+    if (part.startsWith(':') || part === '*') continue;
+    return false;
+  }
+  return true;
 }
 
 function isPreflight(request: CapturedRequest): boolean {
@@ -420,6 +471,9 @@ interface QueryShape {
   operation: InspectionSqlOperation;
   tablesRead: string[];
   tablesWritten: string[];
+  columns?: InspectionSqlColumn[];
+  selectStar?: boolean;
+  result?: InspectionSqlResult | null;
   dialect: string | null;
   line: number;
   parse: 'ast' | 'fallback';
@@ -498,15 +552,20 @@ class FlowGraphBuilder {
   private readonly functionIds = new Set<string>();
   private readonly matchCache = new Map<string, StaticRoute | null>();
   private readonly requestRoute = new Map<string, string | null>();
+  private readonly queryBySql = new Map<string, Set<string>>();
+  private readonly jsonTargets = new Map<string, string | null>();
+  private readonly jsonMovementsByNode = new Map<string, Map<string, FlowJsonMovement>>();
   private readonly runtimeLinkedRequests = new Set<string>();
   private readonly executedRequests = new Set<string>();
   private readonly executedEndpoints = new Set<string>();
+  private sortedOccurrences: FlowInteractionOccurrence[] = [];
   private externalRequests = 0;
   private preflightRequests = 0;
 
   constructor(private readonly input: FlowGraphInput) {}
 
   build(): FlowSnapshot {
+    this.sortedOccurrences = [...this.input.occurrences].sort((left, right) => left.at - right.at);
     for (const link of this.input.runtimeLinks) {
       if (link.requestId !== null) this.runtimeLinkedRequests.add(link.requestId);
     }
@@ -535,6 +594,8 @@ class FlowGraphBuilder {
     for (const trace of this.input.traces) {
       this.projectTrace(trace);
     }
+    this.projectRuntimeSql();
+    this.projectRuntimeJson();
     this.projectInteractions();
     this.projectRuntimeLinks();
     this.projectRuntimeHandlers();
@@ -833,11 +894,27 @@ class FlowGraphBuilder {
   }
 
   private bestOccurrence(requestAt: number): FlowInteractionOccurrence | null {
+    const occurrences = this.sortedOccurrences;
+    if (occurrences.length === 0) return null;
+    const from = requestAt - CORRELATION_BEFORE_MS;
+    let low = 0;
+    let high = occurrences.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      const candidate = occurrences[middle];
+      if (candidate === undefined || candidate.at >= from) {
+        high = middle;
+      } else {
+        low = middle + 1;
+      }
+    }
     let best: FlowInteractionOccurrence | null = null;
     let bestPriority = 0;
-    for (const occurrence of this.input.occurrences) {
-      if (occurrence.at < requestAt - CORRELATION_BEFORE_MS) continue;
-      if (occurrence.at > requestAt + CORRELATION_AFTER_MS) continue;
+    const to = requestAt + CORRELATION_AFTER_MS;
+    for (let index = low; index < occurrences.length; index += 1) {
+      const occurrence = occurrences[index];
+      if (occurrence === undefined) break;
+      if (occurrence.at > to) break;
       const priority = EVENT_PRIORITY[occurrence.event];
       if (priority <= 0) continue;
       if (
@@ -990,21 +1067,33 @@ class FlowGraphBuilder {
 
   private projectHandlerInitiators(): void {
     if (this.input.requests.length === 0) return;
+    const requestsByInitiator = new Map<string, CapturedRequest[]>();
+    for (const request of this.input.requests) {
+      if (isPreflight(request) || request.origin === 'external') continue;
+      const initiator = request.initiator?.frames[0]?.functionName ?? null;
+      if (initiator === null || initiator === '') continue;
+      const group = requestsByInitiator.get(initiator);
+      if (group === undefined) {
+        requestsByInitiator.set(initiator, [request]);
+      } else {
+        group.push(request);
+      }
+    }
+    if (requestsByInitiator.size === 0) return;
     for (const link of this.input.runtimeHandlers) {
       if (link.name === null || link.name === '') continue;
+      const matching = requestsByInitiator.get(link.name);
+      if (matching === undefined) continue;
       const handlerId = handlerNodeIdFor(link, `runtime:${link.element.key}`);
       if (!this.nodes.has(handlerId)) continue;
-      for (const request of this.input.requests) {
-        if (isPreflight(request) || request.origin === 'external') continue;
-        const initiator = request.initiator?.frames[0]?.functionName ?? null;
-        if (initiator === null || initiator !== link.name) continue;
+      for (const request of matching) {
         const requestId = `request:${request.id}`;
         if (!this.nodes.has(requestId)) continue;
         const edgeId = `SENDS|${handlerId}|${requestId}`;
         if (this.edges.has(edgeId)) continue;
         this.addEdge('SENDS', handlerId, requestId, ['RUNTIME'], 'heuristic', {
           lastSeen: request.wallStartedAt,
-          note: `La petición la inició ${initiator}, el mismo nombre del manejador resuelto en el DOM; asociación por nombre, sin evento registrado.`,
+          note: `La petición la inició ${link.name}, el mismo nombre del manejador resuelto en el DOM; asociación por nombre, sin evento registrado.`,
         });
       }
     }
@@ -1167,9 +1256,13 @@ class FlowGraphBuilder {
     node.sql = query.sql;
     node.tablesRead = [...query.tablesRead];
     node.tablesWritten = [...query.tablesWritten];
+    node.columns = query.columns.map((column) => ({ ...column }));
+    node.selectStar = query.selectStar;
+    node.result = copyResult(query.result);
     node.note = query.note;
     node.occurrences = 0;
     this.addNode(node);
+    this.registerQuerySql(queryId, query.sql);
 
     this.addEdge('QUERIES', functionId, queryId, ['STATIC'], 'direct');
     this.projectTables(queryId, query);
@@ -1507,10 +1600,14 @@ class FlowGraphBuilder {
     node.sql = query.sql;
     node.tablesRead = [...query.tablesRead];
     node.tablesWritten = [...query.tablesWritten];
+    node.columns = query.columns.map((column) => ({ ...column }));
+    node.selectStar = query.selectStar;
+    node.result = copyResult(query.result);
     node.note = query.note;
     node.traceIds = [trace.id];
     node.occurrences = 0;
     this.addNode(node);
+    this.registerQuerySql(queryId, query.sql);
 
     const target = functionId ?? this.findFunctionNode(file, query.line);
     if (target !== null) {
@@ -1536,6 +1633,9 @@ class FlowGraphBuilder {
     node.note = appendNote(node.note, 'Observada en ejecución.');
     node.lastSeen = latest(node.lastSeen, at);
     node.occurrences += 1;
+    if (query.result !== null) {
+      node.result = copyResult(query.result);
+    }
     mergeStrings(node.traceIds, [trace.id]);
 
     const target = functionId ?? this.findFunctionNode(node.file, node.line);
@@ -1569,6 +1669,9 @@ class FlowGraphBuilder {
     node.sql = query.sql;
     node.tablesRead = [...query.tablesRead];
     node.tablesWritten = [...query.tablesWritten];
+    node.columns = query.columns.map((column) => ({ ...column }));
+    node.selectStar = query.selectStar;
+    node.result = copyResult(query.result);
     node.note = appendNote(
       query.note,
       'Consulta observada en ejecución; sin sitio estático equivalente.',
@@ -1577,6 +1680,7 @@ class FlowGraphBuilder {
     node.firstSeen = at;
     node.lastSeen = at;
     this.addNode(node, true);
+    this.registerQuerySql(queryId, query.sql);
 
     const target =
       functionId ??
@@ -1594,6 +1698,184 @@ class FlowGraphBuilder {
     }
     this.projectTables(queryId, query);
     this.projectDatabase(queryId, file, query, at, [trace.id]);
+  }
+
+  private registerQuerySql(queryId: string, sql: string | null): void {
+    if (sql === null || sql === '') return;
+    const normalized = normalizeSqlText(sql);
+    if (normalized === '') return;
+    let ids = this.queryBySql.get(normalized);
+    if (ids === undefined) {
+      ids = new Set();
+      this.queryBySql.set(normalized, ids);
+    }
+    ids.add(queryId);
+  }
+
+  private projectRuntimeSql(): void {
+    for (const entry of this.input.runtimeSql ?? []) {
+      const normalized = normalizeSqlText(entry.sql);
+      if (normalized === '') continue;
+      const ids = this.queryBySql.get(normalized);
+      if (ids !== undefined && ids.size > 0) {
+        let first = true;
+        for (const id of ids) {
+          const node = this.nodes.get(id);
+          if (node === undefined) continue;
+          this.mergeRuntimeSql(node, entry, first);
+          first = false;
+        }
+        continue;
+      }
+      this.projectCapturedQuery(entry, normalized);
+    }
+  }
+
+  private mergeRuntimeSql(node: FlowNode, entry: FlowRuntimeSql, payload: boolean): void {
+    if (payload) {
+      node.result = copyResult(entry.result) ?? node.result;
+      node.occurrences = Math.max(node.occurrences, entry.count);
+      node.note = appendNote(
+        node.note,
+        entry.result === null
+          ? 'Ejecutada en runtime; sin filas devueltas.'
+          : 'Ejecutada en runtime; muestra real adjunta.',
+      );
+    }
+    mergeEvidence(node.evidence, ['RUNTIME']);
+    node.lastSeen = latest(node.lastSeen, entry.observedAt);
+    this.markRuntimeDataEdges(node.id, entry.observedAt);
+  }
+
+  private markRuntimeDataEdges(queryId: string, at: number): void {
+    for (const edge of this.edges.values()) {
+      if (edge.from !== queryId && edge.to !== queryId) continue;
+      if (edge.type !== 'READS' && edge.type !== 'WRITES' && edge.type !== 'USES') continue;
+      mergeEvidence(edge.evidence, ['RUNTIME']);
+      edge.lastSeen = latest(edge.lastSeen, at);
+      const peer = this.nodes.get(edge.from === queryId ? edge.to : edge.from);
+      if (peer === undefined || (peer.type !== 'table' && peer.type !== 'database')) continue;
+      mergeEvidence(peer.evidence, ['RUNTIME']);
+      peer.lastSeen = latest(peer.lastSeen, at);
+    }
+  }
+
+  private projectCapturedQuery(entry: FlowRuntimeSql, normalized: string): void {
+    const file = entry.file;
+    const line = entry.line > 0 ? entry.line : null;
+    const queryId = `query:runtime:${file ?? ''}:${String(line ?? 0)}:${hashText(normalized)}`;
+    const existing = this.nodes.get(queryId);
+    if (existing !== undefined) {
+      this.mergeRuntimeSql(existing, entry, true);
+      return;
+    }
+    const shape: QueryShape = {
+      operation: entry.operation,
+      tablesRead: [...entry.tablesRead],
+      tablesWritten: [...entry.tablesWritten],
+      columns: entry.columns.map((column) => ({ ...column })),
+      selectStar: entry.selectStar,
+      result: entry.result,
+      dialect: entry.dialect,
+      line: line ?? 0,
+      parse: entry.parse,
+    };
+    const node = baseNode(queryId, 'query', SQL_LABELS[entry.operation], ['RUNTIME']);
+    node.subtitle = querySubtitle(shape, file);
+    node.file = file;
+    node.line = line;
+    node.operation = entry.operation;
+    node.dialect = entry.dialect;
+    node.parse = entry.parse;
+    node.sql = entry.sql;
+    node.tablesRead = [...entry.tablesRead];
+    node.tablesWritten = [...entry.tablesWritten];
+    node.columns = entry.columns.map((column) => ({ ...column }));
+    node.selectStar = entry.selectStar;
+    node.result = copyResult(entry.result);
+    node.note = 'Consulta capturada del driver; sin sitio estático equivalente.';
+    node.firstSeen = entry.observedAt;
+    node.lastSeen = entry.observedAt;
+    node.occurrences = Math.max(1, entry.count);
+    this.addNode(node, true);
+    this.registerQuerySql(queryId, entry.sql);
+
+    const target = this.findFunctionNode(file, line);
+    if (target === null) {
+      node.note = appendNote(node.note, 'Sin función asociada.');
+    } else {
+      this.addEdge('QUERIES', target, queryId, ['RUNTIME'], 'heuristic', {
+        note: 'Consulta capturada del driver; función por archivo y línea de la pila.',
+        lastSeen: entry.observedAt,
+      });
+    }
+    this.projectTables(queryId, shape);
+    this.projectDatabase(queryId, file, shape, entry.observedAt, []);
+    this.markRuntimeDataEdges(queryId, entry.observedAt);
+  }
+
+  private projectRuntimeJson(): void {
+    for (const movement of this.input.runtimeJson ?? []) {
+      const target = this.jsonTarget(movement);
+      if (target === null) continue;
+      const node = this.nodes.get(target);
+      if (node === undefined) continue;
+      let index = this.jsonMovementsByNode.get(target);
+      if (index === undefined) {
+        index = new Map<string, FlowJsonMovement>();
+        for (const item of node.jsonMovements ?? []) index.set(item.id, item);
+        this.jsonMovementsByNode.set(target, index);
+      }
+      const existing = index.get(movement.id);
+      if (existing === undefined) {
+        const copy: FlowJsonMovement = { ...movement, body: null };
+        const list = node.jsonMovements ?? [];
+        list.push(copy);
+        node.jsonMovements = list;
+        index.set(movement.id, copy);
+      } else {
+        Object.assign(existing, movement, { body: null });
+      }
+      mergeEvidence(node.evidence, ['RUNTIME']);
+      node.lastSeen = latest(node.lastSeen, movement.at);
+    }
+  }
+
+  private jsonTarget(movement: FlowJsonMovement): string | null {
+    const cacheKey = [
+      movement.file ?? '',
+      String(movement.line),
+      movement.method ?? '',
+      movement.path ?? '',
+    ].join('\u0000');
+    if (this.jsonTargets.has(cacheKey)) {
+      return this.jsonTargets.get(cacheKey) ?? null;
+    }
+    const target = this.resolveJsonTarget(movement);
+    this.jsonTargets.set(cacheKey, target);
+    return target;
+  }
+
+  private resolveJsonTarget(movement: FlowJsonMovement): string | null {
+    if (movement.file !== null && movement.line > 0) {
+      const viaFrame = this.findFunctionNode(movement.file, movement.line);
+      if (viaFrame !== null) return viaFrame;
+    }
+    if (movement.method === null || movement.path === null) return null;
+    const method = movement.method.toUpperCase();
+    for (const route of this.input.routes) {
+      if (route.method.toUpperCase() !== method) continue;
+      if (!jsonPathMatches(route.path, movement.path)) continue;
+      const id = routeNodeId(route);
+      if (this.routeNodes.has(id)) return id;
+    }
+    for (const node of this.nodes.values()) {
+      if (node.type !== 'request') continue;
+      if (node.method === null || node.path === null) continue;
+      if (node.method.toUpperCase() !== method) continue;
+      if (jsonPathMatches(node.path, movement.path)) return node.id;
+    }
+    return null;
   }
 
   private projectExecution(

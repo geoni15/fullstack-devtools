@@ -57,6 +57,7 @@ export function staticQueriesForRoute(route: StaticRoute): InspectionSqlQuery[] 
         callObject: site.objectName,
         note: joinNotes([site.note, analysis.note, sharedNote]),
         observedAt: null,
+        result: null,
       });
     }
   }

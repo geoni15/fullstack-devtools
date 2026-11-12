@@ -13,6 +13,7 @@ import {
   type IpcResult,
   type ProjectSetupDetection,
   type SecurityScanReport,
+  type StoredLaunchSetup,
   type WorkspaceSnapshot,
 } from '@bdt/protocol';
 
@@ -45,6 +46,12 @@ const api: BdtApi = {
     ipcRenderer.invoke(IPC_CHANNELS.detectProjectSetup) as Promise<
       IpcResult<ProjectSetupDetection | null>
     >,
+  loadStoredSetup: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.loadStoredSetup) as Promise<
+      IpcResult<StoredLaunchSetup | null>
+    >,
+  saveStoredSetup: (setup: StoredLaunchSetup) =>
+    ipcRenderer.invoke(IPC_CHANNELS.saveStoredSetup, setup) as Promise<IpcResult<void>>,
   onWorkspaceChanged: (listener: () => void) => {
     if (typeof listener !== 'function') {
       throw new TypeError('El listener debe ser una función.');

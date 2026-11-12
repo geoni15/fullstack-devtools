@@ -3,20 +3,37 @@ import type { FlowEdgeType, FlowNode, FlowNodeType, FlowSnapshot } from '@bdt/pr
 export const FLOW_NODE_WIDTH = 210;
 export const FLOW_NODE_HEIGHT = 48;
 export const FLOW_NODE_COMPACT_HEIGHT = 30;
-const ROW_GAP = 10;
-const COMPACT_ROW_GAP = 6;
-const LAYER_GAP = 88;
+const ROW_GAP = 20;
+const COMPACT_ROW_GAP = 12;
+const LAYER_GAP = 176;
+const FRONTEND_BACKEND_GAP = LAYER_GAP * 7.5;
 const MARGIN = 48;
-const HIERARCHY_H_GAP = 24;
-const HIERARCHY_V_GAP = 82;
-const COMPACT_HIERARCHY_V_GAP = 48;
-const HIERARCHY_ROOT_GAP = 120;
+const HIERARCHY_H_GAP = 48;
+const HIERARCHY_V_GAP = 164;
+const COMPACT_HIERARCHY_V_GAP = 96;
+const HIERARCHY_ROOT_GAP = 240;
+
+const FRONTEND_LAYERS = new Set<FlowNodeType>([
+  'file',
+  'structure',
+  'asset',
+  'element',
+  'handler',
+  'request',
+]);
+
+function layerGap(left: FlowNodeType, right: FlowNodeType): number {
+  return FRONTEND_LAYERS.has(left) && !FRONTEND_LAYERS.has(right)
+    ? FRONTEND_BACKEND_GAP
+    : LAYER_GAP;
+}
 
 export type FlowLayoutMode = 'chronological' | 'hierarchical' | 'structural';
 
 export interface FlowLayoutOptions {
   compact?: boolean;
   widthOf?: (node: FlowNode) => number;
+  heightOf?: (node: FlowNode) => number;
 }
 
 export const FLOW_LAYERS: readonly FlowNodeType[] = [
@@ -69,6 +86,7 @@ export interface FlowPlacedNode {
   y: number;
   layer: number;
   width: number;
+  height: number;
 }
 
 export interface FlowLayerInfo {
@@ -177,8 +195,8 @@ function layoutColumns(
   compare: (left: FlowNode, right: FlowNode) => number,
   compact: boolean,
   widthOf: (node: FlowNode) => number,
+  heightOf: (node: FlowNode) => number,
 ): FlowLayout {
-  const nodeHeight = compact ? FLOW_NODE_COMPACT_HEIGHT : FLOW_NODE_HEIGHT;
   const rowGap = compact ? COMPACT_ROW_GAP : ROW_GAP;
   const buckets = new Map<FlowNodeType, FlowNode[]>();
   for (const type of FLOW_LAYERS) {
@@ -192,35 +210,48 @@ function layoutColumns(
   const columns = active.map((type) => {
     const list = [...(buckets.get(type) ?? [])].sort(compare);
     const columnWidth = list.reduce((widest, node) => Math.max(widest, widthOf(node)), 0);
-    return { type, list, columnWidth: Math.max(1, columnWidth) };
+    const blockHeight =
+      list.reduce((total, node) => total + heightOf(node), 0) +
+      Math.max(0, list.length - 1) * rowGap;
+    return { type, list, columnWidth: Math.max(1, columnWidth), blockHeight };
   });
 
-  const rowCount = Math.max(1, ...columns.map((column) => column.list.length));
   const columnsWidth = columns.reduce((total, column) => total + column.columnWidth, 0);
-  const width = MARGIN * 2 + columnsWidth + Math.max(0, columns.length - 1) * LAYER_GAP;
-  const height = MARGIN * 2 + rowCount * nodeHeight + Math.max(0, rowCount - 1) * rowGap;
+  let gapsWidth = 0;
+  for (let index = 1; index < active.length; index += 1) {
+    const previous = active[index - 1];
+    const current = active[index];
+    if (previous === undefined || current === undefined) continue;
+    gapsWidth += layerGap(previous, current);
+  }
+  const width = MARGIN * 2 + columnsWidth + gapsWidth;
+  const tallest = Math.max(1, ...columns.map((column) => column.blockHeight));
+  const height = MARGIN * 2 + tallest;
 
   const placed: FlowPlacedNode[] = [];
   const positions = new Map<string, FlowPlacedNode>();
   const layers: FlowLayerInfo[] = [];
   let cursor = MARGIN;
 
-  columns.forEach(({ type, list, columnWidth }, layer) => {
+  columns.forEach(({ type, list, columnWidth, blockHeight }, layer) => {
     layers.push({ type, x: cursor, count: list.length, width: columnWidth });
-    const blockHeight = list.length * nodeHeight + Math.max(0, list.length - 1) * rowGap;
-    const top = MARGIN + (height - MARGIN * 2 - blockHeight) / 2;
-    list.forEach((node, row) => {
+    let y = MARGIN + (tallest - blockHeight) / 2;
+    for (const node of list) {
+      const nodeH = heightOf(node);
       const entry: FlowPlacedNode = {
         node,
         x: cursor,
-        y: top + row * (nodeHeight + rowGap),
+        y,
         layer,
         width: columnWidth,
+        height: nodeH,
       };
       placed.push(entry);
       positions.set(node.id, entry);
-    });
-    cursor += columnWidth + LAYER_GAP;
+      y += nodeH + rowGap;
+    }
+    const next = columns[layer + 1];
+    cursor += columnWidth + (next === undefined ? 0 : layerGap(type, next.type));
   });
 
   return { mode, nodes: placed, positions, layers, width, height };
@@ -230,24 +261,26 @@ function layoutChronological(
   snapshot: FlowSnapshot,
   compact: boolean,
   widthOf: (node: FlowNode) => number,
+  heightOf: (node: FlowNode) => number,
 ): FlowLayout {
-  return layoutColumns(snapshot, 'chronological', chronological, compact, widthOf);
+  return layoutColumns(snapshot, 'chronological', chronological, compact, widthOf, heightOf);
 }
 
 function layoutStructural(
   snapshot: FlowSnapshot,
   compact: boolean,
   widthOf: (node: FlowNode) => number,
+  heightOf: (node: FlowNode) => number,
 ): FlowLayout {
-  return layoutColumns(snapshot, 'structural', structuralOrder, compact, widthOf);
+  return layoutColumns(snapshot, 'structural', structuralOrder, compact, widthOf, heightOf);
 }
 
 function layoutHierarchical(
   snapshot: FlowSnapshot,
   compact: boolean,
   nodeWidthOf: (node: FlowNode) => number,
+  nodeHeightOf: (node: FlowNode) => number,
 ): FlowLayout {
-  const nodeHeight = compact ? FLOW_NODE_COMPACT_HEIGHT : FLOW_NODE_HEIGHT;
   const verticalGap = compact ? COMPACT_HIERARCHY_V_GAP : HIERARCHY_V_GAP;
   const nodes = snapshot.nodes;
   const byId = new Map<string, FlowNode>();
@@ -363,8 +396,26 @@ function layoutHierarchical(
   const placed: FlowPlacedNode[] = [];
   const positions = new Map<string, FlowPlacedNode>();
   const depthGroups = new Map<number, FlowNode[]>();
-  let maxDepth = 0;
   const visited = new Set<string>();
+
+  const depthById = new Map<string, number>();
+  const maxHeightByDepth: number[] = [];
+  const collectDepth = (id: string, depth: number): void => {
+    if (depthById.has(id)) return;
+    depthById.set(id, depth);
+    const node = byId.get(id);
+    if (node !== undefined) {
+      maxHeightByDepth[depth] = Math.max(maxHeightByDepth[depth] ?? 0, nodeHeightOf(node));
+    }
+    for (const kid of children.get(id) ?? []) collectDepth(kid, depth + 1);
+  };
+  for (const root of roots) collectDepth(root.id, 0);
+  const depthY: number[] = [];
+  let depthCursor = MARGIN;
+  for (let depth = 0; depth < maxHeightByDepth.length; depth += 1) {
+    depthY[depth] = depthCursor;
+    depthCursor += (maxHeightByDepth[depth] ?? FLOW_NODE_HEIGHT) + verticalGap;
+  }
 
   const place = (id: string, left: number, depth: number): void => {
     if (visited.has(id)) return;
@@ -373,9 +424,10 @@ function layoutHierarchical(
     visited.add(id);
     const width = widthOf(id);
     const own = ownWidth(id);
+    const ownHeight = nodeHeightOf(node);
     const x = left + (width - own) / 2;
-    const y = MARGIN + depth * (nodeHeight + verticalGap);
-    const entry: FlowPlacedNode = { node, x, y, layer: depth, width: own };
+    const y = depthY[depth] ?? MARGIN;
+    const entry: FlowPlacedNode = { node, x, y, layer: depth, width: own, height: ownHeight };
     placed.push(entry);
     positions.set(id, entry);
     const group = depthGroups.get(depth);
@@ -384,7 +436,6 @@ function layoutHierarchical(
     } else {
       group.push(node);
     }
-    if (depth > maxDepth) maxDepth = depth;
 
     const kids = children.get(id) ?? [];
     let total = 0;
@@ -406,9 +457,9 @@ function layoutHierarchical(
   const width =
     roots.length === 0 ? MARGIN * 2 : Math.max(MARGIN * 2, cursor - HIERARCHY_ROOT_GAP + MARGIN);
   const height =
-    placed.length === 0
+    placed.length === 0 || maxHeightByDepth.length === 0
       ? MARGIN * 2
-      : MARGIN * 2 + (maxDepth + 1) * nodeHeight + maxDepth * verticalGap;
+      : depthCursor - verticalGap + MARGIN;
 
   const layers: FlowLayerInfo[] = [...depthGroups.entries()]
     .sort((left, right) => left[0] - right[0])
@@ -417,7 +468,7 @@ function layoutHierarchical(
       x: MARGIN,
       count: group.length,
       label: `NIVEL ${String(depth)}`,
-      y: MARGIN + depth * (nodeHeight + verticalGap) - 18,
+      y: (depthY[depth] ?? MARGIN) - 18,
     }));
 
   return { mode: 'hierarchical', nodes: placed, positions, layers, width, height };
@@ -430,7 +481,13 @@ export function layoutFlow(
 ): FlowLayout {
   const compact = options.compact === true;
   const widthOf = options.widthOf ?? ((): number => FLOW_NODE_WIDTH);
-  if (mode === 'hierarchical') return layoutHierarchical(snapshot, compact, widthOf);
-  if (mode === 'structural') return layoutStructural(snapshot, compact, widthOf);
-  return layoutChronological(snapshot, compact, widthOf);
+  const heightOf =
+    options.heightOf ?? ((): number => (compact ? FLOW_NODE_COMPACT_HEIGHT : FLOW_NODE_HEIGHT));
+  if (mode === 'hierarchical') {
+    return layoutHierarchical(snapshot, compact, widthOf, heightOf);
+  }
+  if (mode === 'structural') {
+    return layoutStructural(snapshot, compact, widthOf, heightOf);
+  }
+  return layoutChronological(snapshot, compact, widthOf, heightOf);
 }

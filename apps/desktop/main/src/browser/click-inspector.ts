@@ -179,38 +179,101 @@ ${PAGE_DOM_HELPERS_SOURCE}
   };
 
   let mapHighlightTimers = [];
-  globalThis.__bdtMapHighlight = (key, selector, durationMs) => {
+  let mapHighlightHosts = [];
+  const clearMapHighlightTimers = () => {
+    for (const timer of mapHighlightTimers) clearTimeout(timer);
+    mapHighlightTimers = [];
+  };
+  const clearMapHighlightHosts = () => {
+    for (const host of mapHighlightHosts) {
+      try { host.remove(); } catch (error) { void error; }
+    }
+    mapHighlightHosts = [];
+  };
+  const resolveHighlightTarget = (key, selector) => {
+    if (typeof selector !== 'string' || selector === '') return null;
+    let target = null;
     try {
-      if (typeof selector !== 'string' || selector === '') return false;
-      let target = null;
+      target = globalThis.__bdtResolveRef ? globalThis.__bdtResolveRef(key, selector) : null;
+    } catch (error) {
+      target = null;
+    }
+    if (!(target instanceof Element)) {
       try {
-        target = globalThis.__bdtResolveRef ? globalThis.__bdtResolveRef(key, selector) : null;
+        target = globalThis.__bdtResolveRef ? globalThis.__bdtResolveRef(null, selector) : null;
       } catch (error) {
         target = null;
       }
-      if (!(target instanceof Element)) {
-        try {
-          target = globalThis.__bdtResolveRef ? globalThis.__bdtResolveRef(null, selector) : null;
-        } catch (error) {
-          target = null;
-        }
+    }
+    return target instanceof Element ? target : null;
+  };
+  const mapHighlightTotal = (durationMs) => {
+    return typeof durationMs === 'number' && isFinite(durationMs)
+      ? Math.max(800, Math.min(12000, durationMs))
+      : 2600;
+  };
+  const placeMapHost = (host, target) => {
+    const rect = rectOf(target);
+    const x = Number(rect.x);
+    const y = Number(rect.y);
+    const width = Number(rect.width);
+    const height = Number(rect.height);
+    if (!isFinite(x) || !isFinite(y) || !isFinite(width) || !isFinite(height)) {
+      style(host, 'display', 'none');
+      return;
+    }
+    if (width <= 0 || height <= 0) {
+      style(host, 'display', 'none');
+      return;
+    }
+    style(host, 'display', 'block');
+    style(host, 'left', Math.round(x) + 'px');
+    style(host, 'top', Math.round(y) + 'px');
+    style(host, 'width', Math.round(width) + 'px');
+    style(host, 'height', Math.round(height) + 'px');
+  };
+  const renderMapHosts = (targets) => {
+    clearMapHighlightHosts();
+    for (const target of targets) {
+      if (!target.isConnected) continue;
+      const host = document.createElement('bdt-map-highlight');
+      style(host, 'position', 'fixed');
+      style(host, 'z-index', '2147483646');
+      style(host, 'pointer-events', 'none');
+      style(host, 'display', 'none');
+      style(host, 'background', 'rgba(88, 166, 255, 0.20)');
+      style(host, 'margin', '0');
+      style(host, 'padding', '0');
+      style(host, 'contain', 'strict');
+      (document.documentElement || document.body).append(host);
+      mapHighlightHosts.push(host);
+      placeMapHost(host, target);
+    }
+  };
+  globalThis.__bdtMapHighlightMany = (targets, durationMs) => {
+    try {
+      if (!Array.isArray(targets) || targets.length === 0) return false;
+      const resolved = [];
+      for (const entry of targets) {
+        if (!entry || typeof entry !== 'object') continue;
+        const target = resolveHighlightTarget(entry.key === undefined ? null : entry.key, entry.selector);
+        if (target !== null) resolved.push(target);
       }
-      if (!(target instanceof Element)) return false;
+      if (resolved.length === 0) return false;
       try {
-        target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+        resolved[0].scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
       } catch (error) {
         void error;
       }
-      for (const timer of mapHighlightTimers) clearTimeout(timer);
-      mapHighlightTimers = [];
-      const total =
-        typeof durationMs === 'number' && isFinite(durationMs)
-          ? Math.max(800, Math.min(12000, durationMs))
-          : 2600;
-      showBox(rectOf(target));
-      mapHighlightTimers.push(setTimeout(() => { hideBox(); }, Math.round(total * 0.32)));
-      mapHighlightTimers.push(setTimeout(() => { showBox(rectOf(target)); }, Math.round(total * 0.42)));
-      mapHighlightTimers.push(setTimeout(() => { hideBox(); }, total));
+      clearMapHighlightTimers();
+      hideBox();
+      const total = mapHighlightTotal(durationMs);
+      renderMapHosts(resolved);
+      mapHighlightTimers.push(setTimeout(() => {
+        for (const host of mapHighlightHosts) style(host, 'display', 'none');
+      }, Math.round(total * 0.32)));
+      mapHighlightTimers.push(setTimeout(() => { renderMapHosts(resolved); }, Math.round(total * 0.42)));
+      mapHighlightTimers.push(setTimeout(() => { clearMapHighlightHosts(); }, total));
       return true;
     } catch (error) {
       void error;
@@ -406,6 +469,7 @@ ${PAGE_DOM_HELPERS_SOURCE}
     hoverTarget = null;
     globalThis.__bdtHoverTarget = null;
     lastTipData = null;
+    lastHoverSent = null;
     hideTip();
     hideBox();
   };
@@ -415,17 +479,30 @@ ${PAGE_DOM_HELPERS_SOURCE}
     hoverTarget = null;
     globalThis.__bdtHoverTarget = null;
     lastTipData = null;
+    lastHoverSent = null;
     hideTip();
     hideBox();
     emit({ kind: 'hover-end' });
   };
 
+  let lastHoverSent = null;
   const sendHover = (target, x, y) => {
     showBox(rectOf(target));
+    const rx = Math.round(x);
+    const ry = Math.round(y);
+    if (
+      lastHoverSent !== null &&
+      lastHoverSent.target === target &&
+      lastHoverSent.x === rx &&
+      lastHoverSent.y === ry
+    ) {
+      return;
+    }
+    lastHoverSent = { target, x: rx, y: ry };
     emit({
       kind: 'hover',
-      x: Math.round(x),
-      y: Math.round(y),
+      x: rx,
+      y: ry,
       docX: Math.round(window.scrollX + x),
       docY: Math.round(window.scrollY + y),
       rect: rectOf(target),
@@ -434,13 +511,21 @@ ${PAGE_DOM_HELPERS_SOURCE}
     });
   };
 
+  let hoverEmitTimer = null;
   const dispatchHover = (target) => {
     if (globalThis.__BDT_INSPECT_ENABLED__ === false) return;
     if (!(target instanceof Element) || !target.isConnected) return;
     const hit = deepTarget(target, hoverX, hoverY);
     hoverTarget = hit;
     globalThis.__bdtHoverTarget = hit;
-    sendHover(hit, hoverX, hoverY);
+    showBox(rectOf(hit));
+    if (hoverEmitTimer !== null) return;
+    hoverEmitTimer = setTimeout(() => {
+      hoverEmitTimer = null;
+      const current = hoverTarget;
+      if (!(current instanceof Element) || !current.isConnected) return;
+      sendHover(current, hoverX, hoverY);
+    }, 120);
   };
 
   const inspectEnabled = () => globalThis.__BDT_INSPECT_ENABLED__ !== false;
@@ -552,30 +637,37 @@ ${PAGE_DOM_HELPERS_SOURCE}
   };
 
   window.addEventListener('dblclick', (event) => {
+    if (!inspectEnabled()) return;
     const target = interactionNode(event.target, event.clientX, event.clientY);
     if (target !== null) sendInteraction('dblclick', target);
   }, true);
   window.addEventListener('contextmenu', (event) => {
+    if (!inspectEnabled()) return;
     const target = interactionNode(event.target, event.clientX, event.clientY);
     if (target !== null) sendInteraction('contextmenu', target);
   }, true);
   window.addEventListener('input', (event) => {
+    if (!inspectEnabled()) return;
     const target = interactionNode(event.target);
     if (target !== null) sendInteraction('input', target);
   }, true);
   window.addEventListener('change', (event) => {
+    if (!inspectEnabled()) return;
     const target = interactionNode(event.target);
     if (target !== null) sendInteraction('change', target);
   }, true);
   window.addEventListener('focusin', (event) => {
+    if (!inspectEnabled()) return;
     const target = interactionNode(event.target);
     if (target !== null) sendInteraction('focus', target);
   }, true);
   window.addEventListener('focusout', (event) => {
+    if (!inspectEnabled()) return;
     const target = interactionNode(event.target);
     if (target !== null) sendInteraction('blur', target);
   }, true);
   window.addEventListener('keydown', (event) => {
+    if (!inspectEnabled()) return;
     if (!__bdtPage.isControlKey(event.key)) return;
     const target = interactionNode(event.target);
     if (target !== null) sendInteraction('keydown', target);
@@ -636,10 +728,10 @@ ${PAGE_DOM_HELPERS_SOURCE}
   }, true);
 
   let domTimer = null;
-  const observedRoots = new WeakSet();
+  let observedRoots = new WeakSet();
   let observer = null;
   const observeRoot = (root) => {
-    if (!root || observedRoots.has(root)) return;
+    if (!root || observer === null || observedRoots.has(root)) return;
     observedRoots.add(root);
     try {
       observer.observe(root, {
@@ -691,7 +783,7 @@ ${PAGE_DOM_HELPERS_SOURCE}
     }
     return false;
   };
-  observer = new MutationObserver((records) => {
+  const createObserver = () => new MutationObserver((records) => {
     if (!inspectEnabled() || !mutationRelevant(records)) return;
     for (const record of records) {
       for (const node of record.addedNodes) {
@@ -708,7 +800,13 @@ ${PAGE_DOM_HELPERS_SOURCE}
       emit({ kind: 'dom-changed' });
     }, 400);
   });
-  observeRoot(document);
+  const ensureObserver = () => {
+    if (observer !== null) return;
+    observer = createObserver();
+    observedRoots = new WeakSet();
+    observeRoot(document);
+  };
+  ensureObserver();
 
   window.addEventListener('mousemove', (event) => {
     if (globalThis.__BDT_INSPECT_ENABLED__ === false) return;
@@ -723,6 +821,7 @@ ${PAGE_DOM_HELPERS_SOURCE}
   globalThis.__bdtHoverRefresh = () => {
     if (globalThis.__BDT_INSPECT_ENABLED__ === false) return;
     if (!(hoverTarget instanceof Element) || !hoverTarget.isConnected) return;
+    lastHoverSent = null;
     sendHover(hoverTarget, hoverX, hoverY);
   };
 
@@ -736,6 +835,7 @@ ${PAGE_DOM_HELPERS_SOURCE}
   window.addEventListener('blur', endHover, true);
 
   window.addEventListener('click', (event) => {
+    if (!inspectEnabled()) return;
     if (event.button !== 0 || !(event.target instanceof Element)) return;
     if (event.target === tipHost || event.target === boxHost) return;
     let x = event.clientX;
@@ -764,6 +864,7 @@ ${PAGE_DOM_HELPERS_SOURCE}
     });
   }, true);
   window.addEventListener('submit', (event) => {
+    if (!inspectEnabled()) return;
     if (!(event.target instanceof Element)) return;
     if (event.target === tipHost || event.target === boxHost) return;
     const rect = event.target.getBoundingClientRect();
@@ -808,6 +909,35 @@ ${PAGE_DOM_HELPERS_SOURCE}
     shiftHeldNow = false;
     syncTipVisibility();
   }, true);
+  globalThis.__bdtSetInspectEnabled = (value) => {
+    globalThis.__BDT_INSPECT_ENABLED__ = value === true;
+    if (globalThis.__BDT_INSPECT_ENABLED__) {
+      ensureObserver();
+      return;
+    }
+    if (observer !== null) observer.disconnect();
+    observer = null;
+    if (domTimer !== null) {
+      clearTimeout(domTimer);
+      domTimer = null;
+    }
+    if (scrollTimer !== null) {
+      clearTimeout(scrollTimer);
+      scrollTimer = null;
+    }
+    if (hoverEmitTimer !== null) {
+      clearTimeout(hoverEmitTimer);
+      hoverEmitTimer = null;
+    }
+    hoverTarget = null;
+    hoverKey = null;
+    lastTipData = null;
+    lastHoverSent = null;
+    globalThis.__bdtHoverTarget = null;
+    globalThis.__bdtClickTarget = null;
+    hideTip();
+    hideBox();
+  };
 })();
 `;
 
@@ -1825,6 +1955,7 @@ export class ClickInspector {
         message: error instanceof Error ? error.message : String(error),
       });
     }
+    await this.syncRuntimeEnabled(this.enabled);
   }
 
   private async ensureWorld(frameId: string): Promise<void> {
@@ -1851,7 +1982,9 @@ export class ClickInspector {
         this.hoverTipPinned ? 'true' : 'false'
       };\nglobalThis.__BDT_SHIFT_HELD__ = ${
         this.shiftHeld ? 'true' : 'false'
-      };\n${LISTENER_SOURCE}`;
+      };\n${LISTENER_SOURCE}\nif (globalThis.__bdtSetInspectEnabled) globalThis.__bdtSetInspectEnabled(${
+        this.enabled ? 'true' : 'false'
+      });`;
       await target.sendCommand('Runtime.evaluate', {
         expression,
         contextId,
@@ -1870,9 +2003,36 @@ export class ClickInspector {
     this.enabled = enabled;
     if (!this.installed) return;
     const expression = enabled
-      ? 'globalThis.__BDT_INSPECT_ENABLED__ = true;'
-      : 'globalThis.__BDT_INSPECT_ENABLED__ = false; if (globalThis.__bdtHoverClear) globalThis.__bdtHoverClear();';
+      ? 'globalThis.__BDT_INSPECT_ENABLED__ = true; if (globalThis.__bdtSetInspectEnabled) globalThis.__bdtSetInspectEnabled(true);'
+      : 'globalThis.__BDT_INSPECT_ENABLED__ = false; if (globalThis.__bdtHoverClear) globalThis.__bdtHoverClear(); if (globalThis.__bdtSetInspectEnabled) globalThis.__bdtSetInspectEnabled(false);';
     void this.evaluateInWorlds(expression);
+    void this.syncRuntimeEnabled(enabled);
+  }
+
+  private async syncRuntimeEnabled(enabled: boolean): Promise<void> {
+    const target = this.target;
+    if (target === null) return;
+    const expression = `globalThis.__BDT_RUNTIME_ENABLED__ = ${
+      enabled ? 'true' : 'false'
+    };\nif (globalThis.__bdtRuntimeSetEnabled) globalThis.__bdtRuntimeSetEnabled(${
+      enabled ? 'true' : 'false'
+    });`;
+    const contexts = [...this.mainContexts.values()];
+    if (contexts.length === 0) {
+      try {
+        await target.sendCommand('Runtime.evaluate', { expression, silent: true });
+      } catch {
+        // El mundo principal aún no está listo; se aplicará al crear el contexto.
+      }
+      return;
+    }
+    for (const contextId of contexts) {
+      try {
+        await target.sendCommand('Runtime.evaluate', { expression, contextId, silent: true });
+      } catch {
+        // Contexto obsoleto; executionContextDestroyed lo retirará.
+      }
+    }
   }
 
   setHoverTipPinned(pinned: boolean): void {
@@ -1920,6 +2080,7 @@ export class ClickInspector {
         const mainId = typeof context.id === 'number' ? context.id : null;
         if (auxData !== null && auxData.isDefault === true && frameId !== null && mainId !== null) {
           this.mainContexts.set(frameId, mainId);
+          if (!this.enabled) void this.syncRuntimeEnabled(false);
         }
         if (context.name !== WORLD_NAME) return;
         const id = typeof context.id === 'number' ? context.id : null;
@@ -2045,7 +2206,11 @@ export class ClickInspector {
     }
   }
 
-  async resolveRef(ref: PageElementRef, withHandler: boolean): Promise<HoverResolution | null> {
+  async resolveRef(
+    ref: PageElementRef,
+    withHandler: boolean,
+    withRuntime = withHandler,
+  ): Promise<HoverResolution | null> {
     const target = this.target;
     if (target === null || !this.installed || !this.enabled) return null;
     const contextId = this.tooltipContext();
@@ -2118,7 +2283,7 @@ export class ClickInspector {
       if (!withHandler) {
         return { element: info, handler: null, handlerEvent: null, listeners: [] };
       }
-      info.runtime = await this.runtimeProvenance(target, primary, group);
+      if (withRuntime) info.runtime = await this.runtimeProvenance(target, primary, group);
       let handler: InspectionHandler | null = null;
       let handlerEvent: 'click' | 'submit' | null = null;
       try {
@@ -2173,17 +2338,17 @@ export class ClickInspector {
       .catch(() => undefined);
   }
 
-  highlightRef(key: string | null, selector: string): void {
+  highlightRefs(targets: Array<{ key: string | null; selector: string }>): void {
     const target = this.target;
     const contextId = this.tooltipContext();
-    if (target === null || contextId === null) return;
-    const expression = `if (globalThis.__bdtMapHighlight) { globalThis.__bdtMapHighlight(${JSON.stringify(
-      key,
-    )}, ${JSON.stringify(selector)}, 2600); }`;
+    if (target === null || contextId === null || targets.length === 0) return;
+    const expression = `if (globalThis.__bdtMapHighlightMany) { globalThis.__bdtMapHighlightMany(${JSON.stringify(
+      targets,
+    )}, 2600); }`;
     void target
       .sendCommand('Runtime.evaluate', { expression, contextId, silent: true })
       .catch((error: unknown) => {
-        this.log.debug('No se pudo resaltar en la página el elemento elegido en el mapa', {
+        this.log.debug('No se pudo resaltar en la página los elementos elegidos en el mapa', {
           message: error instanceof Error ? error.message : String(error),
         });
       });
@@ -2259,6 +2424,7 @@ export class ClickInspector {
         objectId: mainObjectId,
         functionDeclaration: RUNTIME_PROVENANCE_CALL,
         returnByValue: true,
+        awaitPromise: true,
         silent: true,
       })) as { result?: { value?: unknown } };
       const runtime = parseRuntimeProvenance(response.result?.value);
@@ -2351,6 +2517,12 @@ export class ClickInspector {
     return found;
   }
 
+  dropScriptCaches(): void {
+    this.scriptInfos.clear();
+    this.scriptSources.clear();
+    this.sourceMaps.clear();
+  }
+
   dispose(): void {
     this.worldSequence += 1;
     const target = this.target;
@@ -2372,9 +2544,7 @@ export class ClickInspector {
     this.primaryContextId = null;
     this.worldContexts.clear();
     this.mainContexts.clear();
-    this.scriptInfos.clear();
-    this.scriptSources.clear();
-    this.sourceMaps.clear();
+    this.dropScriptCaches();
   }
 
   private async evaluateInWorlds(

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { ConsoleEntry, ConsoleLevel, ConsoleSource } from '@bdt/protocol';
 import { useBrowser } from '../state/browser-store';
 import { CodeLink } from './CodeLink';
@@ -68,6 +68,30 @@ function revealTarget(entry: ConsoleEntry): string | null {
   return null;
 }
 
+const ConsoleRow = memo(function ConsoleRow({ entry }: { entry: ConsoleEntry }) {
+  const where = locationLabel(entry);
+  return (
+    <div
+      className={`console-row level-${entry.level}`}
+      data-source={entry.source}
+      data-level={entry.level}
+      data-testid="console-row"
+    >
+      <span className="console-time">{formatTime(entry.at)}</span>
+      <span className={`console-level level-${entry.level}`}>{LEVEL_LABEL[entry.level]}</span>
+      <span className={`console-source source-${entry.source}`}>{SOURCE_LABEL[entry.source]}</span>
+      <span className="console-text mono">{entry.text}</span>
+      <CodeLink
+        file={revealTarget(entry)}
+        line={entry.line}
+        label={where}
+        className="console-where mono"
+        title={where}
+      />
+    </div>
+  );
+});
+
 export function ConsolePanel() {
   const { state } = useBrowser();
   const entries = state.consoleEntries;
@@ -77,15 +101,23 @@ export function ConsolePanel() {
   const listRef = useRef<HTMLDivElement | null>(null);
   const stickRef = useRef(true);
 
-  const problems = entries.filter(isProblem).length;
-  const counts: Record<Filter, number> = {
-    all: entries.length,
-    frontend: entries.filter((entry) => entry.source === 'frontend').length,
-    backend: entries.filter((entry) => entry.source === 'backend').length,
-  };
+  const problems = useMemo(() => entries.filter(isProblem).length, [entries]);
+  const counts = useMemo<Record<Filter, number>>(
+    () => ({
+      all: entries.length,
+      frontend: entries.filter((entry) => entry.source === 'frontend').length,
+      backend: entries.filter((entry) => entry.source === 'backend').length,
+    }),
+    [entries],
+  );
 
-  const visible = entries.filter(
-    (entry) => (filter === 'all' || entry.source === filter) && (!problemsOnly || isProblem(entry)),
+  const visible = useMemo(
+    () =>
+      entries.filter(
+        (entry) =>
+          (filter === 'all' || entry.source === filter) && (!problemsOnly || isProblem(entry)),
+      ),
+    [entries, filter, problemsOnly],
   );
 
   useEffect(() => {
@@ -151,34 +183,9 @@ export function ConsolePanel() {
           </p>
         ) : (
           <div className="console-rows" role="log" aria-label="Consola de la aplicación">
-            {visible.map((entry) => {
-              const where = locationLabel(entry);
-              return (
-                <div
-                  key={entry.id}
-                  className={`console-row level-${entry.level}`}
-                  data-source={entry.source}
-                  data-level={entry.level}
-                  data-testid="console-row"
-                >
-                  <span className="console-time">{formatTime(entry.at)}</span>
-                  <span className={`console-level level-${entry.level}`}>
-                    {LEVEL_LABEL[entry.level]}
-                  </span>
-                  <span className={`console-source source-${entry.source}`}>
-                    {SOURCE_LABEL[entry.source]}
-                  </span>
-                  <span className="console-text mono">{entry.text}</span>
-                  <CodeLink
-                    file={revealTarget(entry)}
-                    line={entry.line}
-                    label={where}
-                    className="console-where mono"
-                    title={where}
-                  />
-                </div>
-              );
-            })}
+            {visible.map((entry) => (
+              <ConsoleRow key={entry.id} entry={entry} />
+            ))}
           </div>
         )}
       </div>

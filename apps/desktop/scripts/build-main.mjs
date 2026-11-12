@@ -45,8 +45,8 @@ await build({
 
 await build({
   ...commonOptions,
-  entryPoints: [path.join(appDir, 'preload', 'src', 'map.ts')],
-  outfile: path.join(appDir, 'dist', 'preload', 'map.cjs'),
+  entryPoints: [path.join(appDir, 'preload', 'src', 'unified.ts')],
+  outfile: path.join(appDir, 'dist', 'preload', 'unified.cjs'),
   format: 'cjs',
 });
 

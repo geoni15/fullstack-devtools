@@ -24,7 +24,11 @@ import {
   type ConsoleEntry,
   type ConsoleLevel,
   type ConsoleSource,
+  type FlowJsonCaptureState,
+  type FlowJsonMovement,
+  type FlowJsonState,
   type FlowMapState,
+  type FlowSqlCaptureState,
   type InspectionBackend,
   type InspectionCard,
   type InspectionCodeBlock,
@@ -37,6 +41,7 @@ import {
   type InspectionRequestPhase,
   type InspectionRuntime,
   type InspectionSqlQuery,
+  type InspectionSqlResult,
   type SecurityScanReport,
 } from '@bdt/protocol';
 import {
@@ -68,9 +73,10 @@ import {
 } from './click-inspector';
 import { databaseHintLabel, pickDatabaseHint } from './database-hints';
 import { parseBrowserTargets } from './endpoints';
-import { buildFlowSnapshot } from './flow-graph';
+import { buildFlowSnapshot, type FlowRuntimeSql } from './flow-graph';
 import { FlowLedger } from './flow-ledger';
-import { FlowMapWindow } from './flow-map-window';
+import type { CapturedJsonExecution, JsonCaptureInfo } from './json-capture';
+import { UnifiedWindow } from './unified-window';
 import { InspectionPanel } from './inspection-panel';
 import { InteractionLedger } from './interaction-ledger';
 import { NodeInspector, type SqlObservation } from './node-inspector';
@@ -223,12 +229,11 @@ export interface BrowserControllerOptions {
   getWorkspaceFiles(): readonly string[];
   chromePreloadPath: string;
   panelPreloadPath: string;
-  mapPreloadPath: string;
+  unifiedPreloadPath: string;
 }
 
 const PARTITION = 'bdt-inspector';
 const FLUSH_INTERVAL_MS = 150;
-const SECURITY_SCAN_DELAY_MS = 900;
 const CDP_COMMAND_TIMEOUT_MS = 5000;
 const CHROME_HEIGHT = 64;
 const PANEL_WIDTH = 430;
@@ -236,11 +241,19 @@ const MIN_PANEL_WIDTH = 300;
 const MIN_HOST_WIDTH_FOR_PANEL = 640;
 const INSPECTION_WINDOW_MS = 3000;
 const INSPECTION_LEEWAY_MS = 150;
+const HOVER_RESOLUTION_TTL_MS = 1000;
 const FLOW_REFRESH_MS = 1000;
+const JSON_PUSH_MS = 500;
 const MAX_BACKEND_CODE_LINES = 80;
 const MAX_ACTIVITY_DETAIL = 600;
 const MAX_BODY_CHARS = 16000;
 const CHROME_URL = `data:text/html;charset=utf-8,${encodeURIComponent(BROWSER_CHROME_HTML)}`;
+const JSON_KIND_LABEL: Record<CapturedJsonExecution['kind'], string> = {
+  request: 'enviado',
+  response: 'devuelto',
+  parse: 'leído',
+  stringify: 'serializado',
+};
 
 function withTimeout<T>(command: Promise<T>, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -753,8 +766,16 @@ export class BrowserController {
   private hoverSequence = 0;
   private hoverPending: InspectorHoverSignal | null = null;
   private hoverResolving = false;
-  private hoverProvenanceCache: { key: string; at: number; value: HoverTextProvenance } | null =
-    null;
+  private readonly hoverProvenanceCache = new Map<
+    string,
+    { at: number; value: HoverTextProvenance }
+  >();
+  private hoverResolutionCache: {
+    key: string;
+    mode: InspectionMode;
+    at: number;
+    value: HoverResolution;
+  } | null = null;
   private readonly hoverBackendCodeCache = new Map<string, { at: number; value: BackendSource }>();
   private readonly runtimeFileCache = new Map<string, string | null>();
   private readonly symbols = new WorkspaceSymbols(() => this.options.getWorkspaceRoot());
@@ -764,7 +785,7 @@ export class BrowserController {
   >();
   private cdpClockOffsetMs: number | null = null;
   private panelView: WebContentsView | null = null;
-  private readonly mapWindow: FlowMapWindow;
+  private readonly inspectWindow: UnifiedWindow;
   private panelRuntime: InspectionRuntime = { ...OFF_RUNTIME };
   private runtime: NodeInspector | null = null;
   private frontendLauncher: AppLauncher | null = null;
@@ -781,6 +802,20 @@ export class BrowserController {
   private readonly runtimeSqlActivitySeen = new Set<string>();
   private sqlRuntimeSequence = 0;
   private readonly flowLedger = new FlowLedger();
+  private readonly runtimeSql = new Map<string, FlowRuntimeSql>();
+  private sqlCaptureInfo: FlowSqlCaptureState | null = null;
+  private sqlExecutions = 0;
+  private sqlSampled = 0;
+  private sqlLastAt: number | null = null;
+  private readonly runtimeJsonActivitySeen = new Set<string>();
+  private jsonRuntimeSequence = 0;
+  private readonly runtimeJson = new Map<string, FlowJsonMovement>();
+  private readonly jsonBodySent = new Set<string>();
+  private jsonPushTimer: ReturnType<typeof setTimeout> | null = null;
+  private jsonCaptureInfo: FlowJsonCaptureState | null = null;
+  private jsonMovements = 0;
+  private jsonBodies = 0;
+  private jsonLastAt: number | null = null;
   private readonly flowInteractions = new InteractionLedger();
   private readonly runtimeLinks = new RuntimeLinkLedger();
   private readonly runtimeHandlers = new RuntimeHandlerLedger();
@@ -792,8 +827,9 @@ export class BrowserController {
   private inventory: PageControl[] = [];
   private inventoryKey = '';
   private inventoryTimer: ReturnType<typeof setTimeout> | null = null;
+  private inventoryRunning = false;
   private flowState: FlowMapState = { open: false, building: false, error: null, snapshot: null };
-  private mapOpen = false;
+  private inspectOpen = false;
   private flowRevision = 0;
   private flowDirty = false;
   private flowTimer: ReturnType<typeof setTimeout> | null = null;
@@ -804,8 +840,10 @@ export class BrowserController {
   private frontendDetection: Promise<string | null> | null = null;
   private frontendDetectionUrl: string | null = null;
   private readonly security: SecurityScanner;
-  private securityTimer: ReturnType<typeof setTimeout> | null = null;
   private securityGeneration = 0;
+  private securityScans = 0;
+  private debuggerEnabled = false;
+  private debuggerGate: Promise<void> = Promise.resolve();
   private readonly firstPartyUrls = new Map<string, boolean>();
 
   constructor(
@@ -815,8 +853,8 @@ export class BrowserController {
   ) {
     this.state = idleState();
     this.panel = new InspectionPanel(options.panelPreloadPath, log);
-    this.mapWindow = new FlowMapWindow(options.mapPreloadPath, log, () => {
-      this.handleMapWindowClosed();
+    this.inspectWindow = new UnifiedWindow(options.unifiedPreloadPath, log, () => {
+      this.handleInspectWindowClosed();
     });
     this.routes = new BackendRouteIndex(() => this.options.getWorkspaceRoot(), log);
     this.security = new SecurityScanner(log, (url) => this.isWorkspaceUrl(url));
@@ -847,19 +885,36 @@ export class BrowserController {
     ) {
       return this.security.current();
     }
-    this.cancelSecurityScan();
     const generation = ++this.securityGeneration;
     const target = view.webContents.debugger;
+    this.securityScans += 1;
+    if (!this.debuggerEnabled) {
+      try {
+        await this.setDebuggerEnabled(true);
+        // Deja que Chromium reenvíe Debugger.scriptParsed de los scripts ya cargados.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      } catch {
+        // Sin Debugger se analiza el HTML, CSS y las peticiones; los scripts quedan fuera.
+      }
+    }
     this.send({
       type: 'security',
       report: { ...this.security.current(), status: 'scanning', error: null },
     });
-    const report = await this.security.scan({
-      target,
-      config: this.state.config,
-      pageUrl: maskUrl(view.webContents.getURL()),
-      requests: this.buffer?.all() ?? [],
-    });
+    let report: SecurityScanReport;
+    try {
+      report = await this.security.scan({
+        target,
+        config: this.state.config,
+        pageUrl: maskUrl(view.webContents.getURL()),
+        requests: this.buffer?.all() ?? [],
+      });
+    } finally {
+      this.securityScans -= 1;
+      if (this.securityScans === 0 && !this.inspectionEnabled) {
+        await this.setDebuggerEnabled(false).catch(() => undefined);
+      }
+    }
     if (this.view !== view) {
       this.security.markStale();
       return this.security.current();
@@ -945,6 +1000,12 @@ export class BrowserController {
         },
         onSqlCapture: (info) => {
           this.onSqlCaptureChanged(info);
+        },
+        onJsonCaptured: (execution) => {
+          this.onJsonCaptured(execution);
+        },
+        onJsonCapture: (info) => {
+          this.onJsonCaptureChanged(info);
         },
         log: this.log,
       });
@@ -1194,11 +1255,21 @@ export class BrowserController {
     this.send({ type: 'requests-cleared' });
     this.clearActivity();
     this.flowLedger.clear();
+    this.runtimeSql.clear();
+    this.sqlExecutions = 0;
+    this.sqlSampled = 0;
+    this.sqlLastAt = null;
+    this.runtimeJson.clear();
+    this.jsonBodySent.clear();
+    this.jsonMovements = 0;
+    this.jsonBodies = 0;
+    this.jsonLastAt = null;
     this.flowInteractions.clear();
     this.runtimeLinks.clear();
     this.runtimeHandlers.clear();
     this.resetAutoResolve();
     this.markFlowDirty();
+    this.scheduleJsonPush();
     this.scheduleAutoResolve();
     this.emitState();
     return { ...this.state };
@@ -1215,6 +1286,7 @@ export class BrowserController {
     this.inspectionEnabled = enabled;
     this.state = { ...this.state, inspectionEnabled: enabled };
     this.inspector?.setEnabled(enabled);
+    void this.setDebuggerEnabled(enabled).catch(() => undefined);
     if (!enabled) {
       this.setMapOpen(false);
       this.dismissCard();
@@ -1250,7 +1322,7 @@ export class BrowserController {
   }
 
   handleWorkspaceChanged(): void {
-    this.hoverProvenanceCache = null;
+    this.hoverProvenanceCache.clear();
     this.runtimeFileCache.clear();
     this.runtimeSourceCache.clear();
     this.symbols.invalidate();
@@ -1274,7 +1346,7 @@ export class BrowserController {
   }
 
   isMapSender(sender: WebContents): boolean {
-    return this.mapWindow.isSender(sender);
+    return this.inspectWindow.isSender(sender);
   }
 
   handleChromeReady(sender: WebContents): void {
@@ -1284,53 +1356,96 @@ export class BrowserController {
   }
 
   handlePanelReady(sender: WebContents): void {
-    if (this.mapWindow.handleReady(sender)) {
-      this.mapWindow.updateMap(this.flowState);
+    if (this.inspectWindow.handleReady(sender)) {
+      this.inspectWindow.updateState(this.windowState());
+      this.jsonBodySent.clear();
+      this.pushJsonState();
       return;
     }
     if (!this.panel.handleReady(sender)) return;
     this.updatePanel(this.inspectionSession?.card ?? null);
   }
 
-  highlightFlowElement(key: string | null, selector: string): void {
-    this.inspector?.highlightRef(key, selector);
+  highlightFlowElements(targets: Array<{ key: string | null; selector: string }>): void {
+    this.inspector?.highlightRefs(targets);
   }
 
-  private handleMapWindowClosed(): void {
-    if (!this.mapOpen) return;
-    this.setMapOpen(false);
+  private get flowOpen(): boolean {
+    return this.inspectOpen;
   }
 
-  setMapOpen(open: boolean): void {
-    if (open === this.mapOpen) {
-      if (open) this.mapWindow.focus();
-      return;
-    }
-    if (open) {
-      if (!this.state.inspectionEnabled || this.view === null) {
-        return;
-      }
-      this.mapOpen = true;
-      this.cancelHover();
-      this.flowState = {
-        open: true,
-        building: true,
-        error: null,
-        snapshot: this.flowState.snapshot,
-      };
-      this.mapWindow.open();
-      const mapContents = this.mapWindow.webContents();
-      if (mapContents !== null) {
-        this.trackShift(mapContents);
-      }
-      this.mapWindow.updateMap(this.flowState);
-      void this.refreshMap(true).finally(() => {
-        this.scheduleAutoResolve();
+  private windowState(): FlowMapState {
+    return {
+      ...this.flowState,
+      sqlCapture: this.sqlCaptureView(),
+      jsonCapture: this.jsonCaptureView(),
+    };
+  }
+
+  private updateFlowWindows(): void {
+    this.inspectWindow.updateState(this.windowState());
+  }
+
+  private scheduleJsonPush(): void {
+    if (!this.flowOpen || this.jsonPushTimer !== null) return;
+    this.jsonPushTimer = setTimeout(() => {
+      this.jsonPushTimer = null;
+      this.pushJsonState();
+    }, JSON_PUSH_MS);
+  }
+
+  private pushJsonState(): void {
+    if (!this.flowOpen) return;
+    const movements = [...this.runtimeJson.values()]
+      .sort((left, right) => right.at - left.at)
+      .map((movement) => {
+        if (movement.body === null) return movement;
+        if (this.jsonBodySent.has(movement.id)) {
+          return { ...movement, body: null, bodyOmitted: true };
+        }
+        this.jsonBodySent.add(movement.id);
+        return movement;
       });
-      return;
-    }
-    this.mapOpen = false;
-    this.mapWindow.close();
+    const payload: FlowJsonState = { capture: this.jsonCaptureView(), movements };
+    this.inspectWindow.updateJsonState(payload);
+  }
+
+  private sqlCaptureView(): FlowSqlCaptureState | null {
+    if (this.sqlCaptureInfo === null) return null;
+    return {
+      ...this.sqlCaptureInfo,
+      drivers: [...this.sqlCaptureInfo.drivers],
+      executions: this.sqlExecutions,
+      sampled: this.sqlSampled,
+      lastAt: this.sqlLastAt,
+    };
+  }
+
+  private jsonCaptureView(): FlowJsonCaptureState | null {
+    if (this.jsonCaptureInfo === null) return null;
+    return {
+      ...this.jsonCaptureInfo,
+      hooks: [...this.jsonCaptureInfo.hooks],
+      movements: this.jsonMovements,
+      bodies: this.jsonBodies,
+      lastAt: this.jsonLastAt,
+    };
+  }
+
+  private startFlow(): void {
+    this.flowState = {
+      open: true,
+      building: true,
+      error: null,
+      snapshot: this.flowState.snapshot,
+    };
+    this.updateFlowWindows();
+    void this.refreshFlow(true).finally(() => {
+      this.scheduleAutoResolve();
+    });
+  }
+
+  private stopFlow(): void {
     this.stopAutoResolve();
     this.flowGeneration += 1;
     this.flowBuilding = false;
@@ -1339,6 +1454,11 @@ export class BrowserController {
       clearTimeout(this.flowTimer);
       this.flowTimer = null;
     }
+    if (this.jsonPushTimer !== null) {
+      clearTimeout(this.jsonPushTimer);
+      this.jsonPushTimer = null;
+    }
+    this.jsonBodySent.clear();
     if (this.inventoryTimer !== null) {
       clearTimeout(this.inventoryTimer);
       this.inventoryTimer = null;
@@ -1349,26 +1469,63 @@ export class BrowserController {
       error: null,
       snapshot: this.flowState.snapshot,
     };
+    this.updateFlowWindows();
     this.updatePanel(this.inspectionSession?.card ?? null);
     this.inspector?.refreshHover();
   }
 
+  private handleInspectWindowClosed(): void {
+    if (!this.inspectOpen) return;
+    this.inspectOpen = false;
+    this.stopFlow();
+  }
+
+  setMapOpen(open: boolean): void {
+    if (!open) {
+      if (!this.inspectOpen) return;
+      this.inspectOpen = false;
+      this.inspectWindow.close();
+      this.stopFlow();
+      return;
+    }
+    if (!this.state.inspectionEnabled || this.view === null) return;
+    if (this.inspectOpen) {
+      this.inspectWindow.focus();
+      return;
+    }
+    this.inspectOpen = true;
+    this.cancelHover();
+    this.inspectWindow.open();
+    const contents = this.inspectWindow.webContents();
+    if (contents !== null) {
+      this.trackShift(contents);
+    }
+    this.startFlow();
+  }
+
   private markFlowDirty(): void {
-    if (!this.mapOpen) return;
+    if (!this.flowOpen) return;
     this.flowDirty = true;
     this.scheduleFlowRefresh();
   }
 
   private scheduleFlowRefresh(): void {
-    if (!this.mapOpen || this.flowTimer !== null) return;
+    if (!this.flowOpen || this.flowTimer !== null) return;
     this.flowTimer = setTimeout(() => {
       this.flowTimer = null;
-      void this.refreshMap(false);
+      void this.refreshFlow(false);
     }, FLOW_REFRESH_MS);
   }
 
-  private async refreshMap(refreshRoutes: boolean): Promise<void> {
-    if (!this.mapOpen) return;
+  private async refreshFlow(refreshRoutes: boolean): Promise<void> {
+    if (!this.flowOpen) return;
+    // Mientras la página carga, las peticiones llegan a ráfagas: reconstruir el mapa
+    // en cada ráfaga compite con la carga y la frena. Se reconstruye al terminar.
+    if (!refreshRoutes && this.state.loading) {
+      this.flowDirty = true;
+      this.scheduleFlowRefresh();
+      return;
+    }
     if (this.flowBuilding) {
       this.flowDirty = true;
       this.scheduleFlowRefresh();
@@ -1378,7 +1535,7 @@ export class BrowserController {
     this.flowBuilding = true;
     this.flowDirty = false;
     this.flowState = { ...this.flowState, open: true, building: true, error: null };
-    this.mapWindow.updateMap(this.flowState);
+    this.updateFlowWindows();
     try {
       if (refreshRoutes) {
         this.routes.invalidate();
@@ -1389,7 +1546,7 @@ export class BrowserController {
         ]);
         this.syncInspectorRoutes();
       }
-      if (generation !== this.flowGeneration || !this.mapOpen) return;
+      if (generation !== this.flowGeneration || !this.flowOpen) return;
       const started = Date.now();
       const snapshot = buildFlowSnapshot({
         traces: this.flowLedger.all(),
@@ -1406,10 +1563,12 @@ export class BrowserController {
         occurrences: this.flowInteractions.occurrenceList(),
         runtimeLinks: this.runtimeLinks.all(),
         runtimeHandlers: this.runtimeHandlers.all(),
+        runtimeSql: [...this.runtimeSql.values()],
+        runtimeJson: [...this.runtimeJson.values()],
       });
-      if (generation !== this.flowGeneration || !this.mapOpen) return;
+      if (generation !== this.flowGeneration || !this.flowOpen) return;
       this.flowState = { open: true, building: false, error: null, snapshot };
-      this.mapWindow.updateMap(this.flowState);
+      this.updateFlowWindows();
       this.log.info('Mapa de flujo construido', {
         ms: Date.now() - started,
         nodes: snapshot.nodes.length,
@@ -1420,21 +1579,21 @@ export class BrowserController {
         requests: snapshot.stats.requests,
       });
     } catch (error) {
-      if (generation !== this.flowGeneration || !this.mapOpen) return;
+      if (generation !== this.flowGeneration || !this.flowOpen) return;
       this.flowState = {
         ...this.flowState,
         open: true,
         building: false,
         error: error instanceof Error ? error.message : String(error),
       };
-      this.mapWindow.updateMap(this.flowState);
+      this.updateFlowWindows();
       this.log.warn('No se pudo construir el mapa de flujo', {
         message: error instanceof Error ? error.message : String(error),
       });
     } finally {
       if (generation === this.flowGeneration) {
         this.flowBuilding = false;
-        if (this.flowDirty && this.mapOpen) {
+        if (this.flowDirty && this.flowOpen) {
           this.flowDirty = false;
           this.scheduleFlowRefresh();
         }
@@ -1443,7 +1602,7 @@ export class BrowserController {
   }
 
   private resetFlow(): void {
-    this.mapOpen = false;
+    this.inspectOpen = false;
     this.flowGeneration += 1;
     this.flowBuilding = false;
     this.flowDirty = false;
@@ -1456,6 +1615,17 @@ export class BrowserController {
       this.inventoryTimer = null;
     }
     this.flowLedger.clear();
+    this.runtimeSql.clear();
+    this.sqlCaptureInfo = null;
+    this.sqlExecutions = 0;
+    this.sqlSampled = 0;
+    this.sqlLastAt = null;
+    this.runtimeJson.clear();
+    this.jsonBodySent.clear();
+    this.jsonCaptureInfo = null;
+    this.jsonMovements = 0;
+    this.jsonBodies = 0;
+    this.jsonLastAt = null;
     this.flowInteractions.clear();
     this.runtimeLinks.clear();
     this.runtimeHandlers.clear();
@@ -1467,11 +1637,11 @@ export class BrowserController {
     this.frontendDetection = null;
     this.frontendDetectionUrl = null;
     this.flowState = { open: false, building: false, error: null, snapshot: null };
-    this.mapWindow.updateMap(this.flowState);
+    this.updateFlowWindows();
   }
 
   private scheduleInventoryRefresh(delay = 800): void {
-    if (!this.mapOpen || this.inventoryTimer !== null) return;
+    if (!this.flowOpen || this.inventoryTimer !== null) return;
     this.inventoryTimer = setTimeout(() => {
       this.inventoryTimer = null;
       void this.refreshInventory();
@@ -1482,6 +1652,10 @@ export class BrowserController {
     const view = this.view;
     if (view === null || view.webContents.isDestroyed()) return;
     if (!this.state.connected || !this.state.inspectionEnabled) return;
+    if (this.state.loading) {
+      if (schedule) this.scheduleInventoryRefresh(600);
+      return;
+    }
     const contents = view.webContents;
     let url: string;
     try {
@@ -1491,8 +1665,26 @@ export class BrowserController {
       return;
     }
     if (!url.startsWith('http://') && !url.startsWith('https://')) return;
+    if (this.inventoryRunning) {
+      if (schedule) this.scheduleInventoryRefresh(600);
+      return;
+    }
+    this.inventoryRunning = true;
     try {
-      const result = await contents.executeJavaScript(INVENTORY_SCRIPT);
+      let result: unknown;
+      if (contents.debugger.isAttached()) {
+        // Runtime.evaluate espera la promesa del inventario por tandas sin
+        // bloquear el hilo de la página durante todo el recorrido.
+        const response = (await contents.debugger.sendCommand('Runtime.evaluate', {
+          expression: INVENTORY_SCRIPT,
+          awaitPromise: true,
+          returnByValue: true,
+          silent: true,
+        })) as { result?: { value?: unknown } };
+        result = response.result?.value;
+      } else {
+        result = await contents.executeJavaScript(INVENTORY_SCRIPT);
+      }
       if (this.view?.webContents !== contents) return;
       const controls = parseInventory(result);
       const signature = inventorySignature(controls);
@@ -1507,6 +1699,8 @@ export class BrowserController {
       this.log.debug('No se pudo inventariar los controles de la página', {
         message: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      this.inventoryRunning = false;
     }
   }
 
@@ -1526,7 +1720,7 @@ export class BrowserController {
   }
 
   private scheduleAutoResolve(delay = 600): void {
-    if (!this.mapOpen || !this.state.connected || !this.state.inspectionEnabled) return;
+    if (!this.flowOpen || !this.state.connected || !this.state.inspectionEnabled) return;
     if (this.autoResolveRunning) {
       this.autoResolveWanted = true;
       return;
@@ -1541,33 +1735,38 @@ export class BrowserController {
   }
 
   private async runAutoResolve(): Promise<void> {
-    if (this.autoResolveRunning || !this.mapOpen) return;
+    if (this.autoResolveRunning || !this.flowOpen) return;
     const inspector = this.inspector;
     if (inspector === null) return;
     const generation = this.autoResolveGeneration;
     this.autoResolveRunning = true;
     try {
-      while (this.mapOpen && generation === this.autoResolveGeneration) {
+      while (this.flowOpen && generation === this.autoResolveGeneration) {
         const ref = this.nextAutoResolveRef();
         if (ref === null) break;
         this.autoResolved.add(ref.key);
         let resolution: HoverResolution | null = null;
         try {
-          resolution = await inspector.resolveRef(ref, true);
+          // Sin procedencia: recorrer el estado de React por cada control bloquea
+          // la página justo cuando el usuario interactúa. Solo manejador y elemento.
+          resolution = await inspector.resolveRef(ref, true, false);
         } catch (error) {
           this.log.debug('No se pudo resolver el control indexado', {
             message: error instanceof Error ? error.message : String(error),
             element: ref.selector,
           });
         }
-        if (!this.mapOpen || generation !== this.autoResolveGeneration) break;
+        if (!this.flowOpen || generation !== this.autoResolveGeneration) break;
         if (resolution !== null) {
           this.recordRuntimeResolution(resolution.element, resolution.handler, true);
         }
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 20);
+        });
       }
     } finally {
       this.autoResolveRunning = false;
-      if (this.autoResolveWanted && this.mapOpen) {
+      if (this.autoResolveWanted && this.flowOpen) {
         this.autoResolveWanted = false;
         this.scheduleAutoResolve(200);
       }
@@ -1594,23 +1793,10 @@ export class BrowserController {
     this.inventory = [];
     this.inventoryKey = '';
     this.runtimeHandlers.clear();
+    this.hoverResolutionCache = null;
     this.resetAutoResolve();
     this.markFlowDirty();
-    if (this.mapOpen) this.scheduleInventoryRefresh(0);
-  }
-
-  private scheduleSecurityScan(delay = SECURITY_SCAN_DELAY_MS): void {
-    this.cancelSecurityScan();
-    this.securityTimer = setTimeout(() => {
-      this.securityTimer = null;
-      void this.scanSecurity();
-    }, delay);
-  }
-
-  private cancelSecurityScan(): void {
-    if (this.securityTimer === null) return;
-    clearTimeout(this.securityTimer);
-    this.securityTimer = null;
+    if (this.flowOpen && !this.state.loading) this.scheduleInventoryRefresh(0);
   }
 
   private isWorkspaceUrl(url: string): boolean {
@@ -1776,7 +1962,7 @@ export class BrowserController {
     if (this.shiftHeld === held) return;
     this.shiftHeld = held;
     this.inspector?.setShiftHeld(held);
-    this.mapWindow.setShiftHeld(held);
+    this.inspectWindow.setShiftHeld(held);
   }
 
   selectPanelRequest(requestId: string): void {
@@ -1805,6 +1991,7 @@ export class BrowserController {
   private cancelHover(): void {
     this.hoverSequence += 1;
     this.hoverPending = null;
+    this.hoverResolutionCache = null;
     this.inspector?.hideTooltip();
   }
 
@@ -1823,7 +2010,7 @@ export class BrowserController {
   }
 
   dispose(): void {
-    this.mapWindow.close();
+    this.inspectWindow.close();
     this.teardownConnection();
     this.window = null;
   }
@@ -1958,7 +2145,6 @@ export class BrowserController {
     });
     contents.on('did-start-loading', () => {
       if (!isCurrent()) return;
-      this.cancelSecurityScan();
       this.securityGeneration += 1;
       this.security.markStale();
       this.send({ type: 'security', report: this.security.current() });
@@ -1974,12 +2160,15 @@ export class BrowserController {
         captureActive: contents.debugger.isAttached(),
       };
       this.emitState();
+      if (this.flowOpen) {
+        this.markFlowDirty();
+        this.scheduleInventoryRefresh(250);
+      }
     });
     contents.on('did-finish-load', () => {
       if (!isCurrent()) return;
       this.handlePageChanged();
       void this.ensureFrontendFramework();
-      this.scheduleSecurityScan();
     });
     contents.on('did-navigate', (_event, url) => {
       if (!isCurrent()) return;
@@ -2066,16 +2255,52 @@ export class BrowserController {
     }
   }
 
+  private setDebuggerEnabled(enabled: boolean): Promise<void> {
+    const run = this.debuggerGate.then(() => this.applyDebuggerEnabled(enabled));
+    this.debuggerGate = run.catch(() => undefined);
+    return run;
+  }
+
+  private async applyDebuggerEnabled(enabled: boolean): Promise<void> {
+    const view = this.view;
+    if (view === null || view.webContents.isDestroyed()) return;
+    const target = view.webContents.debugger;
+    if (!target.isAttached()) return;
+    if (enabled === this.debuggerEnabled) return;
+    if (enabled) {
+      try {
+        await withTimeout(target.sendCommand('Debugger.enable'), 'Debugger.enable');
+        await target.sendCommand('Debugger.setSkipAllPauses', { skip: true });
+        // Capturar la pila asíncrona completa obliga a V8 a retener una traza por cada
+        // promesa de la página; solo se usa el primer frame de la pila síncrona.
+        await target.sendCommand('Debugger.setAsyncCallStackDepth', { maxDepth: 0 });
+      } catch (error) {
+        this.log.warn('No se pudo activar el dominio Debugger', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+      this.debuggerEnabled = true;
+      return;
+    }
+    this.debuggerEnabled = false;
+    await target.sendCommand('Debugger.disable').catch(() => undefined);
+    this.inspector?.dropScriptCaches();
+    this.security.handleMessage('Debugger.globalObjectCleared', {});
+  }
+
   private async attachCapture(view: WebContentsView): Promise<void> {
     const target = view.webContents.debugger;
     target.attach('1.3');
     try {
       await withTimeout(target.sendCommand('Network.enable'), 'Network.enable');
-      await withTimeout(target.sendCommand('Debugger.enable'), 'Debugger.enable');
       await withTimeout(target.sendCommand('Runtime.enable'), 'Runtime.enable');
       await target.sendCommand('Log.enable').catch(() => undefined);
-      await target.sendCommand('Debugger.setSkipAllPauses', { skip: true });
-      await target.sendCommand('Debugger.setAsyncCallStackDepth', { maxDepth: 2147483647 });
+      this.debuggerEnabled = false;
+      this.debuggerGate = Promise.resolve();
+      if (this.state.inspectionEnabled) {
+        await this.applyDebuggerEnabled(true);
+      }
       this.log.debug('Captura CDP activa');
     } catch (error) {
       if (target.isAttached()) target.detach();
@@ -2091,6 +2316,7 @@ export class BrowserController {
     target.on('detach', (_event, reason) => {
       if (this.view !== view) return;
       this.log.warn('Depurador CDP desadjuntado', { reason });
+      this.debuggerEnabled = false;
       this.state = { ...this.state, captureActive: false };
       this.emitState();
     });
@@ -2262,13 +2488,35 @@ export class BrowserController {
     const generation = this.hoverSequence;
     const mode = this.inspectionMode;
     const withHandler = mode !== 'html';
+    const cacheKey = signal.ref?.key ?? '';
+    const cached = this.hoverResolutionCache;
     let resolution: HoverResolution | null = null;
-    try {
-      resolution = await inspector.resolveHover(signal, withHandler);
-    } catch (error) {
-      this.log.debug('No se pudo inspeccionar el elemento bajo el mouse', {
-        message: error instanceof Error ? error.message : String(error),
-      });
+    if (
+      cached !== null &&
+      cacheKey !== '' &&
+      cached.key === cacheKey &&
+      cached.mode === mode &&
+      Date.now() - cached.at < HOVER_RESOLUTION_TTL_MS
+    ) {
+      const rect =
+        signal.rect !== null && (signal.rect.width > 0 || signal.rect.height > 0)
+          ? signal.rect
+          : cached.value.element.rect;
+      resolution = {
+        ...cached.value,
+        element: { ...cached.value.element, ref: signal.ref, rect },
+      };
+    } else {
+      try {
+        resolution = await inspector.resolveHover(signal, withHandler);
+      } catch (error) {
+        this.log.debug('No se pudo inspeccionar el elemento bajo el mouse', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      if (resolution !== null && cacheKey !== '') {
+        this.hoverResolutionCache = { key: cacheKey, mode, at: Date.now(), value: resolution };
+      }
     }
     if (generation !== this.hoverSequence) return;
     if (resolution === null) {
@@ -2319,6 +2567,13 @@ export class BrowserController {
               note: handler.note,
               at: Date.now(),
             });
+      if (auto) {
+        // El barrido automático solo registra manejadores: buscar coincidencias
+        // de texto en todas las respuestas por cada control bloquea el proceso
+        // principal justo cuando el usuario interactúa.
+        if (handlerChanged) this.markFlowDirty();
+        return;
+      }
       const provenance = this.hoverProvenance(element);
       const runtime = provenance.runtime;
       const request = provenance.request;
@@ -2457,8 +2712,9 @@ export class BrowserController {
     const key = `${query ?? ''}\u0000${String(count)}\u0000${runtimeSignature}\u0000${dataHints
       .map((hint) => `${hint.path}\u0002${hint.value}`)
       .join('\u0001')}`;
-    const cached = this.hoverProvenanceCache;
-    if (cached !== null && cached.key === key && Date.now() - cached.at < 1200) {
+    const cached = this.hoverProvenanceCache.get(key);
+    const now = Date.now();
+    if (cached !== undefined && now - cached.at < 1200) {
       return cached.value;
     }
 
@@ -2492,7 +2748,10 @@ export class BrowserController {
       route: route === null ? null : `${route.file}:${String(route.line)}`,
       database: value.database === null ? null : value.database.database,
     });
-    this.hoverProvenanceCache = { key, at: Date.now(), value };
+    for (const [entryKey, entry] of this.hoverProvenanceCache) {
+      if (now - entry.at >= 1200) this.hoverProvenanceCache.delete(entryKey);
+    }
+    this.hoverProvenanceCache.set(key, { at: now, value });
     return value;
   }
 
@@ -4117,7 +4376,108 @@ export class BrowserController {
     return changed;
   }
 
+  private onJsonCaptureChanged(info: JsonCaptureInfo): void {
+    this.jsonCaptureInfo = {
+      ok: info.ok,
+      hooks: [...info.hooks],
+      error: info.error,
+      movements: 0,
+      bodies: 0,
+      lastAt: null,
+    };
+    this.updateFlowWindows();
+    this.scheduleJsonPush();
+    if (!info.ok) {
+      this.recordActivity({
+        category: 'backend',
+        tone: 'warning',
+        title: 'La captura JSON en runtime no está disponible',
+        detail: info.error ?? 'El inspector no pudo instalar los hooks de JSON.',
+      });
+      return;
+    }
+    this.recordActivity({
+      category: 'json',
+      title: 'Captura JSON de runtime activa',
+      detail: `Hooks: ${info.hooks.join(', ')} · cuerpos enmascarados antes de mostrarse`,
+    });
+  }
+
+  private onJsonCaptured(execution: CapturedJsonExecution): void {
+    const body = execution.truncated ? null : sanitizeJsonBody(execution.body, MAX_BODY_CHARS);
+    if (body === null && !execution.truncated) return;
+    const key = [
+      execution.kind,
+      execution.direction,
+      execution.method ?? '',
+      execution.path ?? '',
+      execution.status === null ? '' : String(execution.status),
+      body?.text ?? '',
+    ].join('\u0000');
+    const frame = this.jsonFrame(execution);
+    const previous = this.runtimeJson.get(key);
+    this.jsonMovements += 1;
+    if (body !== null) this.jsonBodies += 1;
+    this.jsonLastAt = execution.at;
+    this.runtimeJson.set(key, {
+      id: previous?.id ?? `json-${String(++this.jsonRuntimeSequence)}`,
+      kind: execution.kind,
+      direction: execution.direction,
+      method: execution.method,
+      path: execution.path,
+      status: execution.status,
+      at: execution.at,
+      count: (previous?.count ?? 0) + 1,
+      file: frame?.file ?? previous?.file ?? null,
+      line: frame?.line ?? previous?.line ?? 0,
+      column: frame?.column ?? previous?.column ?? 0,
+      body: body?.text ?? previous?.body ?? null,
+      truncated:
+        execution.truncated || (body?.truncated ?? false) || (previous?.truncated ?? false),
+    });
+    this.scheduleJsonPush();
+    if (!this.runtimeJsonActivitySeen.has(key)) {
+      this.runtimeJsonActivitySeen.add(key);
+      const where =
+        execution.method !== null && execution.path !== null
+          ? `${execution.method} ${execution.path}${
+              execution.status === null ? '' : ` · ${String(execution.status)}`
+            }`
+          : null;
+      this.recordActivity({
+        category: 'json',
+        tone: 'ok',
+        title: `JSON ${JSON_KIND_LABEL[execution.kind]}${where === null ? '' : ` · ${where}`}`,
+        detail:
+          body === null
+            ? 'Cuerpo recortado; no se muestra para no exponer datos sin enmascarar.'
+            : body.text,
+        file: frame?.file ?? null,
+        line: frame?.line ?? null,
+      });
+    }
+  }
+
+  private jsonFrame(execution: CapturedJsonExecution): RelativeFrame | null {
+    for (const frame of execution.frames) {
+      const file = this.relativeFramePath(frame.file);
+      if (file === null) continue;
+      return { file, line: frame.line, column: frame.column };
+    }
+    return null;
+  }
+
   private onSqlCaptureChanged(info: SqlCaptureInfo): void {
+    this.sqlCaptureInfo = {
+      ok: info.ok,
+      drivers: [...info.drivers],
+      prisma: info.prisma,
+      error: info.error,
+      executions: 0,
+      sampled: 0,
+      lastAt: null,
+    };
+    this.updateFlowWindows();
     if (!info.ok) {
       this.recordActivity({
         category: 'backend',
@@ -4138,7 +4498,10 @@ export class BrowserController {
       });
       return;
     }
-    const detail = [`Drivers: ${info.drivers.join(', ')}`, 'solo texto SQL, sin parámetros'];
+    const detail = [
+      `Drivers: ${info.drivers.join(', ')}`,
+      'consulta y muestra de filas devueltas; sin parámetros',
+    ];
     if (info.prisma) {
       detail.push('Prisma usa un motor propio: su SQL no se puede leer desde el driver');
     }
@@ -4171,11 +4534,46 @@ export class BrowserController {
         line: frame?.line ?? null,
       });
     }
+    this.recordRuntimeSql(execution);
     const session = this.inspectionSession;
     if (session === null) return;
     if (this.applyCapturedSql(session, execution)) {
       this.updatePanel(session.card);
     }
+  }
+
+  private recordRuntimeSql(execution: CapturedSqlExecution): void {
+    const normalized = normalizeSqlText(execution.sql);
+    if (normalized === '') return;
+    this.sqlExecutions += 1;
+    if (execution.sample !== null) this.sqlSampled += 1;
+    this.sqlLastAt = execution.at;
+    const previous = this.runtimeSql.get(normalized);
+    const analysis = analyzeSql(execution.sql)[0];
+    const frame = this.primaryFrame(execution);
+    this.runtimeSql.set(normalized, {
+      sql: execution.sql,
+      driver: execution.driver,
+      observedAt: execution.at,
+      count: (previous?.count ?? 0) + 1,
+      file: frame?.file ?? previous?.file ?? null,
+      line: frame?.line ?? previous?.line ?? 0,
+      column: frame?.column ?? previous?.column ?? 0,
+      operation: analysis?.operation ?? previous?.operation ?? sqlOperationFromText(execution.sql),
+      tablesRead:
+        analysis === undefined ? [...(previous?.tablesRead ?? [])] : [...analysis.tablesRead],
+      tablesWritten:
+        analysis === undefined ? [...(previous?.tablesWritten ?? [])] : [...analysis.tablesWritten],
+      columns:
+        analysis === undefined
+          ? (previous?.columns ?? []).map((column) => ({ ...column }))
+          : analysis.columns.map((column) => ({ ...column })),
+      dialect: analysis?.dialect ?? previous?.dialect ?? null,
+      parse: analysis?.parse ?? previous?.parse ?? 'fallback',
+      selectStar: analysis?.selectStar ?? previous?.selectStar ?? false,
+      result: this.inspectionResult(execution) ?? previous?.result ?? null,
+    });
+    this.markFlowDirty();
   }
 
   private applyCapturedSql(session: InspectionSession, execution: CapturedSqlExecution): boolean {
@@ -4193,7 +4591,16 @@ export class BrowserController {
       (query) => query.sql !== null && normalizeSqlText(query.sql) === normalized,
     );
     if (known !== undefined) {
-      if (known.status === 'observed') return false;
+      const result = this.inspectionResult(execution);
+      let changed = false;
+      if (
+        result !== null &&
+        (known.result === null || known.result.observedAt !== result.observedAt)
+      ) {
+        known.result = result;
+        changed = true;
+      }
+      if (known.status === 'observed') return changed;
       known.status = 'observed';
       known.observedAt = execution.at;
       addEvidence(card, 'RUNTIME');
@@ -4224,6 +4631,7 @@ export class BrowserController {
       callObject: null,
       note: null,
       observedAt: execution.at,
+      result: this.inspectionResult(execution),
     });
     addEvidence(card, 'RUNTIME');
     this.log.info('Consulta SQL capturada en runtime', {
@@ -4233,6 +4641,19 @@ export class BrowserController {
       operation: analysis?.operation ?? null,
     });
     return true;
+  }
+
+  private inspectionResult(execution: CapturedSqlExecution): InspectionSqlResult | null {
+    const sample = execution.sample;
+    if (sample === null) return null;
+    return {
+      columns: [...sample.columns],
+      rows: sample.rows.map((row) => [...row]),
+      rowCount: sample.rowCount,
+      truncated: sample.truncated,
+      observedAt: execution.at,
+      driver: execution.driver,
+    };
   }
 
   private primaryFrame(execution: CapturedSqlExecution): RelativeFrame | null {
@@ -4814,16 +5235,15 @@ export class BrowserController {
   }
 
   private teardownConnection(): void {
-    this.cancelSecurityScan();
     this.securityGeneration += 1;
     this.firstPartyUrls.clear();
     const securityReport = this.security.reset();
     this.send({ type: 'security', report: securityReport });
     this.resetFlow();
-    this.mapWindow.close();
+    this.inspectWindow.close();
     this.dismissCard();
     this.inspectionSession = null;
-    this.hoverProvenanceCache = null;
+    this.hoverProvenanceCache.clear();
     this.lastRuntimeStatus = null;
     this.setShiftHeld(false);
     this.activitySequence = 0;
@@ -4845,6 +5265,8 @@ export class BrowserController {
     const inspector = this.inspector;
     this.inspector = null;
     inspector?.dispose();
+    this.debuggerEnabled = false;
+    this.debuggerGate = Promise.resolve();
 
     const view = this.view;
     this.view = null;

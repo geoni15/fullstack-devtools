@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import type { BrowserMode, LaunchRequest, ProjectSetupDetection } from '@bdt/protocol';
+import type {
+  BrowserMode,
+  LaunchRequest,
+  ProjectSetupDetection,
+  StoredLaunchSetup,
+} from '@bdt/protocol';
 import { bdt } from '../api';
 import { useBrowser } from '../state/browser-store';
 
@@ -106,6 +111,7 @@ export function AppView({ active }: AppViewProps) {
   const [mode, setMode] = useState<BrowserMode>('window');
   const [detected, setDetected] = useState<ProjectSetupDetection | null>(null);
   const [detecting, setDetecting] = useState(false);
+  const [usingStored, setUsingStored] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [dismissedError, setDismissedError] = useState<string | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -146,6 +152,20 @@ export function AppView({ active }: AppViewProps) {
   useEffect(() => {
     let activeDetection = true;
 
+    const applyStored = (stored: StoredLaunchSetup): void => {
+      const touched = touchedRef.current;
+      setFrontendBase(stored.frontendBase);
+      if (!touched.frontendPort) setFrontendPort(stored.frontendPort);
+      if (!touched.frontendCommand) setFrontendCommand(stored.frontendCommand);
+      if (!touched.frontendCwd) setFrontendCwd(stored.frontendCwd);
+      setBackendBase(stored.backendBase);
+      if (!touched.backendPort) setBackendPort(stored.backendPort);
+      if (!touched.backendCommand) setBackendCommand(stored.backendCommand);
+      if (!touched.backendCwd) setBackendCwd(stored.backendCwd);
+      setInspectorPort(stored.inspectorPort);
+      setMode(stored.mode);
+    };
+
     const apply = (detection: ProjectSetupDetection | null): void => {
       setDetected(detection);
       const touched = touchedRef.current;
@@ -179,25 +199,36 @@ export function AppView({ active }: AppViewProps) {
       }
     };
 
-    const load = async (resetTouched: boolean): Promise<void> => {
-      if (resetTouched) {
-        touchedRef.current = { ...UNTOUCHED };
-      }
+    const load = async (): Promise<void> => {
       setDetecting(true);
       try {
-        const result = await bdt.detectProjectSetup();
+        const [storedResult, detectionResult] = await Promise.all([
+          bdt.loadStoredSetup(),
+          bdt.detectProjectSetup(),
+        ]);
         if (!activeDetection) return;
-        apply(result.ok ? result.value : null);
+        const stored = storedResult.ok ? storedResult.value : null;
+        const detection = detectionResult.ok ? detectionResult.value : null;
+        setUsingStored(stored !== null);
+        if (stored !== null) {
+          setDetected(detection);
+          applyStored(stored);
+        } else {
+          apply(detection);
+        }
       } catch {
-        if (activeDetection) apply(null);
+        if (activeDetection) {
+          setUsingStored(false);
+          apply(null);
+        }
       } finally {
         if (activeDetection) setDetecting(false);
       }
     };
 
-    void load(false);
+    void load();
     const unsubscribe = bdt.onWorkspaceChanged(() => {
-      void load(true);
+      void load();
     });
     return () => {
       activeDetection = false;
@@ -237,6 +268,19 @@ export function AppView({ active }: AppViewProps) {
       setLocalError(errorMessage(error));
       return;
     }
+    const stored: StoredLaunchSetup = {
+      frontendBase,
+      frontendPort,
+      frontendCommand,
+      frontendCwd,
+      backendBase,
+      backendPort,
+      backendCommand,
+      backendCwd,
+      inspectorPort,
+      mode,
+    };
+    void bdt.saveStoredSetup(stored).catch(() => undefined);
     void connect(frontendUrl, backendUrl, mode, nodeInspectorPort, frontendLaunch, backendLaunch);
   };
 
@@ -406,7 +450,10 @@ export function AppView({ active }: AppViewProps) {
             title={detectionEvidence}
           >
             <span className="connect-role">Detección automática</span>
-            <span className="connect-role-note">{setupLabel(detected, detecting)}</span>
+            <span className="connect-role-note">
+              {usingStored ? 'Usando el setup guardado de este proyecto. ' : ''}
+              {setupLabel(detected, detecting)}
+            </span>
           </div>
 
           <div className="connect-grid">

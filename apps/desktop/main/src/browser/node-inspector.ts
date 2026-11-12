@@ -10,6 +10,14 @@ import type { StaticRoute, StaticSqlSite } from '@bdt/routes-index';
 import type { Logger } from '../logger';
 import { isLoopbackHost } from './endpoints';
 import {
+  JSON_CAPTURE_DRAIN_EXPRESSION,
+  JSON_CAPTURE_SOURCE,
+  parseCapturedJson,
+  parseJsonCaptureInfo,
+  type CapturedJsonExecution,
+  type JsonCaptureInfo,
+} from './json-capture';
+import {
   SQL_CAPTURE_DRAIN_EXPRESSION,
   SQL_CAPTURE_SOURCE,
   parseCapturedSql,
@@ -22,6 +30,7 @@ import { readCodeBlock } from './source-snippet';
 const CONNECT_TIMEOUT_MS = 4000;
 const COMMAND_TIMEOUT_MS = 5000;
 const SQL_POLL_MS = 400;
+const JSON_POLL_MS = 400;
 const MAX_BREAKPOINTS = 200;
 const EXECUTION_CONTEXT_BEFORE = 2;
 const EXECUTION_CONTEXT_AFTER = 6;
@@ -92,6 +101,8 @@ export interface NodeInspectorOptions {
   onSqlExecuted(observation: SqlObservation): void;
   onSqlCaptured(execution: CapturedSqlExecution): void;
   onSqlCapture(info: SqlCaptureInfo): void;
+  onJsonCaptured(execution: CapturedJsonExecution): void;
+  onJsonCapture(info: JsonCaptureInfo): void;
   log: Logger;
 }
 
@@ -149,6 +160,7 @@ export class NodeInspector {
   private runtime: InspectionRuntime = { status: 'off', port: null, message: null };
   private queue: Promise<void> = Promise.resolve();
   private sqlTimer: ReturnType<typeof setTimeout> | null = null;
+  private jsonTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
 
   constructor(private readonly options: NodeInspectorOptions) {}
@@ -195,6 +207,7 @@ export class NodeInspector {
       this.connected = true;
       await this.setRoutes(this.routes);
       await this.startSqlCapture(generation);
+      await this.startJsonCapture(generation);
     } catch (error) {
       if (!this.isCurrent(generation)) return;
       this.closeSocket();
@@ -240,6 +253,7 @@ export class NodeInspector {
     this.breakpoints.clear();
     this.scripts.clear();
     this.stopSqlPolling();
+    this.stopJsonPolling();
     this.closeSocket();
     this.setRuntime({ status: 'off', port: null, message: null });
   }
@@ -329,6 +343,7 @@ export class NodeInspector {
       this.connected = false;
       this.breakpoints.clear();
       this.stopSqlPolling();
+      this.stopJsonPolling();
       this.rejectPending(new Error('La conexión con el inspector se cerró.'));
       this.setRuntime({
         status: 'unavailable',
@@ -747,8 +762,89 @@ export class NodeInspector {
     }
   }
 
+  private async startJsonCapture(generation: number): Promise<void> {
+    this.stopJsonPolling();
+    try {
+      const response = await this.send<EvaluateResult>('Runtime.evaluate', {
+        expression: JSON_CAPTURE_SOURCE,
+        awaitPromise: true,
+        returnByValue: true,
+        silent: true,
+        includeCommandLineAPI: false,
+      });
+      if (!this.isCurrent(generation)) return;
+      const raw = response.result?.value;
+      let info: JsonCaptureInfo | null = null;
+      if (typeof raw === 'string') {
+        try {
+          info = parseJsonCaptureInfo(JSON.parse(raw) as unknown);
+        } catch {
+          info = null;
+        }
+      }
+      if (info !== null) {
+        this.options.log.info('Captura JSON en runtime', {
+          hooks: info.hooks,
+          ok: info.ok,
+        });
+        this.options.onJsonCapture(info);
+      }
+    } catch (error) {
+      if (this.isCurrent(generation)) {
+        this.options.log.debug('No se pudo activar la captura JSON en runtime', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    this.scheduleJsonPoll(generation);
+  }
+
+  private scheduleJsonPoll(generation: number): void {
+    if (this.jsonTimer !== null || !this.connected) return;
+    this.jsonTimer = setTimeout(() => {
+      void this.pollJson(generation);
+    }, JSON_POLL_MS);
+  }
+
+  private async pollJson(generation: number): Promise<void> {
+    this.jsonTimer = null;
+    if (!this.isCurrent(generation) || !this.connected) return;
+    try {
+      const response = await this.send<EvaluateResult>('Runtime.evaluate', {
+        expression: JSON_CAPTURE_DRAIN_EXPRESSION,
+        returnByValue: true,
+        silent: true,
+        includeCommandLineAPI: false,
+      });
+      if (!this.isCurrent(generation)) return;
+      const raw = response.result?.value;
+      if (typeof raw === 'string') {
+        for (const execution of parseCapturedJson(raw)) {
+          this.options.onJsonCaptured(execution);
+        }
+      }
+    } catch (error) {
+      if (this.isCurrent(generation)) {
+        this.options.log.debug('No se pudo drenar la captura JSON', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    if (this.isCurrent(generation) && this.connected) {
+      this.scheduleJsonPoll(generation);
+    }
+  }
+
+  private stopJsonPolling(): void {
+    if (this.jsonTimer !== null) {
+      clearTimeout(this.jsonTimer);
+      this.jsonTimer = null;
+    }
+  }
+
   private closeSocket(): void {
     this.stopSqlPolling();
+    this.stopJsonPolling();
     const socket = this.socket;
     this.socket = null;
     this.connected = false;

@@ -171,9 +171,9 @@ body.map-open main { display: none; }
 #map-results .map-result .name { display: block; margin-top: 1px; color: #e6edf3; font-size: 11px; word-break: break-word; }
 #map-results .map-result .meta { display: block; margin-top: 1px; color: #7d8b99; font-size: 10px; word-break: break-word; }
 .map-paged-foot { padding: 4px 7px; color: #7d8b99; font-size: 9px; letter-spacing: 0.02em; background: #10161e; }
-#map-scope, #map-order { display: flex; gap: 2px; flex: none; }
-#map-scope button, #map-order button { background: #131b24; }
-#map-scope button.is-on, #map-order button.is-on { background: #223044; color: #e6edf3; }
+#map-scope, #map-order, #map-kind { display: flex; gap: 2px; flex: none; }
+#map-scope button, #map-order button, #map-kind button { background: #131b24; }
+#map-scope button.is-on, #map-order button.is-on, #map-kind button.is-on { background: #223044; color: #e6edf3; }
 #map-bar button { height: 24px; min-width: 24px; padding: 0 7px; background: #172029; color: #aab8c5; border: 0; font: 10px/1 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.02em; cursor: pointer; }
 #map-bar button:hover { background: #1d2833; color: #e6edf3; }
 #map-bar button.is-on { background: #223044; color: #e6edf3; }
@@ -211,6 +211,21 @@ body.map-open main { display: none; }
 .map-trace .tag { display: block; color: #9fe3b8; font-size: 10px; font-family: "Cascadia Mono", Consolas, monospace; word-break: break-all; }
 .map-trace .name { display: block; margin-top: 2px; font-size: 11px; color: #e6edf3; word-break: break-word; }
 .map-trace .meta { display: block; margin-top: 1px; font-size: 10px; color: #7d8b99; }
+#map-json-list .empty, #map-trace-list .empty { padding: 4px; color: #7d8b99; font-size: 10px; }
+.json-item { padding: 4px 6px; margin-bottom: 2px; background: #141c25; content-visibility: auto; contain-intrinsic-size: auto 76px; }
+.json-item:hover { background: #1a2430; }
+.json-item .json-head { color: #39c5cf; font: 10px "Cascadia Mono", Consolas, monospace; word-break: break-word; }
+.json-item .json-body { margin-top: 2px; max-height: 72px; overflow: hidden; color: #c9d1d9; font: 10px/1.35 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+.json-list .json-item { background: #0e151c; }
+.json-list .json-item + .json-item { margin-top: 2px; }
+.json-list .json-item .json-body { max-height: 160px; overflow: auto; }
+.json-item .json-where { margin-top: 2px; color: #7d8b99; font-size: 9px; }
+.json-item .json-more { margin-top: 2px; color: #9fc7f5; font-size: 9px; cursor: pointer; }
+.json-item .json-more:hover { color: #7ee7f0; }
+.json-item .json-where .code-link { color: #9fc7f5; }
+.json-item .json-head.is-link { cursor: pointer; }
+.json-item .json-head.is-link:hover { color: #7ee7f0; }
+#map-json-list .json-item.is-preview .json-body { max-height: 54px; }
 #map-canvas { position: relative; flex: 1; min-width: 0; overflow: hidden; background: #0b1017; }
 #map-axis { position: absolute; top: 0; left: 0; right: 0; height: 22px; overflow: hidden; background: #0b1017; pointer-events: none; z-index: 3; }
 #map-axis .axis-label { position: absolute; top: 6px; left: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; color: #7d8b99; font: 600 9px system-ui, "Segoe UI", sans-serif; letter-spacing: 0.1em; white-space: nowrap; }
@@ -263,6 +278,8 @@ body.is-column-resizing, body.is-column-resizing * { cursor: col-resize !importa
 #map-footer .swatch.receive { background: #3fb950; }
 #map-footer .swatch.gateway { background: #d29922; }
 #map-footer .swatch.server { background: #bc8cff; }
+#map-footer .swatch.read { background: #7ee2a8; }
+#map-footer .swatch.write { background: #e3b341; }
 #map-footer .dashed { color: #d29922; }
 #map-footer .faded { color: #56616d; }
 #map-footer .hub { color: #ffd7a8; }
@@ -284,29 +301,69 @@ body.is-column-resizing, body.is-column-resizing * { cursor: col-resize !importa
 .flow-node.is-selected .title { fill: #ffffff; }
 .flow-node.is-chain .box { fill: #1b2836; }
 .flow-node.is-dimmed { opacity: 0.16; }
-.flow-edge { fill: none; stroke: #6e7f8f; stroke-width: 1.6; vector-effect: non-scaling-stroke; }
-.flow-edge-hit { fill: none; stroke: transparent; stroke-width: 12; pointer-events: stroke; }
+.flow-node.is-table { cursor: default; }
+.flow-node.is-table .head { fill: #18222d; }
+.flow-node.is-table .tag { fill: #7d8b99; font: 600 8px system-ui, "Segoe UI", sans-serif; letter-spacing: 0.1em; }
+.flow-node.is-table .count { fill: #9fe3b8; font: 600 8px system-ui, "Segoe UI", sans-serif; text-anchor: end; }
+.flow-node.is-table .note { fill: #7d8b99; font: 9px system-ui, "Segoe UI", sans-serif; }
+.flow-node.is-table .bar-mark.is-read { fill: #7ee2a8; }
+.flow-node.is-table .bar-mark.is-write { fill: #e3b341; }
+.flow-node .data-grid .grid-head { fill: #18222d; }
+.flow-node .data-grid .grid-gutter-head { fill: #10161e; }
+.flow-node .data-grid .grid-head-cell { fill: transparent; }
+.flow-node .data-grid .grid-col-bg { fill: transparent; }
+.flow-node .data-grid .data-grid-col:hover .grid-col-bg { fill: #141c25; }
+.flow-node .data-grid .data-grid-col.is-selected .grid-col-bg { fill: #1b2836; }
+.flow-node .data-grid .grid-head-line { fill: #2a3644; }
+.flow-node .data-grid .grid-sep { fill: #0b1017; }
+.flow-node .data-grid .grid-row { fill: #0f1720; }
+.flow-node .data-grid .grid-row.is-alt { fill: #0d141b; }
+.flow-node .data-grid .grid-num { fill: #56616d; font: 9px "Cascadia Mono", Consolas, monospace; text-anchor: end; }
+.flow-node .data-grid .grid-name { fill: #e6edf3; font: 600 10.5px "Cascadia Mono", Consolas, monospace; }
+.flow-node .data-grid .grid-cell { fill: #d4d4d4; font: 10.5px "Cascadia Mono", Consolas, monospace; }
+.flow-node .data-grid .grid-cell.is-null { fill: #7d8b99; font-style: italic; }
+.flow-node .data-grid .grid-cell.is-absent { fill: #3f4a56; }
+.flow-node .data-grid .grid-cell-picked { fill: #2b3a4d; }
+.flow-node .data-grid .grid-cell-flash { fill: #1f4a73; }
+.flow-node .data-grid .grid-hit { fill: transparent; cursor: pointer; }
+.flow-node .data-grid .data-grid-col:hover .grid-head-cell { fill: #1d2833; }
+.flow-node .data-grid .data-grid-col.is-selected .grid-head-cell { fill: #223044; }
+.flow-node .data-grid .data-grid-col.is-selected .grid-name { fill: #ffffff; }
+.flow-node .data-grid .use { font: 600 8px system-ui, "Segoe UI", sans-serif; letter-spacing: 0.04em; }
+.flow-node .data-grid .use.is-read { fill: #7ee2a8; }
+.flow-node .data-grid .use.is-write { fill: #e3b341; }
+.flow-node .data-grid .use.is-cond { fill: #79b8ff; }
+.flow-node .data-grid .use.is-muted { fill: #7d8b99; }
+.flow-node .data-grid .use.is-result { fill: #c9a0ff; }
+.flow-cell-route { fill: none; stroke: #58a6ff; stroke-width: var(--flow-route-w, 2); }
+.flow-cell-route.is-read { stroke-dasharray: 4 2; }
+.flow-cell-route.is-write { stroke: #e3b341; }
+.flow-cell-dot { fill: #58a6ff; stroke: #0b1017; stroke-width: 1; }
+.flow-edge { fill: none; stroke: #6e7f8f; stroke-width: var(--flow-edge-w, 1.6); }
+.flow-edge-hit { fill: none; stroke: transparent; stroke-width: var(--flow-hit-w, 12); pointer-events: stroke; }
+.is-panning .flow-edge-hit { display: none; }
 .flow-edge.is-send { stroke: #58a6ff; }
 .flow-edge.is-receive { stroke: #3fb950; }
 .flow-edge.is-gateway { stroke: #d29922; }
 .flow-edge.is-server { stroke: #bc8cff; }
 .flow-edge.is-neutral { stroke: #6e7f8f; }
 .flow-edge.is-static-only { opacity: 0.55; }
-.flow-edge.is-heuristic { stroke-dasharray: 5 3; }
-.flow-edge.is-lit { stroke-width: 2.4; }
+.flow-edge.is-heuristic { stroke-dasharray: var(--flow-dash, 5 3); }
+.flow-edge.is-lit { stroke-width: var(--flow-edge-lit-w, 2.4); }
 .flow-edge.is-dimmed { opacity: 0.12; }
 .flow-dir { fill: #8b98a5; font: 700 11px system-ui, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; pointer-events: none; }
 .flow-dir.is-send { fill: #58a6ff; }
 .flow-dir.is-receive { fill: #3fb950; }
 .flow-dir.is-dimmed { opacity: 0.12; }
 .flow-node .time { fill: #7d8b99; font: 9px "Cascadia Mono", Consolas, monospace; text-anchor: end; }
-.flow-edge.is-bundle { stroke-width: 1.8; }
+.flow-edge.is-bundle { stroke-width: var(--flow-edge-bundle-w, 1.8); }
+#map-svg.is-zoom-out text { display: none; }
 `;
 
 const MAP_MARKUP = `<div id="map" hidden>
         <div id="map-bar">
           <div id="map-search-wrap">
-            <input id="map-search" type="search" placeholder="Buscar nodo, ruta, estado o SQL…" aria-label="Buscar en el mapa" spellcheck="false" />
+            <input id="map-search" type="search" placeholder="Buscar nodo, tabla, columna, uso o SQL…" aria-label="Buscar en el mapa" spellcheck="false" />
             <div id="map-results" aria-label="Resultados del mapa" hidden></div>
           </div>
           <div id="map-order" role="group" aria-label="Orden del mapa">
@@ -316,8 +373,13 @@ const MAP_MARKUP = `<div id="map" hidden>
           </div>
           <label id="map-compact-label" title="Muestra solo el título y el contador de cada cuadro para que quepan más nodos en pantalla."><input type="checkbox" id="map-compact" />Vista compacta</label>
           <div id="map-scope" role="group" aria-label="Alcance del tráfico">
-            <button type="button" id="map-scope-all" class="is-on" aria-pressed="true">Todo el tráfico</button>
-            <button type="button" id="map-scope-interacted" aria-pressed="false">Solo lo que interactuaste</button>
+            <button type="button" id="map-scope-all" aria-pressed="false">Todo el tráfico</button>
+            <button type="button" id="map-scope-interacted" class="is-on" aria-pressed="true">Solo lo que interactuaste</button>
+          </div>
+          <div id="map-kind" role="group" aria-label="Operaciones SQL">
+            <button type="button" id="map-kind-all" class="is-on" aria-pressed="true" title="Todas las tablas y celdas">Todo</button>
+            <button type="button" id="map-kind-read" aria-pressed="false" title="Oculta y re-apila solo las lecturas de la base de datos">Lecturas</button>
+            <button type="button" id="map-kind-write" aria-pressed="false" title="Oculta y re-apila solo las escrituras en la base de datos">Escrituras</button>
           </div>
           <select id="map-event" aria-label="Filtrar por evento" title="Atenúa los controles y las cadenas que no salen del evento elegido. Es una vista, no una relación causal.">
             <option value="">Todos los eventos</option>
@@ -327,13 +389,15 @@ const MAP_MARKUP = `<div id="map" hidden>
           <button type="button" id="map-zoom-in" title="Acercar" aria-label="Acercar">+</button>
           <button type="button" id="map-fit">Ajustar</button>
           <button type="button" id="map-tip-toggle" aria-pressed="false" title="Detalle al pasar el cursor; mantén Shift para verlo temporalmente.">Tooltip<span class="key">Shift</span></button>
-          <button type="button" id="map-page" title="Cerrar la ventana del mapa">Cerrar mapa</button>
+          <button type="button" id="map-page" title="Cerrar la ventana del mapa">Cerrar ventana</button>
         </div>
         <div id="map-stack" aria-label="Cadena de tecnologías"></div>
         <div id="map-body">
           <aside id="map-traces" aria-label="Interacciones de la sesión">
             <div class="rail-title" id="map-traces-title">Interacciones de la sesión</div>
             <div id="map-trace-list"></div>
+            <div class="rail-title" id="map-json-title">Movimientos JSON</div>
+            <div id="map-json-list"></div>
           </aside>
           <div id="map-canvas">
             <div id="map-axis" aria-hidden="true"></div>
@@ -352,29 +416,14 @@ const MAP_MARKUP = `<div id="map" hidden>
             <span class="key"><span class="swatch receive"></span>Recibo</span>
             <span class="key"><span class="swatch gateway"></span>Gateway</span>
             <span class="key"><span class="swatch server"></span>Servidor</span>
+            <span class="key"><span class="swatch read"></span>celda leída</span>
+            <span class="key"><span class="swatch write"></span>celda escrita</span>
             <span class="key dashed">discontinua = heurística</span>
             <span class="key faded">atenuada = solo estática</span>
           </span>
-          <span class="hub">Clic izquierdo ilumina la cadena · clic derecho → «Ver interacciones» · doble flecha = ida y vuelta observada · tooltip con el botón o Shift · solo se dibuja lo visible</span>
+          <span class="hub">Clic en una celda = sigue su recorrido hasta el backend · clic izquierdo ilumina la cadena · clic derecho → «Ver interacciones» · tooltip con el botón o Shift · solo se dibuja lo visible</span>
         </div>
       </div>`;
-
-export const FLOW_MAP_HTML = `<!doctype html>
-<html lang="es">
-  <head>
-    <meta charset="utf-8" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'" />
-    <title>Mapa de flujo</title>
-    <style>${PANEL_CSS}
-body { display: flex; flex-direction: column; }
-#map-svg, #map-svg * { user-select: none; -webkit-user-select: none; }
-#map-detail, #map-detail *, #map-traces, #map-traces * { user-select: text; -webkit-user-select: text; }
-    </style>
-  </head>
-  <body class="map-open">
-    ${MAP_MARKUP}
-  </body>
-</html>`;
 
 export const INSPECTION_PANEL_HTML = `<!doctype html>
 <html lang="es">
@@ -493,5 +542,23 @@ export const INSPECTION_PANEL_HTML = `<!doctype html>
         </div>
       </main>
     </div>
+  </body>
+</html>`;
+
+export const UNIFIED_HTML = `<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'" />
+    <title>Mapa de flujo</title>
+    <style>${PANEL_CSS}
+body { display: flex; flex-direction: column; height: 100vh; }
+#map { flex: 1; min-height: 0; }
+#map-svg, #map-svg * { user-select: none; -webkit-user-select: none; }
+#map-detail, #map-detail *, #map-traces, #map-traces * { user-select: text; -webkit-user-select: text; }
+    </style>
+  </head>
+  <body>
+    ${MAP_MARKUP}
   </body>
 </html>`;

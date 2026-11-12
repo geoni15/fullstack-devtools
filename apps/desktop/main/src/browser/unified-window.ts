@@ -1,16 +1,17 @@
 import { BrowserWindow, type WebContents } from 'electron';
-import { BROWSER_PANEL_CHANNELS, type FlowMapState } from '@bdt/protocol';
+import { BROWSER_PANEL_CHANNELS, type FlowJsonState, type FlowMapState } from '@bdt/protocol';
 import type { Logger } from '../logger';
 import { hardenSession } from '../security';
-import { FLOW_MAP_HTML } from './ui-html';
+import { UNIFIED_HTML } from './ui-html';
 
-const MAP_PARTITION = 'bdt-flow-map';
-const MAP_URL = `data:text/html;charset=utf-8,${encodeURIComponent(FLOW_MAP_HTML)}`;
+const INSPECT_PARTITION = 'bdt-inspect';
+const INSPECT_URL = `data:text/html;charset=utf-8,${encodeURIComponent(UNIFIED_HTML)}`;
 
-export class FlowMapWindow {
+export class UnifiedWindow {
   private window: BrowserWindow | null = null;
   private ready = false;
   private state: FlowMapState | null = null;
+  private jsonState: FlowJsonState | null = null;
   private shiftHeld = false;
 
   constructor(
@@ -28,16 +29,16 @@ export class FlowMapWindow {
       return;
     }
     const window = new BrowserWindow({
-      width: 1280,
-      height: 840,
-      minWidth: 780,
-      minHeight: 480,
+      width: 1440,
+      height: 960,
+      minWidth: 1024,
+      minHeight: 640,
       show: false,
       backgroundColor: '#0b1017',
       title: 'Mapa de flujo · Backend DevTools',
       autoHideMenuBar: true,
       webPreferences: {
-        partition: MAP_PARTITION,
+        partition: INSPECT_PARTITION,
         preload: this.preloadPath,
         contextIsolation: true,
         nodeIntegration: false,
@@ -45,6 +46,7 @@ export class FlowMapWindow {
         webviewTag: false,
         spellcheck: false,
         allowRunningInsecureContent: false,
+        backgroundThrottling: false,
       },
     });
     window.setMenuBarVisibility(false);
@@ -66,12 +68,13 @@ export class FlowMapWindow {
       this.window = null;
       this.ready = false;
       this.state = null;
+      this.jsonState = null;
       this.onClosed();
     });
     this.window = window;
     this.ready = false;
-    void window.loadURL(MAP_URL).catch((error: unknown) => {
-      this.log.warn('No se pudo cargar la ventana del mapa de flujo', {
+    void window.loadURL(INSPECT_URL).catch((error: unknown) => {
+      this.log.warn('No se pudo cargar la ventana del mapa', {
         message: error instanceof Error ? error.message : String(error),
       });
     });
@@ -90,6 +93,7 @@ export class FlowMapWindow {
     this.window = null;
     this.ready = false;
     this.state = null;
+    this.jsonState = null;
     this.shiftHeld = false;
     if (window !== null && !window.isDestroyed()) {
       window.close();
@@ -110,6 +114,7 @@ export class FlowMapWindow {
     if (!this.isSender(sender)) return false;
     this.ready = true;
     this.send();
+    this.sendJson();
     this.sendShift();
     return true;
   }
@@ -120,9 +125,21 @@ export class FlowMapWindow {
     this.sendShift();
   }
 
-  updateMap(state: FlowMapState): void {
+  updateState(state: FlowMapState): void {
     this.state = state;
     this.send();
+  }
+
+  updateJsonState(state: FlowJsonState): void {
+    this.jsonState = state;
+    this.sendJson();
+  }
+
+  private sendJson(): void {
+    const window = this.window;
+    if (!this.ready || this.jsonState === null || window === null) return;
+    if (window.isDestroyed() || window.webContents.isDestroyed()) return;
+    window.webContents.send(BROWSER_PANEL_CHANNELS.jsonData, this.jsonState);
   }
 
   private sendShift(): void {

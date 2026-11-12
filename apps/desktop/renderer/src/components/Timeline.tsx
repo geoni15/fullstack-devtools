@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { memo, useCallback, useMemo, useState } from 'react';
 import {
   normalizeSearchText,
   requestStatusView,
@@ -253,6 +253,57 @@ function RequestDetail({ request }: { request: CapturedRequest }) {
   );
 }
 
+interface RequestRowProps {
+  request: CapturedRequest;
+  isOpen: boolean;
+  onToggle: (id: string) => void;
+}
+
+const RequestRow = memo(function RequestRow({ request, isOpen, onToggle }: RequestRowProps) {
+  const status = requestStatus(request);
+  return (
+    <div className="request-entry">
+      <button
+        type="button"
+        role="row"
+        className={`request-row${isOpen ? ' is-open' : ''}`}
+        onClick={() => onToggle(request.id)}
+        aria-expanded={isOpen}
+        title={request.url}
+        data-testid={`request-row-${request.id}`}
+      >
+        <span className={`method method-${request.method.toLowerCase()}`} role="cell">
+          {request.method}
+        </span>
+        <span className="request-time" role="cell">
+          {formatTime(request.wallStartedAt)}
+        </span>
+        <span className="request-path" role="cell">
+          <span className="request-path-value">{request.path}</span>
+          <span className="request-host">{request.host}</span>
+        </span>
+        <span role="cell">
+          <span className={`origin origin-${request.origin}`}>{ORIGIN_LABEL[request.origin]}</span>
+        </span>
+        <span
+          className={`request-status ${statusTone(request)}`}
+          role="cell"
+          title={`${status.phase} · ${status.detail}`}
+        >
+          {status.label}
+        </span>
+        <span className="request-duration" role="cell">
+          {formatDuration(request.durationMs)}
+        </span>
+        <span className="request-initiator" role="cell">
+          {initiatorLabel(request)}
+        </span>
+      </button>
+      {isOpen ? <RequestDetail request={request} /> : null}
+    </div>
+  );
+});
+
 export function Timeline() {
   const { state } = useBrowser();
   const [filter, setFilter] = useState<Filter>('all');
@@ -262,18 +313,30 @@ export function Timeline() {
   const connected = browser?.connected ?? false;
   const requests = state.requests;
 
-  const counts = {
-    all: requests.length,
-    backend: requests.filter((request) => request.origin === 'backend').length,
-    frontend: requests.filter((request) => request.origin === 'frontend').length,
-    external: requests.filter((request) => request.origin === 'external').length,
-  };
+  const counts = useMemo(
+    () => ({
+      all: requests.length,
+      backend: requests.filter((request) => request.origin === 'backend').length,
+      frontend: requests.filter((request) => request.origin === 'frontend').length,
+      external: requests.filter((request) => request.origin === 'external').length,
+    }),
+    [requests],
+  );
 
   const normalizedQuery = normalizeSearchText(query.trim());
-  const visible = requests.filter(
-    (request) =>
-      (filter === 'all' || request.origin === filter) && matchesRequest(request, normalizedQuery),
+  const visible = useMemo(
+    () =>
+      requests.filter(
+        (request) =>
+          (filter === 'all' || request.origin === filter) &&
+          matchesRequest(request, normalizedQuery),
+      ),
+    [requests, filter, normalizedQuery],
   );
+
+  const toggle = useCallback((id: string): void => {
+    setExpanded((current) => (current === id ? null : id));
+  }, []);
 
   return (
     <div className="timeline" data-testid="timeline">
@@ -331,52 +394,14 @@ export function Timeline() {
               <span role="columnheader">Duración</span>
               <span role="columnheader">Iniciador</span>
             </div>
-            {visible.map((request) => {
-              const isOpen = expanded === request.id;
-              return (
-                <div key={request.id} className="request-entry">
-                  <button
-                    type="button"
-                    role="row"
-                    className={`request-row${isOpen ? ' is-open' : ''}`}
-                    onClick={() => setExpanded(isOpen ? null : request.id)}
-                    aria-expanded={isOpen}
-                    title={request.url}
-                    data-testid={`request-row-${request.id}`}
-                  >
-                    <span className={`method method-${request.method.toLowerCase()}`} role="cell">
-                      {request.method}
-                    </span>
-                    <span className="request-time" role="cell">
-                      {formatTime(request.wallStartedAt)}
-                    </span>
-                    <span className="request-path" role="cell">
-                      <span className="request-path-value">{request.path}</span>
-                      <span className="request-host">{request.host}</span>
-                    </span>
-                    <span role="cell">
-                      <span className={`origin origin-${request.origin}`}>
-                        {ORIGIN_LABEL[request.origin]}
-                      </span>
-                    </span>
-                    <span
-                      className={`request-status ${statusTone(request)}`}
-                      role="cell"
-                      title={`${requestStatus(request).phase} · ${requestStatus(request).detail}`}
-                    >
-                      {requestStatus(request).label}
-                    </span>
-                    <span className="request-duration" role="cell">
-                      {formatDuration(request.durationMs)}
-                    </span>
-                    <span className="request-initiator" role="cell">
-                      {initiatorLabel(request)}
-                    </span>
-                  </button>
-                  {isOpen ? <RequestDetail request={request} /> : null}
-                </div>
-              );
-            })}
+            {visible.map((request) => (
+              <RequestRow
+                key={request.id}
+                request={request}
+                isOpen={expanded === request.id}
+                onToggle={toggle}
+              />
+            ))}
           </div>
         )}
       </div>

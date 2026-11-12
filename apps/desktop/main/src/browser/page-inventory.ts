@@ -79,6 +79,50 @@ ${HANDLER_PROFILE_HELPER_SOURCE}
       'aside', 'div',
     ]);
     const pathCache = new WeakMap();
+    const childIndexCache = new WeakMap();
+    /*
+     * Contar hermanos del mismo tag para cada nodo es cuadrático en listas anchas.
+     * Se indexa cada padre una sola vez por inventario.
+     */
+    const indexOfType = (node) => {
+      let parent = null;
+      try {
+        parent = node.parentNode;
+      } catch (error) {
+        void error;
+        parent = null;
+      }
+      if (!parent) return 1;
+      let map = childIndexCache.get(parent);
+      if (map === undefined) {
+        map = new Map();
+        const counts = new Map();
+        let kids = [];
+        try {
+          kids = parent.children ? Array.from(parent.children) : [];
+        } catch (error) {
+          void error;
+          kids = [];
+        }
+        for (let index = 0; index < kids.length; index += 1) {
+          const kid = kids[index];
+          const tag = kid.tagName;
+          const count = (counts.get(tag) ?? 0) + 1;
+          counts.set(tag, count);
+          map.set(kid, count);
+        }
+        childIndexCache.set(parent, map);
+      }
+      const cached = map.get(node);
+      if (cached !== undefined) return cached;
+      let index = 1;
+      let sibling = node.previousElementSibling;
+      while (sibling) {
+        if (sibling.tagName === node.tagName) index += 1;
+        sibling = sibling.previousElementSibling;
+      }
+      return index;
+    };
     const EVENT_MAP = {
       click: 'click',
       dblclick: 'dblclick',
@@ -158,13 +202,7 @@ ${HANDLER_PROFILE_HELPER_SOURCE}
           id = '';
         }
         if (id !== '') part += '#' + id.slice(0, 80);
-        let index = 1;
-        let sibling = current.previousElementSibling;
-        while (sibling) {
-          if (sibling.tagName === current.tagName) index += 1;
-          sibling = sibling.previousElementSibling;
-        }
-        part += ':nth-of-type(' + index + ')';
+        part += ':nth-of-type(' + indexOfType(current) + ')';
         parts.unshift(part);
         const parent = current.parentElement;
         if (parent) {
@@ -469,30 +507,34 @@ ${HANDLER_PROFILE_HELPER_SOURCE}
     };
     const handlersOf = (node, deep) => {
       const list = [];
-      let attributes = [];
+      let attributes = null;
       try {
-        attributes = Array.from(node.attributes ?? []);
+        attributes = node.attributes ?? null;
       } catch (error) {
         void error;
-        attributes = [];
+        attributes = null;
       }
-      for (const attribute of attributes) {
-        const name = String(attribute.name).toLowerCase();
-        if (name.indexOf('on') !== 0) continue;
-        const event = eventFor(name);
-        if (event === null) continue;
-        let fn = null;
-        try {
-          fn = node[name] ?? node.getAttribute(name);
-        } catch (error) {
-          void error;
-          fn = null;
+      if (attributes !== null) {
+        for (let index = 0; index < attributes.length; index += 1) {
+          const attribute = attributes.item(index);
+          if (attribute === null) continue;
+          const name = String(attribute.name).toLowerCase();
+          if (name.indexOf('on') !== 0) continue;
+          const event = eventFor(name);
+          if (event === null) continue;
+          let fn = null;
+          try {
+            fn = node[name] ?? attribute.value;
+          } catch (error) {
+            void error;
+            fn = null;
+          }
+          addHandler(list, event, fn, 'inline');
         }
-        addHandler(list, event, fn, 'inline');
       }
       let own = [];
       try {
-        own = Object.getOwnPropertyNames(node);
+        own = Object.keys(node);
       } catch (error) {
         void error;
         own = [];
@@ -718,9 +760,41 @@ ${HANDLER_PROFILE_HELPER_SOURCE}
 `;
 
 export const INVENTORY_SCRIPT = String.raw`
-(() => {
+(async () => {
   try {
 ${PAGE_DOM_HELPERS_SOURCE}
+    /*
+     * El inventario toca todos los elementos de la página. Se reparte en tandas
+     * de ~8 ms para que un DOM grande no congele la página al interactuar.
+     */
+    const sliceYield = (() => {
+      if (typeof MessageChannel !== 'function') {
+        return function () {
+          return new Promise(function (resolve) {
+            setTimeout(resolve, 0);
+          });
+        };
+      }
+      const channel = new MessageChannel();
+      const pending = [];
+      channel.port1.onmessage = function () {
+        const resolve = pending.shift();
+        if (resolve !== undefined) resolve();
+      };
+      return function () {
+        return new Promise(function (resolve) {
+          pending.push(resolve);
+          channel.port2.postMessage(0);
+        });
+      };
+    })();
+    const SLICE_MS = 8;
+    let sliceStart = Date.now();
+    const breathe = async () => {
+      if (Date.now() - sliceStart < SLICE_MS) return;
+      await sliceYield();
+      sliceStart = Date.now();
+    };
     const results = [];
     const seen = new Set();
     const controlKeys = new Set();
@@ -761,7 +835,7 @@ ${PAGE_DOM_HELPERS_SOURCE}
     if (documentRef !== null && documentRef.key !== '') {
       results.push({ ...documentRef, handlers: [] });
     }
-    const visit = (root) => {
+    const visit = async (root) => {
       let nodes = [];
       try {
         nodes = Array.from(root.querySelectorAll('*'));
@@ -769,7 +843,9 @@ ${PAGE_DOM_HELPERS_SOURCE}
         void error;
         nodes = [];
       }
+      let ticks = 0;
       for (const node of nodes) {
+        if ((++ticks & 255) === 0) await breathe();
         if (seen.has(node)) continue;
         seen.add(node);
         try {
@@ -795,13 +871,13 @@ ${PAGE_DOM_HELPERS_SOURCE}
           void error;
         }
         try {
-          if (node.shadowRoot) visit(node.shadowRoot);
+          if (node.shadowRoot) await visit(node.shadowRoot);
         } catch (error) {
           void error;
         }
       }
     };
-    visit(document);
+    await visit(document);
     for (const node of [document.documentElement, document.head, document.body]) {
       if (node) addStructure(node);
     }

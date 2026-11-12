@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type { ActivityCategory, ActivityEvent } from '@bdt/protocol';
 import { useBrowser } from '../state/browser-store';
 import { CodeLink } from './CodeLink';
@@ -11,6 +11,7 @@ const FILTERS: { id: Filter; label: string }[] = [
   { id: 'frontend', label: 'Frontend' },
   { id: 'backend', label: 'Backend' },
   { id: 'sql', label: 'SQL' },
+  { id: 'json', label: 'JSON' },
 ];
 
 const CATEGORY_LABEL: Record<ActivityCategory, string> = {
@@ -18,6 +19,7 @@ const CATEGORY_LABEL: Record<ActivityCategory, string> = {
   frontend: 'FRONTEND',
   backend: 'BACKEND',
   sql: 'SQL',
+  json: 'JSON',
 };
 
 function formatTime(at: number): string {
@@ -34,6 +36,29 @@ function locationLabel(event: ActivityEvent): string {
   return event.line !== null && event.line > 0 ? `${event.file}:${String(event.line)}` : event.file;
 }
 
+const ActivityRow = memo(function ActivityRow({ event }: { event: ActivityEvent }) {
+  const where = locationLabel(event);
+  return (
+    <div
+      className={`activity-row tone-${event.tone}`}
+      data-category={event.category}
+      data-testid="activity-row"
+    >
+      <span className="activity-time">{formatTime(event.at)}</span>
+      <span className={`activity-tag tag-${event.category}`}>{CATEGORY_LABEL[event.category]}</span>
+      <span className="activity-main">
+        <span className="activity-title">{event.title}</span>
+        {event.detail !== null ? (
+          <span className="activity-detail mono" title={event.detail}>
+            {event.detail}
+          </span>
+        ) : null}
+      </span>
+      <CodeLink file={event.file} line={event.line} label={where} className="activity-where mono" />
+    </div>
+  );
+});
+
 export function ActivityLog() {
   const { state } = useBrowser();
   const activities = state.activities;
@@ -42,16 +67,22 @@ export function ActivityLog() {
   const listRef = useRef<HTMLDivElement | null>(null);
   const stickRef = useRef(true);
 
-  const counts: Record<Filter, number> = {
-    all: activities.length,
-    request: activities.filter((event) => event.category === 'request').length,
-    frontend: activities.filter((event) => event.category === 'frontend').length,
-    backend: activities.filter((event) => event.category === 'backend').length,
-    sql: activities.filter((event) => event.category === 'sql').length,
-  };
+  const counts = useMemo<Record<Filter, number>>(
+    () => ({
+      all: activities.length,
+      request: activities.filter((event) => event.category === 'request').length,
+      frontend: activities.filter((event) => event.category === 'frontend').length,
+      backend: activities.filter((event) => event.category === 'backend').length,
+      sql: activities.filter((event) => event.category === 'sql').length,
+      json: activities.filter((event) => event.category === 'json').length,
+    }),
+    [activities],
+  );
 
-  const visible =
-    filter === 'all' ? activities : activities.filter((event) => event.category === filter);
+  const visible = useMemo(
+    () => (filter === 'all' ? activities : activities.filter((event) => event.category === filter)),
+    [activities, filter],
+  );
 
   useEffect(() => {
     const node = listRef.current;
@@ -104,36 +135,9 @@ export function ActivityLog() {
           </p>
         ) : (
           <div className="activity-rows" role="log" aria-label="Actividad de la página">
-            {visible.map((event) => {
-              const where = locationLabel(event);
-              return (
-                <div
-                  key={event.id}
-                  className={`activity-row tone-${event.tone}`}
-                  data-category={event.category}
-                  data-testid="activity-row"
-                >
-                  <span className="activity-time">{formatTime(event.at)}</span>
-                  <span className={`activity-tag tag-${event.category}`}>
-                    {CATEGORY_LABEL[event.category]}
-                  </span>
-                  <span className="activity-main">
-                    <span className="activity-title">{event.title}</span>
-                    {event.detail !== null ? (
-                      <span className="activity-detail mono" title={event.detail}>
-                        {event.detail}
-                      </span>
-                    ) : null}
-                  </span>
-                  <CodeLink
-                    file={event.file}
-                    line={event.line}
-                    label={where}
-                    className="activity-where mono"
-                  />
-                </div>
-              );
-            })}
+            {visible.map((event) => (
+              <ActivityRow key={event.id} event={event} />
+            ))}
           </div>
         )}
       </div>

@@ -121,7 +121,7 @@ export interface CapturedRequest {
   responseBody: CapturedBody | null;
 }
 
-export type ActivityCategory = 'frontend' | 'request' | 'backend' | 'sql';
+export type ActivityCategory = 'frontend' | 'request' | 'backend' | 'sql' | 'json';
 
 export type ActivityTone = 'info' | 'ok' | 'warning' | 'error';
 
@@ -366,6 +366,15 @@ export interface InspectionSqlColumn {
 
 export type InspectionSqlStatus = 'possible' | 'observed';
 
+export interface InspectionSqlResult {
+  columns: string[];
+  rows: Array<Array<string | number | boolean | null>>;
+  rowCount: number;
+  truncated: boolean;
+  observedAt: number;
+  driver: string;
+}
+
 export interface InspectionSqlQuery {
   id: string;
   status: InspectionSqlStatus;
@@ -384,6 +393,7 @@ export interface InspectionSqlQuery {
   callObject: string | null;
   note: string | null;
   observedAt: number | null;
+  result: InspectionSqlResult | null;
 }
 
 export type InspectionRuntimeStatus = 'off' | 'connecting' | 'connected' | 'unavailable';
@@ -464,6 +474,7 @@ export const BROWSER_PANEL_CHANNELS = {
   setMode: 'browser-panel:set-mode',
   map: 'browser-panel:map',
   mapData: 'browser-panel:map-data',
+  jsonData: 'browser-panel:json-data',
   highlight: 'browser-panel:highlight',
   shift: 'browser-panel:shift',
   revealLocation: 'browser-panel:reveal-location',

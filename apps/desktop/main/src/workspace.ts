@@ -85,6 +85,7 @@ export class WorkspaceService {
     this.closeCurrent();
     this.current = openWorkspace;
     this.log.info('Espacio de trabajo abierto', { root: scope.rootReal });
+    this.onChange();
 
     return this.snapshot(openWorkspace);
   }

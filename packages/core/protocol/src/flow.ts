@@ -1,6 +1,8 @@
 import type {
   HandlerProfile,
+  InspectionSqlColumn,
   InspectionSqlOperation,
+  InspectionSqlResult,
   RequestOrigin,
   RequestOutcome,
 } from './browser';
@@ -82,6 +84,27 @@ export interface FlowNodeEvent {
   lastSeen: number;
 }
 
+export type FlowJsonMovementKind = 'request' | 'response' | 'parse' | 'stringify';
+
+export type FlowJsonDirection = 'in' | 'out' | 'internal';
+
+export interface FlowJsonMovement {
+  id: string;
+  kind: FlowJsonMovementKind;
+  direction: FlowJsonDirection;
+  method: string | null;
+  path: string | null;
+  status: number | null;
+  at: number;
+  count: number;
+  file: string | null;
+  line: number;
+  column: number;
+  body: string | null;
+  bodyOmitted?: boolean;
+  truncated: boolean;
+}
+
 export interface FlowNode {
   id: string;
   type: FlowNodeType;
@@ -113,6 +136,9 @@ export interface FlowNode {
   sql?: string | null;
   tablesRead?: string[];
   tablesWritten?: string[];
+  columns?: InspectionSqlColumn[];
+  selectStar?: boolean | null;
+  result?: InspectionSqlResult | null;
   engine?: string | null;
   database?: string | null;
   kind?: FlowElementKind | null;
@@ -126,6 +152,7 @@ export interface FlowNode {
   visible?: boolean | null;
   handlers?: FlowHandlerHint[];
   events?: FlowNodeEvent[];
+  jsonMovements?: FlowJsonMovement[];
 }
 
 export interface FlowEdge {
@@ -179,11 +206,37 @@ export interface FlowSnapshot {
   stack: FlowStack;
 }
 
+export interface FlowSqlCaptureState {
+  ok: boolean;
+  drivers: string[];
+  prisma: boolean;
+  error: string | null;
+  executions: number;
+  sampled: number;
+  lastAt: number | null;
+}
+
+export interface FlowJsonCaptureState {
+  ok: boolean;
+  hooks: string[];
+  error: string | null;
+  movements: number;
+  bodies: number;
+  lastAt: number | null;
+}
+
 export interface FlowMapState {
   open: boolean;
   building: boolean;
   error: string | null;
   snapshot: FlowSnapshot | null;
+  sqlCapture?: FlowSqlCaptureState | null;
+  jsonCapture?: FlowJsonCaptureState | null;
+}
+
+export interface FlowJsonState {
+  capture: FlowJsonCaptureState | null;
+  movements: FlowJsonMovement[];
 }
 
 export interface FlowHighlightTarget {

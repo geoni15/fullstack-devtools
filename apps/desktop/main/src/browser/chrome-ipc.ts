@@ -18,6 +18,7 @@ import type { BrowserController } from './controller';
 const MAX_ADDRESS_LENGTH = 2048;
 const MAX_SELECTOR_LENGTH = 2048;
 const MAX_HIGHLIGHT_KEY_LENGTH = 200;
+const MAX_HIGHLIGHT_TARGETS = 512;
 
 function unauthorized<T>(): IpcResult<T> {
   return {
@@ -166,25 +167,52 @@ export function registerBrowserWindowIpc(
   });
 
   ipcMain.on(BROWSER_PANEL_CHANNELS.highlight, (event, payload: unknown) => {
-    if (!browser.isMapSender(event.sender) || !isMainFrame(event)) return;
+    if (!browser.isMapSender(event.sender)) return;
+    if (!isMainFrame(event)) return;
     if (typeof payload !== 'object' || payload === null) return;
-    const record = payload as { key?: unknown; selector?: unknown };
-    const key =
-      record.key === null || record.key === undefined
-        ? null
-        : typeof record.key === 'string' && record.key.length <= MAX_HIGHLIGHT_KEY_LENGTH
-          ? record.key
-          : undefined;
-    if (key === undefined) return;
-    if (
-      typeof record.selector !== 'string' ||
-      record.selector === '' ||
-      record.selector.length > MAX_SELECTOR_LENGTH
-    ) {
-      return;
+    const record = payload as { key?: unknown; selector?: unknown; targets?: unknown };
+    const readTarget = (entry: {
+      key?: unknown;
+      selector?: unknown;
+    }): { key: string | null; selector: string } | null => {
+      const key =
+        entry.key === null || entry.key === undefined
+          ? null
+          : typeof entry.key === 'string' && entry.key.length <= MAX_HIGHLIGHT_KEY_LENGTH
+            ? entry.key
+            : undefined;
+      if (key === undefined) return null;
+      if (
+        typeof entry.selector !== 'string' ||
+        entry.selector === '' ||
+        entry.selector.length > MAX_SELECTOR_LENGTH
+      ) {
+        return null;
+      }
+      return { key, selector: entry.selector };
+    };
+    const targets: Array<{ key: string | null; selector: string }> = [];
+    if (record.targets !== undefined) {
+      if (
+        !Array.isArray(record.targets) ||
+        record.targets.length === 0 ||
+        record.targets.length > MAX_HIGHLIGHT_TARGETS
+      ) {
+        return;
+      }
+      for (const entry of record.targets) {
+        if (typeof entry !== 'object' || entry === null) return;
+        const target = readTarget(entry as { key?: unknown; selector?: unknown });
+        if (target === null) return;
+        targets.push(target);
+      }
+    } else {
+      const target = readTarget(record);
+      if (target === null) return;
+      targets.push(target);
     }
     try {
-      browser.highlightFlowElement(key, record.selector);
+      browser.highlightFlowElements(targets);
     } catch (error) {
       logger.error('Fallo al resaltar el elemento del mapa en la página', {
         message: error instanceof Error ? error.message : String(error),

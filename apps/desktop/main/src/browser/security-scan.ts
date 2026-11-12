@@ -14,6 +14,7 @@ import type { Logger } from '../logger';
 const MAX_EVIDENCE_CHARS = 240;
 const SCRIPT_CONCURRENCY = 6;
 const STYLE_WAIT_MS = 160;
+const SCAN_SLICE_MS = 8;
 
 const PRIVATE_IPV4 =
   /^(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3}|0\.0\.0\.0)$/;
@@ -36,21 +37,44 @@ const NAMESPACE_HOSTS = new Set([
 const SECRET_PATTERNS: readonly {
   kind: string;
   severity: SecuritySeverity;
+  marker: string;
   pattern: RegExp;
 }[] = [
-  { kind: 'Stripe', severity: 'critical', pattern: /\bsk_(?:live|test)_[0-9A-Za-z]{16,}\b/g },
-  { kind: 'AWS', severity: 'critical', pattern: /\bAKIA[0-9A-Z]{16}\b/g },
-  { kind: 'GitHub', severity: 'critical', pattern: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g },
-  { kind: 'GitLab', severity: 'critical', pattern: /\bglpat-[A-Za-z0-9_-]{20,}\b/g },
-  { kind: 'Google', severity: 'critical', pattern: /\bAIza[0-9A-Za-z_-]{35}\b/g },
+  {
+    kind: 'Stripe',
+    severity: 'critical',
+    marker: 'sk_',
+    pattern: /\bsk_(?:live|test)_[0-9A-Za-z]{16,}\b/g,
+  },
+  { kind: 'AWS', severity: 'critical', marker: 'AKIA', pattern: /\bAKIA[0-9A-Z]{16}\b/g },
+  {
+    kind: 'GitHub',
+    severity: 'critical',
+    marker: 'gh',
+    pattern: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
+  },
+  {
+    kind: 'GitLab',
+    severity: 'critical',
+    marker: 'glpat-',
+    pattern: /\bglpat-[A-Za-z0-9_-]{20,}\b/g,
+  },
+  {
+    kind: 'Google',
+    severity: 'critical',
+    marker: 'AIza',
+    pattern: /\bAIza[0-9A-Za-z_-]{35}\b/g,
+  },
   {
     kind: 'clave privada',
     severity: 'critical',
+    marker: 'PRIVATE KEY',
     pattern: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g,
   },
   {
     kind: 'JWT',
     severity: 'high',
+    marker: 'eyJ',
     pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
   },
 ];
@@ -58,37 +82,62 @@ const SECRET_PATTERNS: readonly {
 const GENERIC_SECRET =
   /(api[_-]?key|apikey|secret|password|passwd|access[_-]?token|auth[_-]?token)\s*[:=]\s*(['"`])([^'"`\s]{8,})\2/gi;
 
+const GENERIC_SECRET_HINT = /(?:api|key|secret|passw|token)/i;
+
 const DOM_SINKS: readonly {
   id: string;
   label: string;
   severity: SecuritySeverity;
+  marker: string;
   pattern: RegExp;
 }[] = [
-  { id: 'eval', label: 'eval()', severity: 'high', pattern: /(^|[^.\w$])eval\s*\(/g },
+  {
+    id: 'eval',
+    label: 'eval()',
+    severity: 'high',
+    marker: 'eval',
+    pattern: /(^|[^.\w$])eval\s*\(/g,
+  },
   {
     id: 'new-function',
     label: 'new Function()',
     severity: 'high',
+    marker: 'Function',
     pattern: /\bnew\s+Function\s*\(/g,
   },
-  { id: 'innerhtml', label: 'innerHTML', severity: 'medium', pattern: /\.innerHTML\s*=/g },
-  { id: 'outerhtml', label: 'outerHTML', severity: 'medium', pattern: /\.outerHTML\s*=/g },
+  {
+    id: 'innerhtml',
+    label: 'innerHTML',
+    severity: 'medium',
+    marker: 'innerHTML',
+    pattern: /\.innerHTML\s*=/g,
+  },
+  {
+    id: 'outerhtml',
+    label: 'outerHTML',
+    severity: 'medium',
+    marker: 'outerHTML',
+    pattern: /\.outerHTML\s*=/g,
+  },
   {
     id: 'insertadjacenthtml',
     label: 'insertAdjacentHTML()',
     severity: 'medium',
+    marker: 'insertAdjacentHTML',
     pattern: /\.insertAdjacentHTML\s*\(/g,
   },
   {
     id: 'document-write',
     label: 'document.write()',
     severity: 'medium',
+    marker: 'document.write',
     pattern: /document\.write(?:ln)?\s*\(/g,
   },
   {
     id: 'dangerously-set-inner-html',
     label: 'dangerouslySetInnerHTML',
     severity: 'medium',
+    marker: 'dangerouslySetInnerHTML',
     pattern: /dangerouslySetInnerHTML/g,
   },
 ];
@@ -178,6 +227,12 @@ function isLoopbackHost(host: string): boolean {
 
 function isPrivateHost(host: string): boolean {
   return isPrivateIp(host) || isLoopbackHost(host) || host.endsWith('.local');
+}
+
+function isVendorScript(url: string): boolean {
+  if (url === '') return false;
+  const lower = url.toLowerCase();
+  return lower.includes('/node_modules/') || lower.includes('/.vite/deps/');
 }
 
 function cleanHost(host: string): string {
@@ -305,10 +360,10 @@ function makeFinding(input: {
 
 function scanEndpoints(
   source: ScanSource,
+  starts: readonly number[],
   context: ScanContext,
   findings: Map<string, SecurityFinding>,
 ): void {
-  const starts = lineStarts(source.text);
   const seen = new Set<string>();
   const sourceKey = `${source.kind}:${source.url ?? context.pageUrl ?? ''}`;
   const add = (endpoint: EndpointRef, index: number, evidence: string): void => {
@@ -429,14 +484,16 @@ function secretFinding(
 
 function scanSecrets(
   source: ScanSource,
+  starts: readonly number[],
   context: ScanContext,
   findings: Map<string, SecurityFinding>,
 ): void {
   if (source.kind === 'css') return;
-  const starts = lineStarts(source.text);
+  const text = source.text;
   for (const entry of SECRET_PATTERNS) {
+    if (text.indexOf(entry.marker) === -1) continue;
     entry.pattern.lastIndex = 0;
-    for (const match of source.text.matchAll(entry.pattern)) {
+    for (const match of text.matchAll(entry.pattern)) {
       const value = match[0];
       if (value === undefined) continue;
       const finding = secretFinding(
@@ -452,8 +509,9 @@ function scanSecrets(
     }
   }
   if (!source.firstParty) return;
+  if (!GENERIC_SECRET_HINT.test(text)) return;
   GENERIC_SECRET.lastIndex = 0;
-  for (const match of source.text.matchAll(GENERIC_SECRET)) {
+  for (const match of text.matchAll(GENERIC_SECRET)) {
     const name = match[1] ?? 'secreto';
     const value = match[3];
     if (value === undefined) continue;
@@ -480,12 +538,13 @@ function scanSecrets(
 
 function scanSinks(
   source: ScanSource,
+  starts: readonly number[],
   context: ScanContext,
   findings: Map<string, SecurityFinding>,
 ): void {
   if (source.kind !== 'js' || !source.firstParty) return;
-  const starts = lineStarts(source.text);
   for (const sink of DOM_SINKS) {
+    if (source.text.indexOf(sink.marker) === -1) continue;
     sink.pattern.lastIndex = 0;
     const match = sink.pattern.exec(source.text);
     if (match === null) continue;
@@ -551,12 +610,16 @@ function scanRequestFindings(
   }
 }
 
-export function buildSecurityFindings(input: {
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+export async function buildSecurityFindings(input: {
   sources: readonly ScanSource[];
   requests: readonly CapturedRequest[];
   pageUrl: string | null;
   config: BrowserConfig | null;
-}): SecurityFinding[] {
+}): Promise<SecurityFinding[]> {
   const actualPage = input.pageUrl === null ? null : endpointFromUrl(input.pageUrl);
   const context: ScanContext = {
     pageUrl: input.pageUrl,
@@ -567,11 +630,17 @@ export function buildSecurityFindings(input: {
     backendPort: input.config === null ? null : input.config.backend.port,
   };
   const findings = new Map<string, SecurityFinding>();
+  let sliceStarted = Date.now();
   for (const source of input.sources) {
     if (source.text.trim() === '') continue;
-    scanEndpoints(source, context, findings);
-    scanSecrets(source, context, findings);
-    scanSinks(source, context, findings);
+    const starts = lineStarts(source.text);
+    scanEndpoints(source, starts, context, findings);
+    scanSecrets(source, starts, context, findings);
+    scanSinks(source, starts, context, findings);
+    if (Date.now() - sliceStarted >= SCAN_SLICE_MS) {
+      await yieldToEventLoop();
+      sliceStarted = Date.now();
+    }
   }
   scanRequestFindings(input.requests, context, findings);
   return [...findings.values()].sort((left, right) => {
@@ -703,7 +772,7 @@ export class SecurityScanner {
         ...styleSources,
         ...scriptSources,
       ];
-      const findings = buildSecurityFindings({
+      const findings = await buildSecurityFindings({
         sources,
         requests: input.requests,
         pageUrl: input.pageUrl,
@@ -808,6 +877,9 @@ export class SecurityScanner {
       this.log.debug('El dominio CSS no está disponible; se usa el contenido accesible', {
         message: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      // El dominio CSS mantiene trabajo de estilo en la página; se apaga al terminar.
+      await target.sendCommand('CSS.disable').catch(() => undefined);
     }
     if (sources.length > 0) return sources;
     for (const entry of fallback) {
@@ -842,6 +914,8 @@ export class SecurityScanner {
         ) {
           continue;
         }
+        // Escanear dependencias de terceros consume segundos y no es código propio.
+        if (isVendorScript(url)) continue;
         try {
           const response = (await target.sendCommand('Debugger.getScriptSource', {
             scriptId,
