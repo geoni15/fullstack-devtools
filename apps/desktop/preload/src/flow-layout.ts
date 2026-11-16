@@ -2,12 +2,11 @@ import type { FlowEdgeType, FlowNode, FlowNodeType, FlowSnapshot } from '@bdt/pr
 
 export const FLOW_NODE_WIDTH = 210;
 export const FLOW_NODE_HEIGHT = 48;
-export const FLOW_NODE_COMPACT_HEIGHT = 30;
+export const FLOW_NODE_COMPACT_HEIGHT = 48;
 const ROW_GAP = 20;
 const COMPACT_ROW_GAP = 12;
-const LAYER_GAP = 176;
-const FRONTEND_BACKEND_GAP = LAYER_GAP * 7.5;
-const MARGIN = 48;
+export const LAYER_GAP = 176;
+export const FLOW_MARGIN = 48;
 const HIERARCHY_H_GAP = 48;
 const HIERARCHY_V_GAP = 164;
 const COMPACT_HIERARCHY_V_GAP = 96;
@@ -22,10 +21,12 @@ const FRONTEND_LAYERS = new Set<FlowNodeType>([
   'request',
 ]);
 
-function layerGap(left: FlowNodeType, right: FlowNodeType): number {
-  return FRONTEND_LAYERS.has(left) && !FRONTEND_LAYERS.has(right)
-    ? FRONTEND_BACKEND_GAP
-    : LAYER_GAP;
+export function isFrontendLayerType(type: FlowNodeType): boolean {
+  return FRONTEND_LAYERS.has(type);
+}
+
+function layerGap(left: FlowNodeType, right: FlowNodeType, boundaryGap: number): number {
+  return FRONTEND_LAYERS.has(left) && !FRONTEND_LAYERS.has(right) ? boundaryGap : LAYER_GAP;
 }
 
 export type FlowLayoutMode = 'chronological' | 'hierarchical' | 'structural';
@@ -34,6 +35,7 @@ export interface FlowLayoutOptions {
   compact?: boolean;
   widthOf?: (node: FlowNode) => number;
   heightOf?: (node: FlowNode) => number;
+  boundaryGap?: number;
 }
 
 export const FLOW_LAYERS: readonly FlowNodeType[] = [
@@ -196,6 +198,7 @@ function layoutColumns(
   compact: boolean,
   widthOf: (node: FlowNode) => number,
   heightOf: (node: FlowNode) => number,
+  boundaryGap: number,
 ): FlowLayout {
   const rowGap = compact ? COMPACT_ROW_GAP : ROW_GAP;
   const buckets = new Map<FlowNodeType, FlowNode[]>();
@@ -222,20 +225,20 @@ function layoutColumns(
     const previous = active[index - 1];
     const current = active[index];
     if (previous === undefined || current === undefined) continue;
-    gapsWidth += layerGap(previous, current);
+    gapsWidth += layerGap(previous, current, boundaryGap);
   }
-  const width = MARGIN * 2 + columnsWidth + gapsWidth;
+  const width = FLOW_MARGIN * 2 + columnsWidth + gapsWidth;
   const tallest = Math.max(1, ...columns.map((column) => column.blockHeight));
-  const height = MARGIN * 2 + tallest;
+  const height = FLOW_MARGIN * 2 + tallest;
 
   const placed: FlowPlacedNode[] = [];
   const positions = new Map<string, FlowPlacedNode>();
   const layers: FlowLayerInfo[] = [];
-  let cursor = MARGIN;
+  let cursor = FLOW_MARGIN;
 
   columns.forEach(({ type, list, columnWidth, blockHeight }, layer) => {
     layers.push({ type, x: cursor, count: list.length, width: columnWidth });
-    let y = MARGIN + (tallest - blockHeight) / 2;
+    let y = FLOW_MARGIN + (tallest - blockHeight) / 2;
     for (const node of list) {
       const nodeH = heightOf(node);
       const entry: FlowPlacedNode = {
@@ -251,7 +254,7 @@ function layoutColumns(
       y += nodeH + rowGap;
     }
     const next = columns[layer + 1];
-    cursor += columnWidth + (next === undefined ? 0 : layerGap(type, next.type));
+    cursor += columnWidth + (next === undefined ? 0 : layerGap(type, next.type, boundaryGap));
   });
 
   return { mode, nodes: placed, positions, layers, width, height };
@@ -262,8 +265,17 @@ function layoutChronological(
   compact: boolean,
   widthOf: (node: FlowNode) => number,
   heightOf: (node: FlowNode) => number,
+  boundaryGap: number,
 ): FlowLayout {
-  return layoutColumns(snapshot, 'chronological', chronological, compact, widthOf, heightOf);
+  return layoutColumns(
+    snapshot,
+    'chronological',
+    chronological,
+    compact,
+    widthOf,
+    heightOf,
+    boundaryGap,
+  );
 }
 
 function layoutStructural(
@@ -271,8 +283,17 @@ function layoutStructural(
   compact: boolean,
   widthOf: (node: FlowNode) => number,
   heightOf: (node: FlowNode) => number,
+  boundaryGap: number,
 ): FlowLayout {
-  return layoutColumns(snapshot, 'structural', structuralOrder, compact, widthOf, heightOf);
+  return layoutColumns(
+    snapshot,
+    'structural',
+    structuralOrder,
+    compact,
+    widthOf,
+    heightOf,
+    boundaryGap,
+  );
 }
 
 function layoutHierarchical(
@@ -411,7 +432,7 @@ function layoutHierarchical(
   };
   for (const root of roots) collectDepth(root.id, 0);
   const depthY: number[] = [];
-  let depthCursor = MARGIN;
+  let depthCursor = FLOW_MARGIN;
   for (let depth = 0; depth < maxHeightByDepth.length; depth += 1) {
     depthY[depth] = depthCursor;
     depthCursor += (maxHeightByDepth[depth] ?? FLOW_NODE_HEIGHT) + verticalGap;
@@ -426,7 +447,7 @@ function layoutHierarchical(
     const own = ownWidth(id);
     const ownHeight = nodeHeightOf(node);
     const x = left + (width - own) / 2;
-    const y = depthY[depth] ?? MARGIN;
+    const y = depthY[depth] ?? FLOW_MARGIN;
     const entry: FlowPlacedNode = { node, x, y, layer: depth, width: own, height: ownHeight };
     placed.push(entry);
     positions.set(id, entry);
@@ -448,27 +469,29 @@ function layoutHierarchical(
     }
   };
 
-  let cursor = MARGIN;
+  let cursor = FLOW_MARGIN;
   for (const root of roots) {
     place(root.id, cursor, 0);
     cursor += widthOf(root.id) + HIERARCHY_ROOT_GAP;
   }
 
   const width =
-    roots.length === 0 ? MARGIN * 2 : Math.max(MARGIN * 2, cursor - HIERARCHY_ROOT_GAP + MARGIN);
+    roots.length === 0
+      ? FLOW_MARGIN * 2
+      : Math.max(FLOW_MARGIN * 2, cursor - HIERARCHY_ROOT_GAP + FLOW_MARGIN);
   const height =
     placed.length === 0 || maxHeightByDepth.length === 0
-      ? MARGIN * 2
-      : depthCursor - verticalGap + MARGIN;
+      ? FLOW_MARGIN * 2
+      : depthCursor - verticalGap + FLOW_MARGIN;
 
   const layers: FlowLayerInfo[] = [...depthGroups.entries()]
     .sort((left, right) => left[0] - right[0])
     .map(([depth, group]) => ({
       type: dominantType(group),
-      x: MARGIN,
+      x: FLOW_MARGIN,
       count: group.length,
       label: `NIVEL ${String(depth)}`,
-      y: (depthY[depth] ?? MARGIN) - 18,
+      y: (depthY[depth] ?? FLOW_MARGIN) - 18,
     }));
 
   return { mode: 'hierarchical', nodes: placed, positions, layers, width, height };
@@ -486,8 +509,9 @@ export function layoutFlow(
   if (mode === 'hierarchical') {
     return layoutHierarchical(snapshot, compact, widthOf, heightOf);
   }
+  const boundaryGap = options.boundaryGap ?? LAYER_GAP;
   if (mode === 'structural') {
-    return layoutStructural(snapshot, compact, widthOf, heightOf);
+    return layoutStructural(snapshot, compact, widthOf, heightOf, boundaryGap);
   }
-  return layoutChronological(snapshot, compact, widthOf, heightOf);
+  return layoutChronological(snapshot, compact, widthOf, heightOf, boundaryGap);
 }

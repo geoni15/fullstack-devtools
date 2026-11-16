@@ -50,6 +50,19 @@ export interface FileContent {
   path: string;
   size: number;
   content: string;
+  mtimeMs: number;
+}
+
+export interface FileSaveRequest {
+  path: string;
+  content: string;
+  baseMtimeMs: number;
+}
+
+export interface FileSaveResult {
+  path: string;
+  size: number;
+  mtimeMs: number;
 }
 
 export interface CodeLocationRequest {
@@ -81,6 +94,7 @@ export interface BdtApi {
   openWorkspace(): Promise<IpcResult<WorkspaceSnapshot | null>>;
   getState(): Promise<IpcResult<WorkspaceSnapshot | null>>;
   readFile(path: string): Promise<IpcResult<FileContent>>;
+  saveFile(request: FileSaveRequest): Promise<IpcResult<FileSaveResult>>;
   revealCode(location: CodeLocationRequest): Promise<IpcResult<CodeLocation | null>>;
   onRevealLocation(listener: (location: CodeLocation) => void): () => void;
   onWorkspaceChanged(listener: () => void): () => void;

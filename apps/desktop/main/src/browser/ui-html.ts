@@ -52,6 +52,11 @@ export const BROWSER_CHROME_HTML = `<!doctype html>
 const PANEL_CSS = `
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #0b1118; }
+::-webkit-scrollbar-thumb { background: #24384c; }
+::-webkit-scrollbar-thumb:hover { background: #33506b; }
+::-webkit-scrollbar-corner { background: #0b1118; }
 [hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; background: #0e1116; color: #c9d1d9; font: 12px/1.45 system-ui, "Segoe UI", sans-serif; }
 #panel { display: flex; flex-direction: column; height: 100%; }
@@ -107,11 +112,17 @@ h2 { margin: 0 0 5px; font-size: 10px; font-weight: 600; letter-spacing: 0.08em;
 .request .backend-line .code-link:hover { color: #e6edf3; }
 .code-range { margin-left: auto; font-size: 10px; color: #7d8b99; white-space: nowrap; }
 .code { margin-top: 4px; background: #0a1016; overflow-x: auto; }
-.code-line { display: flex; min-height: 17px; font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; line-height: 17px; }
-.code-number { flex: none; width: 42px; padding-right: 8px; text-align: right; color: #56616d; user-select: none; }
-.code-text { white-space: pre; color: #d4d4d4; padding-right: 10px; }
-.code-line.is-executed { background: #163a2a; }
-.code-line.is-executed .code-number { color: #9fe3b8; }
+.code-toggle { flex: none; padding: 0; background: none; border: 0; color: #7d8b99; font: inherit; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; cursor: pointer; }
+.code-toggle:hover { color: #a9cdf0; }
+.panel-edit { padding: 4px; }
+.panel-editor { display: block; width: 100%; height: 220px; padding: 4px 6px; background: #0a1016; color: #d4d4d4; border: 0; font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; line-height: 17px; white-space: pre; overflow: auto; resize: vertical; user-select: text; }
+.panel-editor:focus { outline: 2px solid #58a6ff; outline-offset: -2px; }
+.panel-savebar { display: flex; align-items: center; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
+.panel-save { padding: 2px 6px; background: #1b2029; color: #d7dde7; border: 0; font: inherit; font-size: 10px; cursor: pointer; }
+.panel-save:hover { background: #20262f; }
+.panel-save:disabled { color: #56616d; cursor: default; }
+.panel-dirty { color: #ffd7a8; font-size: 10px; }
+.panel-edit-status { color: #ffb4a8; font-size: 10px; }
 .code-note { padding: 5px 8px; color: #ffd7a8; font-size: 10px; background: #241c12; }
 .seq { margin-top: 8px; }
 .seq-item { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; }
@@ -144,6 +155,19 @@ h2 { margin: 0 0 5px; font-size: 10px; font-weight: 600; letter-spacing: 0.08em;
 .query.is-observed .state { color: #9fe3b8; }
 .query .sql { margin-top: 4px; padding: 5px 7px; background: #0a1016; color: #d4d4d4; font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; line-height: 1.35; white-space: pre-wrap; word-break: break-word; max-height: 160px; overflow: auto; }
 .query .meta { margin-top: 3px; color: #aab8c5; font-size: 10px; word-break: break-word; }
+.kv { display: flex; gap: 8px; padding: 2px 0; }
+.kv .k { flex: none; width: 76px; color: #7d8b99; font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; }
+.kv .v { flex: 1; min-width: 0; color: #d4d4d4; font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
+.sql-result { margin-top: 5px; background: #0a1016; }
+.sql-result .result-head { display: flex; gap: 8px; align-items: baseline; padding: 4px 7px; background: #101923; color: #7d8b99; font-size: 10px; }
+.sql-result .result-count { margin-left: auto; color: #9fe3b8; white-space: nowrap; }
+.sql-result .result-grid { max-height: 240px; overflow: auto; }
+.sql-result table { border-collapse: collapse; width: 100%; font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; }
+.sql-result th { position: sticky; top: 0; padding: 3px 7px; background: #16202b; color: #a9cdf0; text-align: left; font-weight: 600; white-space: nowrap; }
+.sql-result td { padding: 3px 7px; max-width: 240px; color: #d4d4d4; vertical-align: top; white-space: pre-wrap; word-break: break-word; }
+.sql-result tbody tr:nth-child(even) td { background: #0d141b; }
+.sql-result td.is-null { color: #7d8b99; font-style: italic; }
+.sql-result .result-note { padding: 3px 7px; color: #7d8b99; font-size: 10px; }
 #note { margin-top: 12px; color: #ffd7a8; font-size: 11px; }
 .footer { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
 .footer .level { padding: 1px 6px; background: #22303f; color: #a9cdf0; font-size: 10px; }
@@ -177,8 +201,6 @@ body.map-open main { display: none; }
 #map-bar button { height: 24px; min-width: 24px; padding: 0 7px; background: #172029; color: #aab8c5; border: 0; font: 10px/1 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.02em; cursor: pointer; }
 #map-bar button:hover { background: #1d2833; color: #e6edf3; }
 #map-bar button.is-on { background: #223044; color: #e6edf3; }
-#map-tip-toggle .key { margin-left: 4px; padding: 0 3px; background: #22303f; color: #9fc7f5; font-size: 9px; letter-spacing: 0; }
-#map-tip-toggle.is-held { background: #27415c; color: #e6edf3; }
 #map-bar select { height: 24px; max-width: 168px; background: #172029; color: #aab8c5; border: 0; padding: 0 4px; font: 10px system-ui, "Segoe UI", sans-serif; letter-spacing: 0.02em; cursor: pointer; outline: none; }
 #map-bar select:hover { background: #1d2833; color: #e6edf3; }
 #map-bar select:disabled { color: #56616d; cursor: default; }
@@ -198,7 +220,6 @@ body.map-open main { display: none; }
 .stack-node .tech { font-size: 12px; font-weight: 600; color: #e6edf3; white-space: nowrap; }
 .stack-node.is-missing .tech { color: #7d8b99; }
 .stack-node .meta { font-size: 10px; color: #7d8b99; white-space: nowrap; }
-.stack-node.is-selected { background: #223044; }
 .stack-arrow { display: flex; align-items: center; justify-content: center; flex: none; width: 24px; color: #4e6c8a; font: 18px/1 system-ui, "Segoe UI", sans-serif; }
 .stack-arrow.is-on { color: #3fb950; }
 .stack-hint { display: flex; align-items: center; margin-left: auto; padding-left: 10px; color: #7d8b99; font-size: 10px; white-space: nowrap; }
@@ -214,21 +235,34 @@ body.map-open main { display: none; }
 #map-json-list .empty, #map-trace-list .empty { padding: 4px; color: #7d8b99; font-size: 10px; }
 .json-item { padding: 4px 6px; margin-bottom: 2px; background: #141c25; content-visibility: auto; contain-intrinsic-size: auto 76px; }
 .json-item:hover { background: #1a2430; }
-.json-item .json-head { color: #39c5cf; font: 10px "Cascadia Mono", Consolas, monospace; word-break: break-word; }
-.json-item .json-body { margin-top: 2px; max-height: 72px; overflow: hidden; color: #c9d1d9; font: 10px/1.35 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
-.json-list .json-item { background: #0e151c; }
-.json-list .json-item + .json-item { margin-top: 2px; }
-.json-list .json-item .json-body { max-height: 160px; overflow: auto; }
-.json-item .json-where { margin-top: 2px; color: #7d8b99; font-size: 9px; }
-.json-item .json-more { margin-top: 2px; color: #9fc7f5; font-size: 9px; cursor: pointer; }
-.json-item .json-more:hover { color: #7ee7f0; }
-.json-item .json-where .code-link { color: #9fc7f5; }
-.json-item .json-head.is-link { cursor: pointer; }
-.json-item .json-head.is-link:hover { color: #7ee7f0; }
-#map-json-list .json-item.is-preview .json-body { max-height: 54px; }
+#map-json-list .json-item + .json-item { margin-top: 2px; }
+#map-json-list .info-body { max-height: 180px; }
+#map-middleware { position: absolute; inset: 0; z-index: 2; overflow: hidden; pointer-events: none; }
+#map-cards { position: absolute; inset: 0; z-index: 1; overflow: hidden; pointer-events: none; }
+#map-cards-world { position: absolute; top: 0; left: 0; transform-origin: 0 0; pointer-events: none; }
+#map-cards.is-zoom-out { visibility: hidden; }
+#map-middleware-world { position: absolute; top: 0; left: 0; transform-origin: 0 0; pointer-events: none; }
+.mw-grid { position: absolute; display: grid; justify-content: start; align-items: start; row-gap: 6px; pointer-events: none; }
+.mw-title { display: flex; align-items: baseline; gap: 6px; padding: 0 2px 6px; color: #39c5cf; font: 600 9px/1.2 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.08em; }
+.mw-title-glyph { color: #39c5cf; font-size: 11px; letter-spacing: 0; }
+.mw-title-count { margin-left: auto; color: #7d8b99; font-weight: 400; letter-spacing: 0.02em; }
+.mw-empty { padding: 6px 2px; color: #7d8b99; font-size: 10px; font-style: italic; }
+.mw-card { padding: 5px 7px; background: #121b25; pointer-events: auto; user-select: text; -webkit-user-select: text; }
+.mw-card:hover { background: #17222e; }
+.mw-card.is-response { background: #12201a; }
+.mw-card.is-response:hover { background: #16271f; }
+.mw-card.is-frontend { background: #131c26; }
+.mw-card.is-frontend:hover { background: #182430; }
+.mw-card.is-backend { background: #181726; }
+.mw-card.is-backend:hover { background: #1f1d31; }
+#map-middleware.is-zoom-out .mw-grid * { color: transparent !important; }
+.mw-link-line { fill: none; stroke: #33475c; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.mw-link-line.is-request { stroke: #3a5a78; }
+.mw-link-line.is-response { stroke: #3c6a4e; }
 #map-canvas { position: relative; flex: 1; min-width: 0; overflow: hidden; background: #0b1017; }
 #map-axis { position: absolute; top: 0; left: 0; right: 0; height: 22px; overflow: hidden; background: #0b1017; pointer-events: none; z-index: 3; }
 #map-axis .axis-label { position: absolute; top: 6px; left: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; color: #7d8b99; font: 600 9px system-ui, "Segoe UI", sans-serif; letter-spacing: 0.1em; white-space: nowrap; }
+#map-axis .axis-label.is-middleware { color: #39c5cf; }
 #map-axis .axis-grip { position: absolute; top: 0; bottom: 0; left: 0; width: 9px; background: transparent; pointer-events: auto; cursor: col-resize; touch-action: none; }
 #map-axis .axis-grip::after { content: ""; position: absolute; top: 4px; bottom: 4px; left: 4px; width: 1px; background: #2b3a4a; }
 #map-axis .axis-grip:hover, #map-axis .axis-grip.is-active { background: #1d2833; }
@@ -236,33 +270,93 @@ body.map-open main { display: none; }
 body.is-column-resizing, body.is-column-resizing * { cursor: col-resize !important; user-select: none !important; }
 #map-svg { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
 #map-svg.is-panning { cursor: grabbing; }
-#map-tip { position: absolute; z-index: 11; max-width: 380px; max-height: 300px; overflow: hidden; padding: 6px 8px; background: #0a1016; color: #d4d4d4; font: 11px/1.45 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-word; pointer-events: none; }
+#map-tip { position: absolute; z-index: 11; max-width: 420px; max-height: 420px; background: #0a1016; pointer-events: none; }
+#map-tip.is-frozen { pointer-events: auto; }
+#map-tip-card { padding: 7px 8px; max-height: 420px; overflow: auto; }
+#map-tip-block { position: absolute; top: 0; right: 0; z-index: 1; padding: 1px 6px; background: #d29922; color: #0b1017; font: 600 9px/1.5 "Cascadia Mono", Consolas, monospace; letter-spacing: 0.06em; pointer-events: none; }
+.info-card { display: flex; flex-direction: column; gap: 4px; color: #d4d4d4; font: 11px/1.45 system-ui, "Segoe UI", sans-serif; word-break: break-word; user-select: text; -webkit-user-select: text; }
+.info-head { display: flex; flex-direction: column; gap: 2px; }
+.info-head-top { display: flex; align-items: baseline; gap: 6px; }
+.info-expander { flex: none; width: 12px; height: 12px; padding: 0; background: transparent; color: #9fc7f5; border: 0; font: 10px/1 system-ui, "Segoe UI", sans-serif; cursor: pointer; }
+.info-expander:hover { color: #e6edf3; }
+.info-meta { margin-left: auto; color: #7d8b99; font: 600 8px/1.2 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.04em; white-space: nowrap; }
+.info-head.is-toggleable { cursor: pointer; }
+.info-eyebrow { color: #8b98a5; font: 600 8px/1.2 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.1em; text-transform: uppercase; }
+.info-status { margin-left: auto; color: #8b98a5; font: 9px/1.2 "Cascadia Mono", Consolas, monospace; }
+.info-status.is-request { color: #58a6ff; }
+.info-status.is-response, .info-status.is-ok { color: #9fe3b8; }
+.info-status.is-warn { color: #ffd7a8; }
+.info-status.is-error { color: #ffb4a8; }
+.info-title { color: #e6edf3; font: 600 12px/1.3 system-ui, "Segoe UI", sans-serif; }
+.info-sub { color: #8b98a5; font: 10px/1.35 "Cascadia Mono", Consolas, monospace; }
+.info-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.info-chip { padding: 0 4px; background: #1b2531; color: #9fc7f5; font: 600 8px/1.4 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.06em; }
+.info-chip.is-runtime { background: #173123; color: #9fe3b8; }
+.info-chip.is-static { background: #22303f; color: #9fc7f5; }
+.info-chip.is-recortado { background: #33270f; color: #ffd7a8; }
+.info-chip.is-heurístico { background: #33270f; color: #ffd7a8; }
+.info-rows { display: flex; flex-direction: column; gap: 3px; }
+.info-row { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 6px; align-items: baseline; }
+.info-label { color: #7d8b99; font: 600 8px/1.3 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.08em; text-transform: uppercase; }
+.info-value { color: #d4d4d4; font: 10px/1.4 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+.info-sections { display: flex; flex-direction: column; gap: 3px; }
+.info-section { background: #0a1016; }
+.info-toggle { display: flex; align-items: center; gap: 4px; width: 100%; height: 20px; padding: 0 5px; background: #131a22; color: #9fc7f5; font: 9px/1 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.04em; text-align: left; cursor: pointer; }
+.info-toggle:hover { background: #1d2833; color: #e6edf3; }
+.info-caret { font-size: 10px; }
+.info-body { margin: 0; padding: 5px 7px; color: #d4d4d4; font: 10.5px/13px "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto; user-select: text; -webkit-user-select: text; }
+.info-location { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 6px; }
+.info-footer { margin-top: 2px; }
+.info-action { display: block; width: 100%; height: 22px; padding: 0 6px; background: #1d2632; color: #c9d1d9; font: 10px/1 system-ui, "Segoe UI", sans-serif; text-align: left; cursor: pointer; }
+.info-action:hover { background: #26313f; }
+.info-card.is-rail .info-row, .info-card.is-rail .info-location { grid-template-columns: 58px minmax(0, 1fr); }
+.info-card.is-rail .info-title { font-size: 11px; }
+.info-card.is-middleware .info-row { grid-template-columns: 58px minmax(0, 1fr); }
+.info-card.is-middleware.is-frontend .info-row, .info-card.is-middleware.is-backend .info-row, .info-card.is-middleware.is-frontend .info-location, .info-card.is-middleware.is-backend .info-location { grid-template-columns: 96px minmax(0, 1fr); }
+.info-card.is-middleware.is-frontend .info-eyebrow { color: #9fc7f5; }
+.info-card.is-middleware.is-backend .info-eyebrow { color: #bc8cff; }
+.info-card.is-middleware .info-eyebrow { color: #9fc7f5; }
+.info-card.is-middleware.is-response .info-eyebrow { color: #9fe3b8; }
+.info-card.is-node { position: absolute; background: transparent; pointer-events: auto; }
+.info-card.is-node .info-head { gap: 0; padding: 5px 8px 0 10px; }
+.info-card.is-node .info-head-top { height: 12px; align-items: center; }
+.info-card.is-node .info-eyebrow { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.info-card.is-node .info-title { height: 14px; font: 600 11px/14px system-ui, "Segoe UI", sans-serif; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.info-card.is-node .info-sub { height: 13px; font: 10px/13px system-ui, "Segoe UI", sans-serif; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.info-card.is-node.is-collapsed { overflow: hidden; }
+.info-card.is-node.is-expanded { padding-bottom: 6px; }
+.info-card.is-node > .info-chips, .info-card.is-node > .info-rows, .info-card.is-node > .info-sections, .info-card.is-node > .info-location, .info-card.is-node > .info-footer { padding: 0 8px 0 10px; }
+.info-card.is-node .info-row, .info-card.is-node .info-location { grid-template-columns: 76px minmax(0, 1fr); }
+.info-card.is-node.is-dimmed { opacity: 0.16; }
+.info-card.is-node.is-selected .info-title { color: #ffffff; }
+#map-detail .info-row, #map-detail .info-location { grid-template-columns: 70px minmax(0, 1fr); }
+#map-detail .info-title { font-size: 13px; }
 #map-menu { position: absolute; z-index: 12; min-width: 170px; padding: 3px; background: #141c25; }
 #map-menu button { display: block; width: 100%; height: 25px; padding: 0 8px; background: transparent; color: #c9d1d9; border: 0; font: 11px/1 system-ui, "Segoe UI", sans-serif; text-align: left; cursor: pointer; }
 #map-menu button:hover { background: #1d2833; color: #e6edf3; }
-#map-status { position: absolute; left: 12px; top: 30px; right: 12px; font-size: 11px; pointer-events: none; }
+#map-status { position: absolute; left: 12px; top: 30px; right: 12px; font-size: 11px; pointer-events: none; z-index: 5; }
 #map-status .box { display: inline-block; margin: 0 6px 4px 0; padding: 4px 7px; background: #16202b; color: #aab8c5; pointer-events: auto; }
 #map-status .box.is-error { background: #2a1a18; color: #ffb4a8; }
+#map-status .box.is-warn { background: #33270f; color: #ffd7a8; }
 #map-status .box.is-empty { background: #131a22; color: #8b98a5; }
 #map-status .box .action { height: auto; margin-left: 8px; padding: 1px 6px; background: #223044; color: #c9d1d9; border: 0; font: 9px system-ui, "Segoe UI", sans-serif; cursor: pointer; }
 #map-status .box .action:hover { background: #2a3a50; color: #e6edf3; }
-#map-detail { flex: none; width: 280px; overflow-y: auto; background: #10161e; padding: 8px 10px; }
-#map-detail .type { margin-top: 2px; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: #8b98a5; }
-#map-detail h2 { margin: 4px 0 0; font-size: 13px; font-weight: 600; color: #e6edf3; word-break: break-word; }
-#map-detail .chips { margin-top: 6px; }
-#map-detail .row { margin-top: 8px; }
-#map-detail .row .label { font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: #7d8b99; }
-#map-detail .row .value { color: #d4d4d4; font-size: 11px; word-break: break-word; white-space: pre-wrap; }
-#map-detail .list { margin-top: 3px; max-height: 220px; overflow-y: auto; background: #0a1016; }
-#map-detail .list-item { padding: 4px 6px; color: #d4d4d4; font: 11px/1.35 "Cascadia Mono", Consolas, monospace; word-break: break-word; }
-#map-detail .list-item + .list-item { margin-top: 2px; }
-#map-detail .list-item:nth-child(odd) { background: #0e151c; }
-#map-detail .list-foot { padding: 4px 6px; color: #7d8b99; font: 9px/1.3 system-ui, "Segoe UI", sans-serif; }
-#map-detail .list-empty { margin-top: 3px; color: #8b98a5; font-size: 10px; }
-#map-detail .sql { margin-top: 2px; padding: 5px 7px; background: #0a1016; color: #d4d4d4; font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; line-height: 1.35; white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow: auto; }
-#map-detail .note { margin-top: 8px; color: #ffd7a8; font-size: 10px; word-break: break-word; }
-#map-detail button { display: block; width: 100%; height: 24px; margin-top: 8px; background: #1d2632; color: #c9d1d9; border: 0; font: 10px/1 system-ui, "Segoe UI", sans-serif; cursor: pointer; }
-#map-detail button:hover { background: #26313f; }
+#map-close-guard { position: absolute; inset: 0; z-index: 14; display: flex; align-items: center; justify-content: center; background: rgba(11, 16, 23, 0.82); }
+.guard-card { display: flex; flex-direction: column; gap: 8px; width: 340px; padding: 12px; background: #141c25; }
+.guard-title { color: #e6edf3; font: 600 13px/1.3 system-ui, "Segoe UI", sans-serif; }
+.guard-text { max-height: 180px; overflow: auto; color: #aab8c5; font: 11px/1.45 "Cascadia Mono", Consolas, monospace; word-break: break-word; user-select: text; -webkit-user-select: text; }
+.guard-actions { display: flex; flex-direction: column; gap: 4px; }
+.guard-actions button { height: 26px; padding: 0 8px; background: #1d2632; color: #c9d1d9; border: 0; font: 11px/1 system-ui, "Segoe UI", sans-serif; text-align: left; cursor: pointer; }
+.guard-actions button:hover { background: #26313f; color: #e6edf3; }
+.info-edit { display: flex; flex-direction: column; gap: 4px; padding: 5px 7px; background: #0a1016; }
+.info-editor { width: 100%; height: 220px; padding: 4px 6px; background: #0e1116; color: #d4d4d4; border: 0; font: 10.5px/13px "Cascadia Mono", Consolas, monospace; white-space: pre; overflow: auto; resize: vertical; user-select: text; -webkit-user-select: text; }
+.info-editor:focus { outline: 2px solid #58a6ff; outline-offset: -2px; }
+.info-savebar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.info-save { height: 20px; min-width: 0; padding: 0 6px; background: #1d2632; color: #c9d1d9; border: 0; font: 9px/1 system-ui, "Segoe UI", sans-serif; cursor: pointer; }
+.info-save:hover:not(:disabled) { background: #26313f; color: #e6edf3; }
+.info-dirty { color: #ffd7a8; font: 600 9px/1 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.04em; }
+.info-edit-status { color: #ffb4a8; font: 9px/1.3 system-ui, "Segoe UI", sans-serif; }
+#map-detail { flex: none; width: 280px; overflow-y: auto; background: #10161e; padding: 8px 10px; display: flex; flex-direction: column; gap: 8px; }
 #map-detail .code-link, #map-results .code-link { display: inline; width: auto; height: auto; margin: 0; padding: 0; background: none; color: #9fc7f5; font: inherit; }
 #map-detail .code-link:hover, #map-results .code-link:hover { background: none; color: #e6edf3; }
 #map-footer { flex: none; display: flex; align-items: center; gap: 10px 14px; padding: 4px 10px; background: #10161e; color: #7d8b99; font-size: 10px; flex-wrap: wrap; }
@@ -294,6 +388,7 @@ body.is-column-resizing, body.is-column-resizing * { cursor: col-resize !importa
 .flow-node .title { fill: #e6edf3; font: 600 11px system-ui, "Segoe UI", sans-serif; }
 .flow-node .sub { fill: #8b98a5; font: 10px system-ui, "Segoe UI", sans-serif; }
 .flow-node .badge { fill: #9fe3b8; font: 600 8px system-ui, "Segoe UI", sans-serif; text-anchor: end; }
+.flow-node .weight { fill: #7d8b99; font: 600 8px system-ui, "Segoe UI", sans-serif; text-anchor: end; }
 .flow-node.is-hidden .title { fill: #8b98a5; }
 .flow-node.is-disabled .bar { fill: #4e5a66; }
 .flow-node:hover .box { fill: #1d2836; }
@@ -371,7 +466,7 @@ const MAP_MARKUP = `<div id="map" hidden>
             <button type="button" id="map-order-structural" aria-pressed="false" title="Columnas por tipo con filas ordenadas por archivo, línea y posición en el DOM">Estructural</button>
             <button type="button" id="map-order-hierarchy" aria-pressed="false" title="Árbol jerárquico por archivo: HTML, CSS/JS, controles, peticiones, backend y SQL">Jerárquico</button>
           </div>
-          <label id="map-compact-label" title="Muestra solo el título y el contador de cada cuadro para que quepan más nodos en pantalla."><input type="checkbox" id="map-compact" />Vista compacta</label>
+          <label id="map-compact-label" title="Activada por defecto para ahorrar recursos. Cada nodo muestra tres líneas; desmárcala para desplegar tarjetas con todo el detalle."><input type="checkbox" id="map-compact" checked />Vista compacta</label>
           <div id="map-scope" role="group" aria-label="Alcance del tráfico">
             <button type="button" id="map-scope-all" aria-pressed="false">Todo el tráfico</button>
             <button type="button" id="map-scope-interacted" class="is-on" aria-pressed="true">Solo lo que interactuaste</button>
@@ -385,10 +480,12 @@ const MAP_MARKUP = `<div id="map" hidden>
             <option value="">Todos los eventos</option>
           </select>
           <label id="map-event-only-label" title="Oculta y re-apila solo los nodos alcanzables desde el evento elegido."><input type="checkbox" id="map-event-only" />Solo esos</label>
+          <select id="map-status-filter" aria-label="Filtrar por estado HTTP" title="Oculta y re-apila solo las cadenas de las peticiones con el estado elegido, igual que «Ver interacciones».">
+            <option value="">Todos los estados</option>
+          </select>
           <button type="button" id="map-zoom-out" title="Alejar" aria-label="Alejar">−</button>
           <button type="button" id="map-zoom-in" title="Acercar" aria-label="Acercar">+</button>
           <button type="button" id="map-fit">Ajustar</button>
-          <button type="button" id="map-tip-toggle" aria-pressed="false" title="Detalle al pasar el cursor; mantén Shift para verlo temporalmente.">Tooltip<span class="key">Shift</span></button>
           <button type="button" id="map-page" title="Cerrar la ventana del mapa">Cerrar ventana</button>
         </div>
         <div id="map-stack" aria-label="Cadena de tecnologías"></div>
@@ -402,9 +499,29 @@ const MAP_MARKUP = `<div id="map" hidden>
           <div id="map-canvas">
             <div id="map-axis" aria-hidden="true"></div>
             <svg id="map-svg" xmlns="http://www.w3.org/2000/svg"></svg>
-            <div id="map-tip" role="tooltip" hidden></div>
+            <div id="map-cards" aria-label="Tarjetas de los nodos del mapa">
+              <div id="map-cards-world"></div>
+            </div>
+            <div id="map-middleware" hidden aria-label="Fila de intercambio: petición frontend, JSON y petición backend">
+              <div id="map-middleware-world"></div>
+            </div>
+            <div id="map-tip" role="tooltip" hidden>
+              <div id="map-tip-card"></div>
+              <div id="map-tip-block" hidden>bloquear</div>
+            </div>
             <div id="map-menu" role="menu" aria-label="Acciones del nodo" hidden></div>
             <div id="map-status"></div>
+            <div id="map-close-guard" role="dialog" aria-label="Código sin guardar" hidden>
+              <div class="guard-card">
+                <div class="guard-title">Hay código sin guardar</div>
+                <div class="guard-text" id="map-close-guard-text"></div>
+                <div class="guard-actions">
+                  <button id="map-guard-save" type="button">Guardar y cerrar</button>
+                  <button id="map-guard-discard" type="button">Descartar y cerrar</button>
+                  <button id="map-guard-cancel" type="button">Cancelar</button>
+                </div>
+              </div>
+            </div>
           </div>
           <aside id="map-detail" aria-label="Detalle del nodo" hidden></aside>
         </div>
@@ -421,7 +538,7 @@ const MAP_MARKUP = `<div id="map" hidden>
             <span class="key dashed">discontinua = heurística</span>
             <span class="key faded">atenuada = solo estática</span>
           </span>
-          <span class="hub">Clic en una celda = sigue su recorrido hasta el backend · clic izquierdo ilumina la cadena · clic derecho → «Ver interacciones» · tooltip con el botón o Shift · solo se dibuja lo visible</span>
+          <span class="hub">Clic en una celda = sigue su recorrido hasta el backend · clic izquierdo ilumina la cadena · clic derecho → «Ver interacciones» · Shift = detalle · Ctrl = fija el detalle con «bloquear» · solo se dibuja lo visible</span>
         </div>
       </div>`;
 
@@ -464,12 +581,23 @@ export const INSPECTION_PANEL_HTML = `<!doctype html>
           <h1 id="element">Elemento</h1>
           <div id="element-detail" class="sub"></div>
 
-          <section>
+          <section id="sec-html">
+            <h2>HTML/CSS</h2>
+            <div id="html-selector" class="value">—</div>
+            <div id="html-size" class="note"></div>
+            <div id="html-rows"></div>
+            <div id="html-empty" class="empty" hidden>
+              Haz clic en un elemento para leer sus estilos calculados y sus atributos.
+            </div>
+          </section>
+
+          <section id="sec-frontend">
             <h2>Frontend</h2>
             <div id="handler" class="value">—</div>
             <div id="handler-loc" class="note"></div>
             <div id="handler-code-wrap" hidden>
               <div class="code-head">
+                <button class="code-toggle" id="handler-code-toggle" type="button" aria-expanded="false" hidden>▸ Código</button>
                 <span class="code-file" id="handler-code-file"></span>
                 <span class="code-range" id="handler-code-range"></span>
               </div>
@@ -477,7 +605,7 @@ export const INSPECTION_PANEL_HTML = `<!doctype html>
             </div>
           </section>
 
-          <section>
+          <section id="sec-requests">
             <h2>Peticiones</h2>
             <input
               id="request-search"
@@ -491,7 +619,7 @@ export const INSPECTION_PANEL_HTML = `<!doctype html>
             <div id="requests"><div class="empty">Escuchando…</div></div>
           </section>
 
-          <section>
+          <section id="sec-request">
             <h2>Petición</h2>
             <div id="endpoint" class="value">—</div>
             <div class="seq" id="sequence"></div>
@@ -502,12 +630,13 @@ export const INSPECTION_PANEL_HTML = `<!doctype html>
             <div class="body-note" id="bodies-note" hidden></div>
           </section>
 
-          <section>
+          <section id="sec-backend">
             <h2>Backend</h2>
             <div id="backend" class="value"></div>
             <div id="backend-loc" class="note"></div>
             <div id="backend-code-wrap" hidden>
               <div class="code-head">
+                <button class="code-toggle" id="backend-code-toggle" type="button" aria-expanded="false" hidden>▸ Código</button>
                 <span class="code-file" id="backend-code-file"></span>
                 <span class="code-range" id="backend-code-range"></span>
               </div>
@@ -515,17 +644,18 @@ export const INSPECTION_PANEL_HTML = `<!doctype html>
             </div>
           </section>
 
-          <section>
+          <section id="sec-sql">
             <h2>SQL</h2>
             <div id="queries"><div class="empty">—</div></div>
           </section>
 
-          <section>
+          <section id="sec-execution">
             <h2>Ejecución</h2>
             <div id="execution" hidden>
               <div id="execution-loc" class="value"></div>
               <div id="breakpoints"></div>
               <div class="code-head">
+                <button class="code-toggle" id="execution-code-toggle" type="button" aria-expanded="false" hidden>▸ Código</button>
                 <span class="code-file" id="execution-code-file"></span>
                 <span class="code-range" id="execution-code-range"></span>
               </div>

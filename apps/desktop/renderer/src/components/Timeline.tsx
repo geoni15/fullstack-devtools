@@ -247,7 +247,7 @@ function RequestDetail({ request }: { request: CapturedRequest }) {
             ))}
           </dl>
         )}
-        <span className="detail-note">Valores sensibles enmascarados.</span>
+        <span className="detail-note">Cabeceras sensibles enmascaradas.</span>
       </div>
     </div>
   );

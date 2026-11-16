@@ -616,7 +616,7 @@ export function AppView({ active }: AppViewProps) {
             <span className="connect-hint">
               Un comando «node archivo» se inicia con «--inspect» y recibe PORT; un «npm run script»
               arranca sin inspector de Node. La barra solo permite frontend y backend configurados.
-              Cuerpos JSON enmascarados.
+              Cuerpos JSON completos, solo en memoria.
             </span>
           </div>
         </form>

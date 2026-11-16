@@ -1,7 +1,5 @@
 import type { CapturedBody } from '@bdt/protocol';
-import { isSensitiveHeader } from './headers';
 
-const MASK = '[enmascarado]';
 const MAX_DEPTH = 64;
 
 interface OutputBudget {
@@ -21,10 +19,13 @@ function push(budget: OutputBudget, chunk: string): void {
   budget.truncated = true;
 }
 
-function writeMasked(value: unknown, depth: number, budget: OutputBudget): void {
+// Los valores se conservan tal cual, incluidas claves sensibles: el usuario audita
+// el dato real. Solo se acota el tamaño y la profundidad; nada sale del proceso ni
+// se escribe en disco. El enmascarado de cabeceras y query sigue vigente.
+function writeBody(value: unknown, depth: number, budget: OutputBudget): void {
   if (budget.truncated) return;
   if (depth > MAX_DEPTH) {
-    push(budget, JSON.stringify(MASK));
+    push(budget, 'null');
     return;
   }
   if (Array.isArray(value)) {
@@ -32,7 +33,7 @@ function writeMasked(value: unknown, depth: number, budget: OutputBudget): void 
     for (let index = 0; index < value.length; index += 1) {
       if (budget.truncated) return;
       if (index > 0) push(budget, ',');
-      writeMasked(value[index], depth + 1, budget);
+      writeBody(value[index], depth + 1, budget);
     }
     push(budget, ']');
     return;
@@ -46,7 +47,7 @@ function writeMasked(value: unknown, depth: number, budget: OutputBudget): void 
       first = false;
       push(budget, JSON.stringify(key));
       push(budget, ':');
-      writeMasked(isSensitiveHeader(key) ? MASK : item, depth + 1, budget);
+      writeBody(item, depth + 1, budget);
     }
     push(budget, '}');
     return;
@@ -71,7 +72,7 @@ export function sanitizeJsonBody(
   if (parsed === null || typeof parsed !== 'object') return null;
   const budget: OutputBudget = { text: '', truncated: false, limit: maxChars };
   try {
-    writeMasked(parsed, 0, budget);
+    writeBody(parsed, 0, budget);
   } catch {
     return null;
   }

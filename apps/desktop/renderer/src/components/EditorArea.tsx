@@ -22,8 +22,8 @@ function EmptyEditor() {
     <div className="editor-empty">
       <p className="empty-title">Sin archivo abierto</p>
       <p className="empty-text">
-        Selecciona un archivo del explorador para verlo en modo solo lectura, o abre la pestaña
-        Aplicación para inspeccionar una web en ejecución.
+        Selecciona un archivo del explorador para abrirlo y editarlo, o abre la pestaña Aplicación
+        para inspeccionar una web en ejecución.
       </p>
       <p className="empty-hint">F1 · Captura N0 de red</p>
     </div>
@@ -31,10 +31,12 @@ function EmptyEditor() {
 }
 
 export function EditorArea() {
-  const { state, activateTab, closeTab } = useWorkspace();
+  const { state, activateTab, closeTab, editTab, saveTab, reloadTab } = useWorkspace();
   const browser = useBrowser();
   const [view, setView] = useState<EditorView>('app');
+  const [pendingClose, setPendingClose] = useState<string | null>(null);
   const activeTab = state.tabs.find((tab) => tab.path === state.activePath) ?? null;
+  const closingTab = state.tabs.find((tab) => tab.path === pendingClose) ?? null;
 
   useEffect(() => {
     if (state.activePath !== null) {
@@ -51,6 +53,21 @@ export function EditorArea() {
   const openFileTab = (path: string): void => {
     activateTab(path);
     setView('file');
+  };
+
+  const requestClose = (path: string, dirty: boolean): void => {
+    if (dirty) {
+      setPendingClose(path);
+      return;
+    }
+    closeTab(path);
+  };
+
+  const saveAndClose = async (path: string): Promise<void> => {
+    const saved = await saveTab(path);
+    if (!saved) return;
+    setPendingClose(null);
+    closeTab(path);
   };
 
   const reveal =
@@ -100,11 +117,14 @@ export function EditorArea() {
               >
                 {tab.name}
               </button>
+              {tab.status === 'ready' && tab.dirty ? (
+                <span className="tab-dirty" title="Sin guardar" aria-label="Sin guardar" />
+              ) : null}
               <button
                 type="button"
                 className="tab-close"
                 aria-label={`Cerrar ${tab.name}`}
-                onClick={() => closeTab(tab.path)}
+                onClick={() => requestClose(tab.path, tab.status === 'ready' && tab.dirty)}
               >
                 ×
               </button>
@@ -113,6 +133,55 @@ export function EditorArea() {
         })}
         {state.tabs.length === 0 ? <span className="tabs-idle">Archivos</span> : null}
       </div>
+
+      {closingTab !== null ? (
+        <div className="editor-guard" role="dialog" aria-label="Archivo sin guardar">
+          <span className="guard-label">{closingTab.name} tiene cambios sin guardar</span>
+          <button type="button" onClick={() => void saveAndClose(closingTab.path)}>
+            Guardar y cerrar
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setPendingClose(null);
+              closeTab(closingTab.path);
+            }}
+          >
+            Descartar y cerrar
+          </button>
+          <button type="button" onClick={() => setPendingClose(null)}>
+            Cancelar
+          </button>
+        </div>
+      ) : null}
+
+      {view === 'file' && activeTab?.status === 'ready' ? (
+        <div className="editor-tools">
+          <span className="editor-tools-path">{activeTab.path}</span>
+          {activeTab.externalChange ? (
+            <span className="editor-external">Cambió en disco</span>
+          ) : null}
+          {activeTab.dirty ? <span className="editor-dirty">Sin guardar</span> : null}
+          {activeTab.externalChange ? (
+            <>
+              <button type="button" onClick={() => void reloadTab(activeTab.path)}>
+                Recargar
+              </button>
+              <button type="button" onClick={() => void saveTab(activeTab.path, true)}>
+                Guardar encima
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              disabled={!activeTab.dirty}
+              onClick={() => void saveTab(activeTab.path)}
+            >
+              Guardar · Ctrl+S
+            </button>
+          )}
+        </div>
+      ) : null}
 
       <div className="editor-body">
         <div className={`app-pane${view === 'app' ? ' is-active' : ''}`}>
@@ -130,9 +199,12 @@ export function EditorArea() {
           ) : (
             <MonacoPane
               key={activeTab.path}
-              content={activeTab.content}
+              value={activeTab.buffer}
+              dirty={activeTab.dirty}
               language={languageForPath(activeTab.path)}
               reveal={reveal}
+              onChange={(buffer) => editTab(activeTab.path, buffer)}
+              onSave={() => void saveTab(activeTab.path)}
             />
           )
         ) : null}
@@ -150,8 +222,8 @@ export function EditorArea() {
               ? `N0 · ${browser.state.requests.length} peticiones observadas`
               : 'N0 · sin sesión'
             : activeTab?.status === 'ready'
-              ? `${formatBytes(activeTab.size)} · solo lectura`
-              : 'Solo lectura'}
+              ? `${formatBytes(activeTab.size)} · ${activeTab.dirty ? 'sin guardar' : 'guardado'}`
+              : 'Sin archivo'}
         </span>
       </div>
     </section>

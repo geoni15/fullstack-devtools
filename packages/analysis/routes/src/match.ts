@@ -1,6 +1,10 @@
 import { normalizeRoutePath, type StaticRoute } from './types';
 
+const regExpCache = new Map<string, RegExp>();
+
 export function routePatternToRegExp(routePath: string): RegExp {
+  const cached = regExpCache.get(routePath);
+  if (cached !== undefined) return cached;
   const path = normalizeRoutePath(routePath);
   let pattern = '^';
   let index = 0;
@@ -43,7 +47,9 @@ export function routePatternToRegExp(routePath: string): RegExp {
     pattern += (char ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     index += 1;
   }
-  return new RegExp(`${pattern}/?$`, 'i');
+  const regExp = new RegExp(`${pattern}/?$`, 'i');
+  regExpCache.set(routePath, regExp);
+  return regExp;
 }
 
 function specificity(route: StaticRoute): number {

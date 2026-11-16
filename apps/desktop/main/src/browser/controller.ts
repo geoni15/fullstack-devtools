@@ -4,9 +4,13 @@ import { BrowserWindow, WebContentsView, type WebContents } from 'electron';
 import {
   BdtError,
   BROWSER_CHROME_CHANNELS,
+  CODE_LOCATION_REQUEST_SCHEMA,
   ERROR_CODES,
   IPC_CHANNELS,
   INSPECTION_MODES,
+  elementSelectorLabel,
+  elementSizeLabel,
+  elementStyleGroups,
   handlerLabel,
   handlerProfileTags,
   requestStatusView,
@@ -21,6 +25,8 @@ import {
   type BrowserState,
   type BrowserTargetsRequest,
   type CapturedRequest,
+  type CodeLocation,
+  type CodeLocationRequest,
   type ConsoleEntry,
   type ConsoleLevel,
   type ConsoleSource,
@@ -28,10 +34,13 @@ import {
   type FlowJsonMovement,
   type FlowJsonState,
   type FlowMapState,
+  type FlowRequestDetail,
+  type FlowRequestState,
   type FlowSqlCaptureState,
   type InspectionBackend,
   type InspectionCard,
   type InspectionCodeBlock,
+  type InspectionCorrelation,
   type InspectionElement,
   type InspectionExecution,
   type InspectionHandler,
@@ -42,6 +51,7 @@ import {
   type InspectionRuntime,
   type InspectionSqlQuery,
   type InspectionSqlResult,
+  type RequestInitiator,
   type SecurityScanReport,
 } from '@bdt/protocol';
 import {
@@ -67,8 +77,10 @@ import {
   type HoverTipCode,
   type HoverTipData,
   type HoverTipRow,
+  type HoverTipTone,
   type InspectorClickSignal,
   type InspectorHoverSignal,
+  type InspectorRevealSignal,
   type InspectorSignal,
 } from './click-inspector';
 import { databaseHintLabel, pickDatabaseHint } from './database-hints';
@@ -80,6 +92,7 @@ import { UnifiedWindow } from './unified-window';
 import { InspectionPanel } from './inspection-panel';
 import { InteractionLedger } from './interaction-ledger';
 import { NodeInspector, type SqlObservation } from './node-inspector';
+import { NodeWeightMeter, textBytes, type RequestWeight } from './node-weight';
 import {
   INVENTORY_SCRIPT,
   parseInventory,
@@ -99,7 +112,8 @@ import type {
 } from './runtime-provenance';
 import { RuntimeHandlerLedger } from './runtime-handler-ledger';
 import { RuntimeLinkLedger, type RuntimeLinkBasis } from './runtime-link-ledger';
-import { normalizeSqlText, staticQueriesForRoute } from './sql-queries';
+import { joinNotes, normalizeSqlText, staticQueriesForRoute } from './sql-queries';
+import { hashText } from './hash-text';
 import { FRONTEND_FRAMEWORK_SCRIPT } from './stack-detection';
 import { BROWSER_CHROME_HTML } from './ui-html';
 import { WorkspaceSymbols, type ComponentSymbol } from './workspace-symbols';
@@ -121,7 +135,7 @@ interface CdpRequestWillBeSent {
 
 interface CdpResponseReceived {
   requestId: string;
-  response: { status: number; mimeType?: string };
+  response: { status: number; mimeType?: string; headers?: Record<string, string> };
 }
 
 interface CdpLoadingFinished {
@@ -209,9 +223,9 @@ interface PendingRequest {
 interface InspectionSession {
   id: string;
   clickedAt: number;
-  handlerName: string | null;
   card: InspectionCard;
   requests: Map<string, InspectionRequest>;
+  initiators: Map<string, RequestInitiator | null>;
   selectedByUser: boolean;
   executions: InspectionExecution[];
   sqlObservations: SqlObservation[];
@@ -227,6 +241,7 @@ interface BackendSource {
 export interface BrowserControllerOptions {
   getWorkspaceRoot(): string | null;
   getWorkspaceFiles(): readonly string[];
+  revealCode(request: CodeLocationRequest): CodeLocation | null;
   chromePreloadPath: string;
   panelPreloadPath: string;
   unifiedPreloadPath: string;
@@ -542,6 +557,14 @@ interface HoverTextProvenance {
   runtime: RuntimeLink | null;
 }
 
+interface HoverSqlEntry {
+  query: InspectionSqlQuery;
+  file: string;
+  correlation: InspectionCorrelation | null;
+  driver: string | null;
+  count: number;
+}
+
 function shortFunctionSource(url: string): string {
   if (url === '') return '(inline)';
   const clean = url.replace(/^https?:\/\/[^/]+/i, '');
@@ -616,24 +639,17 @@ function observedStatusLabel(request: CapturedRequest): string {
   return `${formatClock(request.wallStartedAt)} · ${status.code} ${status.reason}${duration}`;
 }
 
-function formatHoverSelector(element: HoverElementInfo): string {
-  const id = element.id !== null ? `#${element.id}` : '';
-  const classes = element.classes.map((name) => `.${name}`).join('');
-  return `${element.tag}${id}${classes}`;
-}
-
-function hoverStyleValue(element: HoverElementInfo, name: string): string | null {
-  const style = element.styles.find((entry) => entry.name === name);
-  return style === undefined || style.value === '' ? null : style.value;
-}
-
-function hoverStyleGroup(element: HoverElementInfo, names: readonly string[]): string | null {
-  const parts: string[] = [];
-  for (const name of names) {
-    const value = hoverStyleValue(element, name);
-    if (value !== null) parts.push(`${name}: ${value}`);
+function runtimeRequestLabel(link: RuntimeLink): { value: string; tone: HoverTipTone } | null {
+  const info = link.requestInfo;
+  if (info === null) return null;
+  if (link.request !== null) {
+    return {
+      value: `${info.method} ${info.path} · ${observedStatusLabel(link.request)}`,
+      tone: 'ok',
+    };
   }
-  return parts.length === 0 ? null : parts.join(' · ');
+  const status = info.status === null ? 'sin estado' : `HTTP ${String(info.status)}`;
+  return { value: `${info.method} ${info.path} · ${status} · fuera del búfer`, tone: 'warn' };
 }
 
 function jsonParentCode(match: JsonTextMatch, request: CapturedRequest | null): HoverTipCode {
@@ -643,8 +659,30 @@ function jsonParentCode(match: JsonTextMatch, request: CapturedRequest | null): 
       request !== null ? ` · ${request.method} ${request.path}` : ''
     }`,
     range: `${match.parentPath}${match.parentTruncated ? ' · recortado' : ''}`,
+    path: null,
+    endLine: null,
     lines: parentLines.map((text, index) => ({ line: index + 1, text })),
   };
+}
+
+const URL_SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+
+// Solo se ofrece salto a la línea cuando normalizeCodeLocation puede resolver el archivo
+// contra la raíz del workspace; si no, el clic sería un botón muerto.
+function hoverCodePath(file: string): string | null {
+  const trimmed = file.trim();
+  if (trimmed === '') return null;
+  if (!URL_SCHEME.test(trimmed)) return trimmed;
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (url.protocol === 'file:') return trimmed;
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  return LOOPBACK_HOSTS.has(url.hostname) ? trimmed : null;
 }
 
 function toHoverCode(block: InspectionCodeBlock | null): HoverTipCode | null {
@@ -656,6 +694,8 @@ function toHoverCode(block: InspectionCodeBlock | null): HoverTipCode | null {
   return {
     file: block.file,
     range: block.truncated ? `${range} · recortado` : range,
+    path: hoverCodePath(block.file),
+    endLine: block.endLine,
     lines: block.lines.map((line) => ({ line: line.line, text: line.text })),
   };
 }
@@ -758,6 +798,7 @@ export class BrowserController {
   private inspector: ClickInspector | null = null;
   private inspectionEnabled = true;
   private hoverTipPinned = false;
+  private hoverTipFrozen = false;
   private shiftHeld = false;
   private readonly shiftTracked = new WeakSet<WebContents>();
   private inspectionMode: InspectionMode = 'html';
@@ -800,18 +841,19 @@ export class BrowserController {
   private consoleSequence = 0;
   private lastRuntimeStatus: string | null = null;
   private readonly runtimeSqlActivitySeen = new Set<string>();
-  private sqlRuntimeSequence = 0;
   private readonly flowLedger = new FlowLedger();
   private readonly runtimeSql = new Map<string, FlowRuntimeSql>();
   private sqlCaptureInfo: FlowSqlCaptureState | null = null;
   private sqlExecutions = 0;
   private sqlSampled = 0;
   private sqlLastAt: number | null = null;
+  private readonly sqlAnalysisCache = new Map<string, ReturnType<typeof analyzeSql>>();
   private readonly runtimeJsonActivitySeen = new Set<string>();
   private jsonRuntimeSequence = 0;
   private readonly runtimeJson = new Map<string, FlowJsonMovement>();
   private readonly jsonBodySent = new Set<string>();
-  private jsonPushTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly requestBodySent = new Set<string>();
+  private dataPushTimer: ReturnType<typeof setTimeout> | null = null;
   private jsonCaptureInfo: FlowJsonCaptureState | null = null;
   private jsonMovements = 0;
   private jsonBodies = 0;
@@ -835,6 +877,7 @@ export class BrowserController {
   private flowTimer: ReturnType<typeof setTimeout> | null = null;
   private flowBuilding = false;
   private flowGeneration = 0;
+  private readonly nodeWeights = new NodeWeightMeter();
   private frontendFramework: string | null = null;
   private frontendFrameworkUrl: string | null = null;
   private frontendDetection: Promise<string | null> | null = null;
@@ -1012,8 +1055,8 @@ export class BrowserController {
     }
 
     const hostWindow = config.mode === 'window' ? this.createChromeWindow() : window;
-    this.trackShift(window.webContents);
-    this.trackShift(hostWindow.webContents);
+    this.trackShift(window.webContents, true);
+    this.trackShift(hostWindow.webContents, true);
     const view = new WebContentsView({
       webPreferences: {
         partition: PARTITION,
@@ -1032,11 +1075,9 @@ export class BrowserController {
 
     const panelView = this.panel.create();
     this.panelView = panelView;
-    this.trackShift(panelView.webContents);
+    this.trackShift(panelView.webContents, true);
     hostWindow.contentView.addChildView(panelView);
-    if (config.nodeInspectorPort !== null) {
-      void this.runtime?.connect(config.nodeInspectorPort);
-    }
+    this.connectRuntimeIfEnabled();
     this.updatePanel(null);
 
     if (config.mode === 'embedded') {
@@ -1091,6 +1132,11 @@ export class BrowserController {
       this.emitState();
     });
 
+    if (this.inspectionEnabled) {
+      this.connectRuntimeIfEnabled();
+    } else {
+      this.runtime?.disconnect();
+    }
     return this.getSnapshot();
   }
 
@@ -1261,6 +1307,7 @@ export class BrowserController {
     this.sqlLastAt = null;
     this.runtimeJson.clear();
     this.jsonBodySent.clear();
+    this.requestBodySent.clear();
     this.jsonMovements = 0;
     this.jsonBodies = 0;
     this.jsonLastAt = null;
@@ -1269,7 +1316,7 @@ export class BrowserController {
     this.runtimeHandlers.clear();
     this.resetAutoResolve();
     this.markFlowDirty();
-    this.scheduleJsonPush();
+    this.scheduleDataPush();
     this.scheduleAutoResolve();
     this.emitState();
     return { ...this.state };
@@ -1282,15 +1329,26 @@ export class BrowserController {
     }
   }
 
+  private connectRuntimeIfEnabled(): void {
+    if (!this.inspectionEnabled) return;
+    const port = this.state.config?.nodeInspectorPort ?? null;
+    if (port === null || this.runtime === null) return;
+    const status = this.runtime.getRuntime().status;
+    if (status === 'connected' || status === 'connecting') return;
+    void this.runtime.connect(port);
+  }
+
   setInspection(enabled: boolean): BrowserState {
     this.inspectionEnabled = enabled;
     this.state = { ...this.state, inspectionEnabled: enabled };
     this.inspector?.setEnabled(enabled);
     void this.setDebuggerEnabled(enabled).catch(() => undefined);
     if (!enabled) {
+      this.runtime?.disconnect();
       this.setMapOpen(false);
       this.dismissCard();
     } else {
+      this.connectRuntimeIfEnabled();
       this.updatePanel(this.inspectionSession?.card ?? null);
     }
     this.layoutHost();
@@ -1349,6 +1407,11 @@ export class BrowserController {
     return this.inspectWindow.isSender(sender);
   }
 
+  setMapDirtyPaths(paths: readonly string[]): void {
+    if (!this.inspectOpen) return;
+    this.inspectWindow.setDirtyPaths(paths);
+  }
+
   handleChromeReady(sender: WebContents): void {
     if (!this.isChromeSender(sender)) return;
     this.chromeReady = true;
@@ -1359,7 +1422,9 @@ export class BrowserController {
     if (this.inspectWindow.handleReady(sender)) {
       this.inspectWindow.updateState(this.windowState());
       this.jsonBodySent.clear();
+      this.requestBodySent.clear();
       this.pushJsonState();
+      this.pushRequestState();
       return;
     }
     if (!this.panel.handleReady(sender)) return;
@@ -1386,11 +1451,12 @@ export class BrowserController {
     this.inspectWindow.updateState(this.windowState());
   }
 
-  private scheduleJsonPush(): void {
-    if (!this.flowOpen || this.jsonPushTimer !== null) return;
-    this.jsonPushTimer = setTimeout(() => {
-      this.jsonPushTimer = null;
+  private scheduleDataPush(): void {
+    if (!this.flowOpen || this.dataPushTimer !== null) return;
+    this.dataPushTimer = setTimeout(() => {
+      this.dataPushTimer = null;
       this.pushJsonState();
+      this.pushRequestState();
     }, JSON_PUSH_MS);
   }
 
@@ -1408,6 +1474,52 @@ export class BrowserController {
       });
     const payload: FlowJsonState = { capture: this.jsonCaptureView(), movements };
     this.inspectWindow.updateJsonState(payload);
+  }
+
+  // Los cuerpos de petición se envían una sola vez, igual que los movimientos JSON; el
+  // preload los conserva en caché y aquí solo se marca que ya viajaron.
+  private requestWeightBytes(): Map<string, RequestWeight> {
+    const out = new Map<string, RequestWeight>();
+    for (const request of this.buffer?.all() ?? []) {
+      const sent = request.requestBody;
+      const received = request.responseBody;
+      if (sent === null && received === null) continue;
+      out.set(request.id, {
+        bytes:
+          (sent === null ? 0 : textBytes(sent.text)) +
+          (received === null ? 0 : textBytes(received.text)),
+        truncated: (sent?.truncated ?? false) || (received?.truncated ?? false),
+      });
+    }
+    return out;
+  }
+
+  private pushRequestState(): void {
+    if (!this.flowOpen) return;
+    const buffer = this.buffer;
+    if (buffer === null) return;
+    const requests: FlowRequestDetail[] = buffer.all().map((request) => {
+      const detail: FlowRequestDetail = { ...request };
+      if (request.requestBody !== null) {
+        if (this.requestBodySent.has(`${request.id}:request`)) {
+          detail.requestBody = null;
+          detail.requestBodyOmitted = true;
+        } else {
+          this.requestBodySent.add(`${request.id}:request`);
+        }
+      }
+      if (request.responseBody !== null) {
+        if (this.requestBodySent.has(`${request.id}:response`)) {
+          detail.responseBody = null;
+          detail.responseBodyOmitted = true;
+        } else {
+          this.requestBodySent.add(`${request.id}:response`);
+        }
+      }
+      return detail;
+    });
+    const payload: FlowRequestState = { requests };
+    this.inspectWindow.updateRequestState(payload);
   }
 
   private sqlCaptureView(): FlowSqlCaptureState | null {
@@ -1454,11 +1566,12 @@ export class BrowserController {
       clearTimeout(this.flowTimer);
       this.flowTimer = null;
     }
-    if (this.jsonPushTimer !== null) {
-      clearTimeout(this.jsonPushTimer);
-      this.jsonPushTimer = null;
+    if (this.dataPushTimer !== null) {
+      clearTimeout(this.dataPushTimer);
+      this.dataPushTimer = null;
     }
     this.jsonBodySent.clear();
+    this.requestBodySent.clear();
     if (this.inventoryTimer !== null) {
       clearTimeout(this.inventoryTimer);
       this.inventoryTimer = null;
@@ -1483,6 +1596,10 @@ export class BrowserController {
   setMapOpen(open: boolean): void {
     if (!open) {
       if (!this.inspectOpen) return;
+      if (this.inspectWindow.hasDirtyFiles()) {
+        this.inspectWindow.close();
+        return;
+      }
       this.inspectOpen = false;
       this.inspectWindow.close();
       this.stopFlow();
@@ -1566,6 +1683,10 @@ export class BrowserController {
         runtimeSql: [...this.runtimeSql.values()],
         runtimeJson: [...this.runtimeJson.values()],
       });
+      await this.nodeWeights.apply(snapshot, {
+        rootPath: this.options.getWorkspaceRoot(),
+        requestBytes: this.requestWeightBytes(),
+      });
       if (generation !== this.flowGeneration || !this.flowOpen) return;
       this.flowState = { open: true, building: false, error: null, snapshot };
       this.updateFlowWindows();
@@ -1622,6 +1743,7 @@ export class BrowserController {
     this.sqlLastAt = null;
     this.runtimeJson.clear();
     this.jsonBodySent.clear();
+    this.requestBodySent.clear();
     this.jsonCaptureInfo = null;
     this.jsonMovements = 0;
     this.jsonBodies = 0;
@@ -1794,6 +1916,8 @@ export class BrowserController {
     this.inventoryKey = '';
     this.runtimeHandlers.clear();
     this.hoverResolutionCache = null;
+    // El mundo aislado se recrea en cada navegación: el bloqueo de la tarjeta no sobrevive.
+    this.hoverTipFrozen = false;
     this.resetAutoResolve();
     this.markFlowDirty();
     if (this.flowOpen && !this.state.loading) this.scheduleInventoryRefresh(0);
@@ -1939,10 +2063,29 @@ export class BrowserController {
     this.sendChromeState();
   }
 
-  private trackShift(contents: WebContents): void {
+  private setTipFrozen(frozen: boolean): void {
+    if (this.hoverTipFrozen === frozen) return;
+    if (frozen && !this.state.inspectionEnabled) return;
+    this.hoverTipFrozen = frozen;
+    this.inspector?.setTipFrozen(frozen);
+    if (!frozen) this.inspector?.refreshHover();
+  }
+
+  // La vista inspeccionada y la ventana del mapa leen Ctrl en su propio mundo para no
+  // alternar el bloqueo dos veces por pulsación; aquí solo lo hacen las superficies de la app.
+  private trackShift(contents: WebContents, ctrlFreezesTip = false): void {
     if (this.shiftTracked.has(contents)) return;
     this.shiftTracked.add(contents);
     contents.on('before-input-event', (_event, input) => {
+      if (
+        ctrlFreezesTip &&
+        input.type === 'keyDown' &&
+        input.key === 'Control' &&
+        !input.isAutoRepeat
+      ) {
+        this.setTipFrozen(!this.hoverTipFrozen);
+        return;
+      }
       if (input.key !== 'Shift') return;
       if (input.type === 'keyDown') {
         this.setShiftHeld(true);
@@ -2327,6 +2470,7 @@ export class BrowserController {
       this.onInspectorSignal(signal);
     }, this.log);
     this.inspector = inspector;
+    this.hoverTipFrozen = false;
     try {
       await inspector.install(view.webContents.debugger);
       inspector.setEnabled(this.state.inspectionEnabled);
@@ -2358,6 +2502,16 @@ export class BrowserController {
       this.scheduleInventoryRefresh();
       return;
     }
+    if (signal.kind === 'tip-frozen') {
+      if (this.hoverTipFrozen === signal.frozen) return;
+      this.hoverTipFrozen = signal.frozen;
+      if (!signal.frozen) this.inspector?.refreshHover();
+      return;
+    }
+    if (signal.kind === 'reveal') {
+      this.revealHoverCode(signal);
+      return;
+    }
     if (signal.kind === 'interaction') {
       if (!this.state.connected || !this.state.inspectionEnabled) return;
       this.flowInteractions.record(signal.ref, signal.event, signal.at);
@@ -2380,6 +2534,22 @@ export class BrowserController {
     });
     if (!this.state.connected || !this.state.inspectionEnabled) return;
     void this.openInspection(signal);
+  }
+
+  private revealHoverCode(signal: InspectorRevealSignal): void {
+    if (!this.state.connected || !this.state.inspectionEnabled) return;
+    const parsed = CODE_LOCATION_REQUEST_SCHEMA.safeParse({
+      path: signal.path,
+      line: signal.line,
+      endLine: signal.endLine,
+    });
+    if (!parsed.success) return;
+    const location = this.options.revealCode(parsed.data);
+    if (location === null) {
+      this.log.debug('La línea del tooltip no está dentro del proyecto abierto', {
+        path: signal.path,
+      });
+    }
   }
 
   private onHoverSignal(signal: InspectorHoverSignal): void {
@@ -2413,6 +2583,7 @@ export class BrowserController {
       status: 'resolving',
       createdAt: now,
       element: signal.element,
+      elementInfo: null,
       handler: null,
       requests: [],
       selectedRequestId: null,
@@ -2427,9 +2598,9 @@ export class BrowserController {
     const session: InspectionSession = {
       id: card.id,
       clickedAt: now,
-      handlerName: null,
       card,
       requests: new Map(),
+      initiators: new Map(),
       selectedByUser: false,
       executions: this.runtime?.recentSince(now - INSPECTION_LEEWAY_MS) ?? [],
       sqlObservations: this.runtime?.recentSqlSince(now - INSPECTION_LEEWAY_MS) ?? [],
@@ -2446,7 +2617,11 @@ export class BrowserController {
 
     let handler: InspectionHandler | null = null;
     try {
-      handler = (await this.inspector?.resolveHandler(signal)) ?? null;
+      const resolved = await this.inspector?.resolveClick(signal);
+      handler = resolved?.handler ?? null;
+      if (resolved?.elementInfo != null) {
+        card.elementInfo = resolved.elementInfo;
+      }
     } catch (error) {
       this.log.debug('No se pudo resolver el manejador del clic', {
         message: error instanceof Error ? error.message : String(error),
@@ -2455,12 +2630,8 @@ export class BrowserController {
     if (this.inspectionSession !== session) return;
     if (handler !== null) {
       card.handler = handler;
-      session.handlerName = handler.name;
       for (const item of card.requests) {
-        item.correlation =
-          item.initiatorFunction !== null && item.initiatorFunction === handler.name
-            ? 'direct'
-            : 'heuristic';
+        item.correlation = this.requestCorrelation(session.initiators.get(item.id), handler);
       }
       addEvidence(card, 'RUNTIME');
       if (card.status !== 'done') {
@@ -2484,7 +2655,7 @@ export class BrowserController {
 
   private async inspectHover(signal: InspectorHoverSignal): Promise<void> {
     const inspector = this.inspector;
-    if (inspector === null) return;
+    if (inspector === null || this.hoverTipFrozen) return;
     const generation = this.hoverSequence;
     const mode = this.inspectionMode;
     const withHandler = mode !== 'html';
@@ -2647,7 +2818,7 @@ export class BrowserController {
     resolution: HoverResolution,
   ): HoverTipData {
     const element = resolution.element;
-    const selector = formatHoverSelector(element);
+    const selector = elementSelectorLabel(element);
     const rect = element.rect.width > 0 || element.rect.height > 0 ? element.rect : signal.rect;
     const base: Pick<HoverTipData, 'mode' | 'modeLabel' | 'x' | 'y' | 'rect'> = {
       mode,
@@ -3053,29 +3224,9 @@ export class BrowserController {
     selector: string,
   ): HoverTipData {
     const rows: HoverTipRow[] = [];
-    const layout = hoverStyleGroup(element, ['display', 'position', 'z-index', 'box-sizing']);
-    if (layout !== null) rows.push({ label: 'Layout', value: layout });
-    const boxModel = hoverStyleGroup(element, ['width', 'height', 'margin', 'padding']);
-    if (boxModel !== null) rows.push({ label: 'Caja', value: boxModel });
-    const colors = hoverStyleGroup(element, ['color', 'background-color']);
-    if (colors !== null) rows.push({ label: 'Color', value: colors });
-    const font = hoverStyleGroup(element, [
-      'font-family',
-      'font-size',
-      'font-weight',
-      'line-height',
-      'text-align',
-    ]);
-    if (font !== null) rows.push({ label: 'Fuente', value: font });
-    const flow = hoverStyleGroup(element, [
-      'flex-direction',
-      'gap',
-      'grid-template-columns',
-      'overflow-x',
-      'overflow-y',
-      'opacity',
-    ]);
-    if (flow !== null) rows.push({ label: 'Flujo', value: flow });
+    for (const group of elementStyleGroups(element.styles)) {
+      rows.push({ label: group.label, value: group.value });
+    }
     const attributes = element.attributes
       .map((attribute) => `${attribute.name}="${attribute.value}"`)
       .join(' ');
@@ -3085,7 +3236,7 @@ export class BrowserController {
     return {
       ...base,
       title: selector,
-      subtitle: this.hoverSubtitle(element),
+      subtitle: elementSizeLabel(element),
       rows: this.prepareHoverRows(rows),
       code: null,
       footer: 'Clic: tarjeta completa · Esc: cerrar',
@@ -3120,7 +3271,7 @@ export class BrowserController {
       rows.push({ label: 'Enlace', value: element.link, tone: 'normal' });
     }
     if (link !== null) {
-      rows.push(...this.runtimeChainRows(link));
+      rows.push(...this.runtimeOriginRows(link));
     }
     const staticCandidate =
       request === null && match === null && (link === null || link.requestInfo === null)
@@ -3131,20 +3282,6 @@ export class BrowserController {
         label: 'Petición',
         value: `${staticCandidate.method} ${staticCandidate.path}`,
         tone: 'normal',
-      });
-      const matchedRoute = this.routes.match(
-        staticCandidate.method,
-        stripQuery(staticCandidate.path),
-      );
-      rows.push({
-        label: 'Ruta',
-        value:
-          matchedRoute === null
-            ? 'sin ruta estática en el proyecto'
-            : `${matchedRoute.handlerName ?? 'sin resolver'} · ${matchedRoute.file}:${String(
-                matchedRoute.line,
-              )}`,
-        tone: matchedRoute === null ? 'dim' : 'ok',
       });
     }
     const frames =
@@ -3190,17 +3327,6 @@ export class BrowserController {
           value: `${request.method} ${request.path} · ${observedStatusLabel(request)}`,
           tone: 'dim',
         });
-      }
-      if (provenance.route !== null) {
-        rows.push({
-          label: 'Ruta',
-          value: `${provenance.route.handlerName ?? 'sin resolver'} · ${provenance.route.file}:${String(
-            provenance.route.line,
-          )}`,
-          tone: 'ok',
-        });
-        rows.push(...this.sqlRows(provenance.route));
-        rows.push(this.databaseRow(provenance.database));
       }
     } else if (!runtimeData && (provenance.query !== null || element.dataValues.length > 0)) {
       rows.push({
@@ -3252,12 +3378,12 @@ export class BrowserController {
             : staticCandidate !== undefined
               ? `${staticCandidate.method} ${staticCandidate.path}`
               : selector,
-      subtitle: `${this.hoverSubtitle(element)}${match !== null || link !== null ? ' · OBSERVADO' : ''}`,
+      subtitle: `${elementSizeLabel(element)}${match !== null || link !== null ? ' · OBSERVADO' : ''}`,
       rows: this.prepareHoverRows(rows),
       code: handler === null ? null : toHoverCode(handler.code),
       footer:
         link !== null && link.requestInfo !== null
-          ? 'Cadena verificada en ejecución: función de render → dato → petición → backend.'
+          ? 'Cadena verificada en ejecución: función de render → dato → petición.'
           : link !== null
             ? 'Render verificado en ejecución; sin petición enlazada por identidad.'
             : request !== null
@@ -3283,7 +3409,7 @@ export class BrowserController {
     const link = provenance.runtime;
 
     if (link !== null && link.requestInfo !== null) {
-      rows.push(...this.runtimeChainRows(link));
+      rows.push(...this.runtimeRouteRows(link));
       const source = link.route === null ? null : this.hoverBackendSource(link.route);
       if (source?.note !== null && source?.note !== undefined) {
         rows.push({ label: 'Código', value: source.note, tone: 'warn' });
@@ -3301,16 +3427,6 @@ export class BrowserController {
     }
 
     if (match !== null) {
-      if (provenance.query !== null) {
-        rows.push({ label: 'Texto', value: provenance.query, tone: 'normal' });
-      }
-      rows.push({
-        label: 'JSON',
-        value: `${match.jsonPath} · ${match.origin === 'response' ? 'respuesta' : 'enviado'}${jsonMatchNote(
-          match,
-        )}`,
-        tone: 'ok',
-      });
       if (request !== null) {
         rows.push({
           label: 'Petición',
@@ -3415,12 +3531,11 @@ export class BrowserController {
   ): HoverTipData {
     const rows: HoverTipRow[] = [];
     const request = provenance.request;
-    const route = provenance.route;
     const match = provenance.matches[0] ?? null;
     const link = provenance.runtime;
 
     if (link !== null && link.entries.length > 0) {
-      rows.push(...this.runtimeChainRows(link));
+      rows.push(...this.runtimeJsonRows(link));
       let code: HoverTipCode | null = null;
       if (link.request !== null && provenance.query !== null) {
         const local = findJsonTextMatches([link.request], provenance.query, 1, [], [])[0];
@@ -3470,15 +3585,6 @@ export class BrowserController {
           tone: request.outcome === 'failed' || (request.statusCode ?? 0) >= 500 ? 'warn' : 'ok',
         });
       }
-      if (route !== null) {
-        rows.push({
-          label: 'Backend',
-          value: `${route.handlerName ?? 'sin resolver'} · ${route.file}:${String(route.line)}`,
-          tone: 'ok',
-        });
-        rows.push(...this.sqlRows(route));
-        rows.push(this.databaseRow(provenance.database));
-      }
       for (const extra of provenance.matches.slice(1)) {
         rows.push({
           label: 'También',
@@ -3520,7 +3626,6 @@ export class BrowserController {
     }
     candidates.forEach((candidate, index) => {
       const path = stripQuery(candidate.path);
-      const matchedRoute = this.routes.match(candidate.method, path);
       const observed = this.lastObservedRequest(candidate.method, path);
       if (index === 0) {
         title = `${candidate.method} ${candidate.path}`;
@@ -3536,16 +3641,6 @@ export class BrowserController {
       rows.push({
         label: 'Origen',
         value: `${candidate.source}${candidate.detail !== null ? ` · ${candidate.detail}` : ''}`,
-      });
-      rows.push({
-        label: 'Backend',
-        value:
-          matchedRoute !== null
-            ? `${matchedRoute.handlerName ?? 'sin resolver'} · ${matchedRoute.file}:${String(
-                matchedRoute.line,
-              )}`
-            : 'sin ruta estática',
-        tone: matchedRoute !== null ? 'ok' : 'dim',
       });
       if (observed !== null) {
         rows.push({
@@ -3574,61 +3669,48 @@ export class BrowserController {
     selector: string,
     provenance: HoverTextProvenance,
   ): HoverTipData {
-    const routes: StaticRoute[] = [];
-    if (provenance.route !== null) {
-      routes.push(provenance.route);
-    } else {
-      const candidates = this.staticRequests(resolution);
-      for (const candidate of candidates) {
-        const route = this.routes.match(candidate.method, stripQuery(candidate.path));
-        if (route === null) continue;
-        const duplicate = routes.some(
-          (entry) =>
-            entry.file === route.file &&
-            entry.line === route.line &&
-            entry.method === route.method &&
-            entry.path === route.path,
-        );
-        if (!duplicate) routes.push(route);
-      }
-    }
-    const queries: InspectionSqlQuery[] = [];
-    for (const route of routes) {
-      for (const query of staticQueriesForRoute(route)) {
-        if (query.sql === null) continue;
-        if (queries.some((entry) => entry.id === query.id && entry.line === query.line)) continue;
-        queries.push(query);
-      }
-    }
-
+    const routes = this.sqlRoutes(resolution, provenance);
     const rows: HoverTipRow[] = [];
-    const match = provenance.matches[0] ?? null;
-    const link = provenance.runtime;
-    const dialect = queries.find((query) => query.dialect !== null)?.dialect ?? null;
-    if (link !== null) {
-      rows.push(...this.runtimeOriginRows(link));
-    }
-    if (provenance.query !== null) {
-      rows.push({ label: 'Texto', value: provenance.query, tone: 'normal' });
-    }
-    if (match !== null) {
+    const primaryRoute = routes[0] ?? null;
+    if (primaryRoute === null) {
       rows.push({
-        label: 'JSON',
-        value: `${match.jsonPath} · ${match.origin === 'response' ? 'respuesta' : 'enviado'}${jsonMatchNote(
-          match,
-        )}`,
-        tone: 'ok',
-      });
-    }
-    if (provenance.request !== null && (link === null || link.requestInfo === null)) {
-      rows.push({
-        label: 'Petición',
-        value: `${provenance.request.method} ${provenance.request.path} · ${observedStatusLabel(
-          provenance.request,
-        )}`,
+        label: 'Asociación',
+        value: 'sin SQL asociado a este elemento: no hay ruta backend resuelta',
         tone: 'dim',
       });
+      return {
+        ...base,
+        title: 'Sin SQL asociado',
+        subtitle: `${selector} · SIN ASOCIACIÓN`,
+        rows: this.prepareHoverRows(rows),
+        code: null,
+        footer:
+          'El modo SQL solo muestra consultas asociadas al elemento por su ruta backend; sin ruta no se vuelca SQL de otras peticiones.',
+      };
     }
+
+    const entries = this.associatedSql(routes);
+    const codeEntry = entries.find((entry) => entry.query.status === 'observed') ?? entries[0];
+    const link = provenance.runtime;
+    const requestLabel = link === null ? null : runtimeRequestLabel(link);
+    const association =
+      requestLabel !== null
+        ? requestLabel.value
+        : provenance.request !== null
+          ? `${provenance.request.method} ${provenance.request.path}`
+          : null;
+    rows.push({
+      label: 'Asociación',
+      value: `${association === null ? '' : `${association} → `}${routes
+        .map(
+          (route) =>
+            `${route.method.toUpperCase()} ${route.path} · ${route.file}:${String(route.line)}`,
+        )
+        .join(' | ')}`,
+      tone: 'dim',
+    });
+
+    const dialect = entries.find((entry) => entry.query.dialect !== null)?.query.dialect ?? null;
     if (provenance.database === null) {
       const engine = dialect === null ? null : DIALECT_ENGINE[dialect];
       rows.push({
@@ -3644,98 +3726,282 @@ export class BrowserController {
         tone: 'ok',
       });
     }
-    if (routes.length === 0) {
+    if (entries.length === 0) {
       rows.push({
-        label: 'Ruta',
-        value: 'sin ruta estática para la petición',
+        label: 'SQL',
+        value: 'sin SQL estático ni observado en el manejador asociado',
         tone: 'dim',
       });
     }
-    for (const route of routes) {
-      rows.push({
-        label: 'Ruta',
-        value: `${route.handlerName ?? 'sin resolver'} · ${route.file}:${String(route.line)}`,
-        tone: 'ok',
-      });
-      if (route.note !== null) rows.push({ label: 'Nota', value: route.note, tone: 'warn' });
-    }
-    if (routes.length > 0 && queries.length === 0) {
-      rows.push({ label: 'SQL', value: 'sin SQL estático en el manejador', tone: 'dim' });
-    }
 
-    const tablesRead: string[] = [];
-    const tablesWritten: string[] = [];
-    const columns: string[] = [];
-    for (const query of queries) {
-      for (const table of query.tablesRead) {
-        if (!tablesRead.includes(table)) tablesRead.push(table);
-      }
-      for (const table of query.tablesWritten) {
-        if (!tablesWritten.includes(table)) tablesWritten.push(table);
-      }
-      for (const column of query.columns) {
-        const label = `${column.table !== null ? `${column.table}.` : ''}${column.name} (${column.usage})`;
-        if (!columns.includes(label)) columns.push(label);
-      }
-    }
-    if (tablesRead.length > 0) {
-      rows.push({ label: 'Lee', value: tablesRead.join(', '), tone: 'normal' });
-    }
-    if (tablesWritten.length > 0) {
-      rows.push({ label: 'Escribe', value: tablesWritten.join(', '), tone: 'warn' });
-    }
-    if (columns.length > 0) {
-      rows.push({ label: 'Columnas', value: columns.join('\n'), tone: 'dim' });
-    } else if (queries.some((query) => query.selectStar)) {
+    entries.forEach((entry, index) => {
+      const query = entry.query;
+      const suffix = entries.length > 1 ? ` ${String(index + 1)}` : '';
+      const observed = query.status === 'observed';
       rows.push({
-        label: 'Columnas',
-        value: 'SELECT * · el SQL no declara columnas',
-        tone: 'warn',
+        label: `SQL${suffix}`,
+        value: `${SQL_OPERATION_LABEL[query.operation]} · ${
+          observed ? 'OBSERVADA' : 'ESTÁTICA · no ejecutada'
+        }`,
+        tone: observed ? 'ok' : 'dim',
       });
-    }
-    if (dialect !== null) {
-      rows.push({ label: 'Dialecto', value: dialect, tone: 'dim' });
-    }
+      if (query.sql !== null && entry !== codeEntry) {
+        rows.push({ label: `Sentencia${suffix}`, value: query.sql, tone: 'normal' });
+      }
+      rows.push({
+        label: `Sitio${suffix}`,
+        value:
+          query.line > 0
+            ? `${entry.file}:${String(query.line)}${
+                query.column > 0 ? `:${String(query.column)}` : ''
+              }`
+            : `${entry.file} · sin línea en la captura`,
+        tone: 'dim',
+      });
+      if (entry.driver !== null) {
+        rows.push({ label: `Driver${suffix}`, value: entry.driver, tone: 'normal' });
+      }
+      if (observed && query.observedAt !== null) {
+        rows.push({
+          label: `Ejecutada${suffix}`,
+          value: `${formatClock(query.observedAt)}${
+            entry.count > 1 ? ` · ${String(entry.count)} veces` : ''
+          }`,
+          tone: 'ok',
+        });
+      }
+      if (entry.correlation !== null) {
+        rows.push({
+          label: `Correlación${suffix}`,
+          value:
+            entry.correlation === 'direct'
+              ? 'directa · misma sentencia o línea SQL ejecutada en esta ruta'
+              : 'heurística · archivo y línea dentro del manejador',
+          tone: entry.correlation === 'direct' ? 'ok' : 'warn',
+        });
+      }
+      if (query.tablesRead.length > 0) {
+        rows.push({ label: `Lee${suffix}`, value: query.tablesRead.join(', '), tone: 'normal' });
+      }
+      if (query.tablesWritten.length > 0) {
+        rows.push({
+          label: `Escribe${suffix}`,
+          value: query.tablesWritten.join(', '),
+          tone: 'warn',
+        });
+      }
+      if (query.columns.length > 0) {
+        rows.push({
+          label: `Columnas${suffix}`,
+          value: query.columns
+            .map(
+              (column) =>
+                `${column.table !== null ? `${column.table}.` : ''}${column.name} (${column.usage})`,
+            )
+            .join('\n'),
+          tone: 'dim',
+        });
+      } else if (query.selectStar) {
+        rows.push({
+          label: `Columnas${suffix}`,
+          value: 'SELECT * · el SQL no declara columnas',
+          tone: 'warn',
+        });
+      }
+      if (query.dialect !== null) {
+        rows.push({ label: `Dialecto${suffix}`, value: query.dialect, tone: 'dim' });
+      }
+      if (query.parse === 'fallback') {
+        rows.push({
+          label: `Análisis${suffix}`,
+          value: 'sin AST · tablas y columnas aproximadas por texto',
+          tone: 'warn',
+        });
+      }
+      if (query.result !== null) {
+        rows.push({
+          label: `Filas${suffix}`,
+          value: `${String(query.result.rowCount)} filas · ${String(
+            query.result.columns.length,
+          )} columnas${query.result.truncated ? ' · muestra recortada' : ''}`,
+          tone: 'ok',
+        });
+      }
+      if (query.note !== null) {
+        rows.push({ label: `Nota${suffix}`, value: query.note, tone: 'warn' });
+      }
+    });
 
-    const firstQuery = queries[0];
-    const firstRoute = routes[0];
-    const primaryTables =
-      firstQuery === undefined
+    const codeQuery = codeEntry?.query ?? null;
+    const codeLines =
+      codeQuery === null || codeQuery.sql === null
         ? []
-        : firstQuery.tablesRead.length > 0
-          ? firstQuery.tablesRead
-          : firstQuery.tablesWritten;
+        : codeQuery.sql.split('\n').map((text, index) => ({
+            line: codeQuery.line > 0 ? codeQuery.line + index : index + 1,
+            text,
+          }));
     const code: HoverTipCode | null =
-      firstQuery === undefined || firstQuery.sql === null
+      codeEntry === undefined || codeQuery === null || codeQuery.sql === null
         ? null
         : {
-            file: `${firstRoute?.file ?? ''} · ${SQL_OPERATION_LABEL[firstQuery.operation]}`.trim(),
-            range: firstQuery.line > 0 ? `línea ${String(firstQuery.line)}` : 'SQL estático',
-            lines: firstQuery.sql.split('\n').map((text, index) => ({
-              line: firstQuery.line > 0 ? firstQuery.line + index : index + 1,
-              text,
-            })),
+            file: `${codeEntry.file} · ${SQL_OPERATION_LABEL[codeQuery.operation]}`,
+            range: codeQuery.line > 0 ? `línea ${String(codeQuery.line)}` : 'SQL sin línea',
+            path: hoverCodePath(codeEntry.file),
+            endLine:
+              codeQuery.line > 0 && codeLines.length > 1
+                ? codeQuery.line + codeLines.length - 1
+                : null,
+            lines: codeLines,
           };
+    const primaryTables =
+      codeQuery === null
+        ? []
+        : codeQuery.tablesRead.length > 0
+          ? codeQuery.tablesRead
+          : codeQuery.tablesWritten;
+    const anyObserved = entries.some((entry) => entry.query.status === 'observed');
 
     return {
       ...base,
       title:
-        firstQuery !== undefined
-          ? `${SQL_OPERATION_LABEL[firstQuery.operation]}${
+        codeQuery !== null
+          ? `${SQL_OPERATION_LABEL[codeQuery.operation]}${
               primaryTables.length > 0 ? ` · ${primaryTables.join(', ')}` : ''
             }`
-          : firstRoute !== undefined
-            ? `${firstRoute.method.toUpperCase()} ${firstRoute.path}`
-            : 'Sin SQL',
-      subtitle: `${selector} · ${match !== null || link !== null ? 'OBSERVADO' : 'ESTÁTICO'}`,
+          : `${primaryRoute.method.toUpperCase()} ${primaryRoute.path}`,
+      subtitle: `${selector} · ${anyObserved ? 'OBSERVADO' : 'ESTÁTICO'}`,
       rows: this.prepareHoverRows(rows),
       code,
-      footer:
-        link !== null
-          ? 'Ruta y base de datos de la petición enlazada por identidad en ejecución · SQL estático no ejecutado.'
-          : match?.basis === 'data'
-            ? 'Base de datos y ruta correlacionadas por los datos del componente · SQL estático no ejecutado.'
-            : 'Base de datos detectada en fuentes del proyecto · SQL estático no ejecutado.',
+      footer: anyObserved
+        ? 'SQL ejecutado y asociado a la ruta del elemento por sentencia, sitio de llamada o breakpoint.'
+        : 'SQL estático del manejador asociado al elemento · no observado en ejecución.',
+    };
+  }
+
+  private sqlRoutes(resolution: HoverResolution, provenance: HoverTextProvenance): StaticRoute[] {
+    if (provenance.route !== null) return [provenance.route];
+    const routes: StaticRoute[] = [];
+    for (const candidate of this.staticRequests(resolution)) {
+      const route = this.routes.match(candidate.method, stripQuery(candidate.path));
+      if (route === null) continue;
+      const duplicate = routes.some(
+        (entry) =>
+          entry.file === route.file &&
+          entry.line === route.line &&
+          entry.method === route.method &&
+          entry.path === route.path,
+      );
+      if (!duplicate) routes.push(route);
+    }
+    return routes;
+  }
+
+  // Misma identidad que usa el grafo: SQL normalizado. Sin ruta resuelta no se acepta nada,
+  // para no volcar consultas de otras peticiones sobre el elemento inspeccionado.
+  private associatedSql(routes: readonly StaticRoute[]): HoverSqlEntry[] {
+    const entries: HoverSqlEntry[] = [];
+    const seen = new Set<string>();
+    const add = (entry: HoverSqlEntry): void => {
+      const sql = entry.query.sql;
+      const key =
+        sql === null ? `${entry.query.id}:${String(entry.query.line)}` : normalizeSqlText(sql);
+      if (key === '' || seen.has(key)) return;
+      seen.add(key);
+      entries.push(entry);
+    };
+    const observations = this.runtime?.recentSqlSince(0) ?? [];
+
+    for (const route of routes) {
+      for (const query of staticQueriesForRoute(route)) {
+        if (query.sql === null) continue;
+        const observed = this.runtimeSql.get(normalizeSqlText(query.sql));
+        if (observed !== undefined) {
+          add({
+            query: {
+              ...this.runtimeSqlQuery(observed),
+              id: query.id,
+              line: query.line,
+              column: query.column,
+              callMethod: query.callMethod,
+              callObject: query.callObject,
+              note: joinNotes([query.note, 'Misma sentencia observada en ejecución.']),
+            },
+            file: observed.file ?? route.file,
+            correlation: 'direct',
+            driver: observed.driver,
+            count: observed.count,
+          });
+          continue;
+        }
+        const executed = observations.find(
+          (observation) =>
+            observation.siteIds.includes(query.id) &&
+            observation.breakpoints.some(
+              (breakpoint) =>
+                breakpoint.method.toUpperCase() === route.method.toUpperCase() &&
+                breakpoint.path === route.path,
+            ),
+        );
+        if (executed !== undefined) {
+          add({
+            query: {
+              ...query,
+              status: 'observed',
+              observedAt: executed.observedAt,
+              note: joinNotes([query.note, 'Línea SQL ejecutada con breakpoint en esta ruta.']),
+            },
+            file: route.file,
+            correlation: 'direct',
+            driver: null,
+            count: 1,
+          });
+          continue;
+        }
+        add({ query, file: route.file, correlation: null, driver: null, count: 0 });
+      }
+
+      for (const observed of this.runtimeSql.values()) {
+        if (observed.file === null || observed.file !== route.file) continue;
+        if (observed.line < route.line || observed.line > route.endLine) continue;
+        add({
+          query: {
+            ...this.runtimeSqlQuery(observed),
+            note: 'Asociación por archivo y línea del manejador; no verifica el sitio de llamada.',
+          },
+          file: observed.file,
+          correlation: 'heuristic',
+          driver: observed.driver,
+          count: observed.count,
+        });
+      }
+    }
+    return entries;
+  }
+
+  private runtimeSqlQuery(observed: FlowRuntimeSql): InspectionSqlQuery {
+    const site =
+      observed.file !== null && observed.line > 0
+        ? `${observed.file}:${String(observed.line)}:${String(observed.column)}:${hashText(observed.sql)}`
+        : `runtime:${hashText(observed.sql)}`;
+    return {
+      id: site,
+      status: 'observed',
+      operation: observed.operation,
+      tablesRead: [...observed.tablesRead],
+      tablesWritten: [...observed.tablesWritten],
+      columns: observed.columns.map((column) => ({ ...column })),
+      dialect: observed.dialect,
+      parse: observed.parse,
+      selectStar: observed.selectStar,
+      sql: observed.sql,
+      dynamic: false,
+      line: observed.line,
+      column: observed.column,
+      callMethod: observed.driver,
+      callObject: null,
+      note: null,
+      observedAt: observed.observedAt,
+      result: observed.result,
     };
   }
 
@@ -3757,17 +4023,6 @@ export class BrowserController {
       y: signal.y,
       rect: signal.rect,
     };
-  }
-
-  private hoverSubtitle(element: HoverElementInfo): string {
-    const parts = [
-      `${String(Math.round(element.rect.width))} × ${String(Math.round(element.rect.height))} px`,
-    ];
-    const display = hoverStyleValue(element, 'display');
-    const position = hoverStyleValue(element, 'position');
-    if (display !== null) parts.push(display);
-    if (position !== null) parts.push(position);
-    return parts.join(' · ');
   }
 
   private prepareHoverRows(rows: HoverTipRow[]): HoverTipRow[] {
@@ -3859,49 +4114,8 @@ export class BrowserController {
       if (lines.length > 0) {
         rows.push({ label: 'Pila', value: lines.join('\n'), tone: 'ok' });
       }
-      if (link.request !== null) {
-        rows.push({
-          label: 'Petición',
-          value: `${link.request.method} ${link.request.path} · ${observedStatusLabel(
-            link.request,
-          )}`,
-          tone: 'dim',
-        });
-      } else {
-        const status =
-          link.requestInfo.status === null
-            ? 'sin estado'
-            : `HTTP ${String(link.requestInfo.status)}`;
-        rows.push({
-          label: 'Petición',
-          value: `${link.requestInfo.method} ${link.requestInfo.path} · ${status} · fuera del búfer`,
-          tone: 'warn',
-        });
-      }
-    }
-    return rows;
-  }
-
-  private runtimeChainRows(link: RuntimeLink): HoverTipRow[] {
-    const rows = this.runtimeOriginRows(link);
-    if (link.requestInfo !== null) {
-      if (link.route !== null) {
-        rows.push({
-          label: 'Ruta',
-          value: `${link.route.handlerName ?? 'sin resolver'} · ${link.route.file}:${String(
-            link.route.line,
-          )}`,
-          tone: 'ok',
-        });
-        rows.push(...this.sqlRows(link.route));
-        rows.push(this.databaseRow(link.database));
-      } else {
-        rows.push({
-          label: 'Ruta',
-          value: 'sin ruta estática para la petición ejecutada',
-          tone: 'dim',
-        });
-      }
+      const label = runtimeRequestLabel(link);
+      if (label !== null) rows.push({ label: 'Petición', value: label.value, tone: label.tone });
     }
     for (const extra of link.entries) {
       if (extra === link.data) continue;
@@ -3916,11 +4130,55 @@ export class BrowserController {
     return rows;
   }
 
+  private runtimeRouteRows(link: RuntimeLink): HoverTipRow[] {
+    const info = link.requestInfo;
+    if (info === null) return [];
+    const rows: HoverTipRow[] = [];
+    const label = runtimeRequestLabel(link);
+    if (label !== null) rows.push({ label: 'Petición', value: label.value, tone: label.tone });
+    const route = link.route;
+    if (route === null) {
+      rows.push({
+        label: 'Ruta',
+        value: 'sin ruta estática para la petición ejecutada',
+        tone: 'dim',
+      });
+      return rows;
+    }
+    rows.push({
+      label: 'Ruta',
+      value: `${route.handlerName ?? 'sin resolver'} · ${route.file}:${String(route.line)}`,
+      tone: 'ok',
+    });
+    rows.push({
+      label: 'Líneas',
+      value: `${String(route.line)}–${String(route.endLine)} · ${route.framework}`,
+      tone: 'dim',
+    });
+    if (route.note !== null) rows.push({ label: 'Nota', value: route.note, tone: 'warn' });
+    return rows;
+  }
+
+  private runtimeJsonRows(link: RuntimeLink): HoverTipRow[] {
+    const rows: HoverTipRow[] = [];
+    if (link.data !== null) {
+      rows.push({ label: 'JSON', value: `${link.data.jsonPath} · respuesta`, tone: 'ok' });
+    }
+    const label = runtimeRequestLabel(link);
+    if (label !== null) rows.push({ label: 'Petición', value: label.value, tone: label.tone });
+    for (const extra of link.entries) {
+      if (extra === link.data) continue;
+      const value = extra.value === '' ? '' : ` = "${extra.value}"`;
+      rows.push({ label: 'También', value: `${extra.jsonPath}${value}`, tone: 'dim' });
+    }
+    if (link.note !== null) rows.push({ label: 'Nota', value: link.note, tone: 'warn' });
+    return rows;
+  }
+
   private provenanceDataRows(element: HoverElementInfo, match: JsonTextMatch): HoverTipRow[] {
     const rows: HoverTipRow[] = [];
     const matchedNumbers = displayNumbers(match.value);
     for (const entry of element.dataValues) {
-      if (rows.length >= 3) break;
       const sameText = entry.value.trim() === match.value.trim();
       const sameNumber =
         matchedNumbers.length > 0 &&
@@ -3933,32 +4191,6 @@ export class BrowserController {
       });
     }
     return rows;
-  }
-
-  private sqlRows(route: StaticRoute): HoverTipRow[] {
-    const read = new Set<string>();
-    const written = new Set<string>();
-    for (const query of staticQueriesForRoute(route)) {
-      if (query.sql === null) continue;
-      for (const table of query.tablesRead) read.add(table);
-      for (const table of query.tablesWritten) written.add(table);
-    }
-    const rows: HoverTipRow[] = [];
-    if (read.size > 0) {
-      rows.push({ label: 'SQL', value: `lee ${[...read].join(', ')}`, tone: 'normal' });
-    }
-    if (written.size > 0) {
-      rows.push({ label: 'SQL', value: `escribe ${[...written].join(', ')}`, tone: 'warn' });
-    }
-    return rows;
-  }
-
-  private databaseRow(database: DatabaseHint | null): HoverTipRow {
-    return {
-      label: 'Base de datos',
-      value: database === null ? 'sin nombre detectado en el código' : databaseHintLabel(database),
-      tone: database === null ? 'dim' : 'ok',
-    };
   }
 
   private staticRequests(resolution: HoverResolution): StaticRequestCandidate[] {
@@ -4106,12 +4338,37 @@ export class BrowserController {
     this.autoSelect(session);
   }
 
+  private requestCorrelation(
+    initiator: RequestInitiator | null | undefined,
+    handler: InspectionHandler | null,
+  ): InspectionCorrelation {
+    if (
+      handler === null ||
+      handler.url === null ||
+      handler.line === null ||
+      handler.column === null
+    ) {
+      return 'heuristic';
+    }
+    for (const frame of initiator?.frames ?? []) {
+      if (
+        frame.url === handler.url &&
+        frame.line === handler.line &&
+        frame.column === handler.column
+      ) {
+        return 'direct';
+      }
+    }
+    return 'heuristic';
+  }
+
   private addInspectionRequest(
     session: InspectionSession,
     request: CapturedRequest,
     phase: InspectionRequestPhase,
   ): InspectionRequest {
-    const initiatorFunction = request.initiator?.frames[0]?.functionName ?? null;
+    const initiator = request.initiator ?? null;
+    const initiatorFunction = initiator?.frames[0]?.functionName ?? null;
     const item: InspectionRequest = {
       id: request.id,
       method: request.method,
@@ -4121,12 +4378,7 @@ export class BrowserController {
       statusCode: request.statusCode,
       durationMs: request.durationMs,
       outcome: request.outcome,
-      correlation:
-        session.handlerName !== null &&
-        initiatorFunction !== null &&
-        initiatorFunction === session.handlerName
-          ? 'direct'
-          : 'heuristic',
+      correlation: this.requestCorrelation(initiator, session.card.handler),
       initiatorFunction,
       phase,
       backend: this.backendSummaryFor(request.method, request.path),
@@ -4134,6 +4386,7 @@ export class BrowserController {
       responseBody: request.responseBody,
     };
     session.requests.set(item.id, item);
+    session.initiators.set(item.id, initiator);
     const card = session.card;
     card.requests.push(item);
     card.requests.sort((left, right) => left.startedAt - right.startedAt);
@@ -4153,13 +4406,12 @@ export class BrowserController {
       existing.outcome = request.outcome;
       existing.requestBody = request.requestBody;
       existing.responseBody = request.responseBody;
-      const initiatorFunction = request.initiator?.frames[0]?.functionName ?? null;
-      if (initiatorFunction !== null) {
-        existing.initiatorFunction = initiatorFunction;
-        existing.correlation =
-          session.handlerName !== null && initiatorFunction === session.handlerName
-            ? 'direct'
-            : 'heuristic';
+      const initiator = request.initiator ?? null;
+      if (initiator !== null) {
+        session.initiators.set(request.id, initiator);
+        const initiatorFunction = initiator.frames[0]?.functionName ?? null;
+        if (initiatorFunction !== null) existing.initiatorFunction = initiatorFunction;
+        existing.correlation = this.requestCorrelation(initiator, session.card.handler);
       }
       if (existing.backend === null) {
         existing.backend = this.backendSummaryFor(request.method, request.path);
@@ -4287,7 +4539,14 @@ export class BrowserController {
       codeNote: source.note,
     };
     session.card.backend = backend;
-    session.card.queries = staticQueriesForRoute(route);
+    // La tarjeta de clic y el tooltip comparten la misma asociación de SQL por ruta.
+    session.card.queries = this.associatedSql([route]).map((entry) => ({
+      ...entry.query,
+      note: joinNotes([
+        entry.query.note,
+        entry.count > 1 ? `${String(entry.count)} ejecuciones observadas.` : null,
+      ]),
+    }));
     if (session.card.level !== 'N2') {
       session.card.level = 'N1';
     }
@@ -4386,7 +4645,7 @@ export class BrowserController {
       lastAt: null,
     };
     this.updateFlowWindows();
-    this.scheduleJsonPush();
+    this.scheduleDataPush();
     if (!info.ok) {
       this.recordActivity({
         category: 'backend',
@@ -4399,7 +4658,7 @@ export class BrowserController {
     this.recordActivity({
       category: 'json',
       title: 'Captura JSON de runtime activa',
-      detail: `Hooks: ${info.hooks.join(', ')} · cuerpos enmascarados antes de mostrarse`,
+      detail: `Hooks: ${info.hooks.join(', ')} · cuerpos completos, solo en memoria`,
     });
   }
 
@@ -4412,13 +4671,22 @@ export class BrowserController {
       execution.method ?? '',
       execution.path ?? '',
       execution.status === null ? '' : String(execution.status),
-      body?.text ?? '',
+      body === null ? '' : `${String(body.text.length)}:${hashText(body.text)}`,
     ].join('\u0000');
     const frame = this.jsonFrame(execution);
     const previous = this.runtimeJson.get(key);
     this.jsonMovements += 1;
     if (body !== null) this.jsonBodies += 1;
     this.jsonLastAt = execution.at;
+    if (this.runtimeJson.size > 2000) {
+      const excess = this.runtimeJson.size - 2000;
+      let removed = 0;
+      for (const oldKey of this.runtimeJson.keys()) {
+        this.runtimeJson.delete(oldKey);
+        removed += 1;
+        if (removed >= excess) break;
+      }
+    }
     this.runtimeJson.set(key, {
       id: previous?.id ?? `json-${String(++this.jsonRuntimeSequence)}`,
       kind: execution.kind,
@@ -4435,9 +4703,10 @@ export class BrowserController {
       truncated:
         execution.truncated || (body?.truncated ?? false) || (previous?.truncated ?? false),
     });
-    this.scheduleJsonPush();
+    this.scheduleDataPush();
     if (!this.runtimeJsonActivitySeen.has(key)) {
       this.runtimeJsonActivitySeen.add(key);
+      if (this.runtimeJsonActivitySeen.size > 500) this.runtimeJsonActivitySeen.clear();
       const where =
         execution.method !== null && execution.path !== null
           ? `${execution.method} ${execution.path}${
@@ -4512,12 +4781,21 @@ export class BrowserController {
     });
   }
 
+  private sqlAnalysis(sql: string): ReturnType<typeof analyzeSql> {
+    const cached = this.sqlAnalysisCache.get(sql);
+    if (cached !== undefined) return cached;
+    const result = analyzeSql(sql);
+    if (this.sqlAnalysisCache.size > 500) this.sqlAnalysisCache.clear();
+    this.sqlAnalysisCache.set(sql, result);
+    return result;
+  }
+
   private onSqlCaptured(execution: CapturedSqlExecution): void {
     const key = `${String(execution.at)}:${execution.driver}:${execution.sql.slice(0, 200)}`;
     if (!this.runtimeSqlActivitySeen.has(key)) {
       this.runtimeSqlActivitySeen.add(key);
       if (this.runtimeSqlActivitySeen.size > 500) this.runtimeSqlActivitySeen.clear();
-      const analysis = analyzeSql(execution.sql)[0];
+      const analysis = this.sqlAnalysis(execution.sql)[0];
       const tables =
         analysis === undefined
           ? []
@@ -4549,7 +4827,7 @@ export class BrowserController {
     if (execution.sample !== null) this.sqlSampled += 1;
     this.sqlLastAt = execution.at;
     const previous = this.runtimeSql.get(normalized);
-    const analysis = analyzeSql(execution.sql)[0];
+    const analysis = this.sqlAnalysis(execution.sql)[0];
     const frame = this.primaryFrame(execution);
     this.runtimeSql.set(normalized, {
       sql: execution.sql,
@@ -4587,58 +4865,118 @@ export class BrowserController {
     const normalized = normalizeSqlText(execution.sql);
     if (normalized === '') return false;
 
+    const bySite = this.findSqlBySite(card.queries, execution);
+    if (bySite !== null) {
+      return this.observeQuery(card, bySite.query, execution, 'direct', bySite.site);
+    }
+
     const known = card.queries.find(
       (query) => query.sql !== null && normalizeSqlText(query.sql) === normalized,
     );
     if (known !== undefined) {
-      const result = this.inspectionResult(execution);
-      let changed = false;
-      if (
-        result !== null &&
-        (known.result === null || known.result.observedAt !== result.observedAt)
-      ) {
-        known.result = result;
-        changed = true;
-      }
-      if (known.status === 'observed') return changed;
-      known.status = 'observed';
-      known.observedAt = execution.at;
-      addEvidence(card, 'RUNTIME');
-      this.log.info('Consulta SQL capturada coincide con una consulta estática', {
-        driver: execution.driver,
-        operation: known.operation,
-      });
-      return true;
+      return this.observeQuery(card, known, execution, 'heuristic', null);
     }
 
-    const analysis = analyzeSql(execution.sql)[0];
+    const observed = this.runtimeSql.get(normalized);
+    if (observed === undefined) return false;
     const frame = this.primaryFrame(execution);
+    const backend = card.backend;
+    const endpoint = card.endpoint;
+    const inHandler =
+      backend !== null &&
+      frame !== null &&
+      frame.file === backend.file &&
+      frame.line >= backend.line &&
+      frame.line <= backend.endLine;
+    const routePath =
+      backend !== null ? backend.routePath : endpoint !== null ? stripQuery(endpoint.path) : null;
+    const routeMethod = endpoint === null ? null : endpoint.method.toUpperCase();
+    const byBreakpoint =
+      frame !== null &&
+      routePath !== null &&
+      session.sqlObservations.some(
+        (observation) =>
+          observation.file === frame.file &&
+          observation.line === frame.line &&
+          observation.breakpoints.some(
+            (breakpoint) =>
+              breakpoint.path === routePath &&
+              (routeMethod === null || breakpoint.method.toUpperCase() === routeMethod),
+          ),
+      );
+    // Sin asociación con el manejador del elemento no se añade SQL de otras peticiones.
+    if (!inHandler && !byBreakpoint) return false;
+
+    const clipped = shorten(observed.sql, 700);
     card.queries.push({
-      id: `runtime-${String(++this.sqlRuntimeSequence)}`,
-      status: 'observed',
-      operation: analysis?.operation ?? sqlOperationFromText(execution.sql),
-      tablesRead: analysis === undefined ? [] : [...analysis.tablesRead],
-      tablesWritten: analysis === undefined ? [] : [...analysis.tablesWritten],
-      columns: analysis === undefined ? [] : analysis.columns.map((column) => ({ ...column })),
-      dialect: analysis?.dialect ?? null,
-      parse: analysis?.parse ?? 'fallback',
-      selectStar: analysis?.selectStar ?? false,
-      sql: shorten(execution.sql, 700),
-      dynamic: false,
-      line: frame?.line ?? 0,
-      column: frame?.column ?? 0,
-      callMethod: execution.driver,
-      callObject: null,
-      note: null,
-      observedAt: execution.at,
-      result: this.inspectionResult(execution),
+      ...this.runtimeSqlQuery(observed),
+      sql: clipped,
+      note: joinNotes([
+        inHandler
+          ? 'Asociación por archivo y línea dentro del manejador resuelto.'
+          : 'Asociación por breakpoint de la ruta en la línea ejecutada.',
+        clipped.length < observed.sql.length
+          ? 'Sentencia recortada a 700 caracteres por límite de memoria.'
+          : null,
+      ]),
     });
     addEvidence(card, 'RUNTIME');
-    this.log.info('Consulta SQL capturada en runtime', {
+    this.log.info('Consulta SQL capturada asociada al manejador', {
       driver: execution.driver,
       file: frame?.file ?? null,
       line: frame?.line ?? null,
-      operation: analysis?.operation ?? null,
+      operation: observed.operation,
+      correlation: inHandler ? 'handler-range' : 'breakpoint',
+    });
+    return true;
+  }
+
+  private findSqlBySite(
+    queries: readonly InspectionSqlQuery[],
+    execution: CapturedSqlExecution,
+  ): { query: InspectionSqlQuery; site: RelativeFrame } | null {
+    for (const frame of execution.frames) {
+      const file = this.relativeFramePath(frame.file);
+      if (file === null) continue;
+      const prefix = `${file}:${String(frame.line)}:${String(frame.column)}:`;
+      const query = queries.find((candidate) => candidate.id.startsWith(prefix));
+      if (query !== undefined) {
+        return { query, site: { file, line: frame.line, column: frame.column } };
+      }
+    }
+    return null;
+  }
+
+  private observeQuery(
+    card: InspectionCard,
+    query: InspectionSqlQuery,
+    execution: CapturedSqlExecution,
+    correlation: InspectionCorrelation,
+    site: RelativeFrame | null,
+  ): boolean {
+    const result = this.inspectionResult(execution);
+    let changed = false;
+    if (
+      result !== null &&
+      (query.result === null || query.result.observedAt !== result.observedAt)
+    ) {
+      query.result = result;
+      changed = true;
+    }
+    if (query.status === 'observed') return changed;
+    query.status = 'observed';
+    query.observedAt = execution.at;
+    query.note = joinNotes([
+      query.note,
+      correlation === 'direct' && site !== null
+        ? `Coincidencia directa por sitio de llamada: ${site.file}:${String(site.line)}.`
+        : 'Coincidencia heurística por texto SQL normalizado; no verifica el sitio de llamada.',
+    ]);
+    addEvidence(card, 'RUNTIME');
+    this.log.info('Consulta SQL capturada coincide con una consulta estática', {
+      driver: execution.driver,
+      operation: query.operation,
+      correlation,
     });
     return true;
   }
@@ -4921,6 +5259,11 @@ export class BrowserController {
     if (current === undefined) return;
     current.statusCode = params.response.status;
     current.mimeType = params.response.mimeType ?? null;
+    const updated = this.buffer?.setResponseHeaders(current.storeId, params.response.headers);
+    if (updated != null) {
+      this.dirty.add(updated.id);
+      this.scheduleFlush();
+    }
   }
 
   private onLoadingFinished(params: CdpLoadingFinished): void {
@@ -5098,6 +5441,7 @@ export class BrowserController {
       if (requests.length > 0) {
         this.send({ type: 'requests', requests, requestCount: buffer.count });
         this.markFlowDirty();
+        this.scheduleDataPush();
       }
     }
     this.flushActivity();
@@ -5247,7 +5591,6 @@ export class BrowserController {
     this.lastRuntimeStatus = null;
     this.setShiftHeld(false);
     this.activitySequence = 0;
-    this.sqlRuntimeSequence = 0;
 
     const runtime = this.runtime;
     this.runtime = null;

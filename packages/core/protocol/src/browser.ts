@@ -117,6 +117,7 @@ export interface CapturedRequest {
   error: string | null;
   initiator: RequestInitiator | null;
   headers: Record<string, string>;
+  responseHeaders: Record<string, string>;
   requestBody: CapturedBody | null;
   responseBody: CapturedBody | null;
 }
@@ -237,6 +238,88 @@ export interface InspectionElement {
   formAction?: string | null;
   formMethod?: string | null;
   formKey?: string | null;
+}
+
+export interface InspectionRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface InspectionElementInfo {
+  tag: string;
+  id: string | null;
+  classes: string[];
+  text: string | null;
+  rect: InspectionRect;
+  attributes: Array<{ name: string; value: string }>;
+  styles: Array<{ name: string; value: string }>;
+}
+
+export interface InspectionStyleGroup {
+  label: string;
+  names: readonly string[];
+}
+
+export const ELEMENT_STYLE_GROUPS: readonly InspectionStyleGroup[] = [
+  { label: 'Layout', names: ['display', 'position', 'z-index', 'box-sizing'] },
+  { label: 'Caja', names: ['width', 'height', 'margin', 'padding'] },
+  { label: 'Color', names: ['color', 'background-color'] },
+  {
+    label: 'Fuente',
+    names: ['font-family', 'font-size', 'font-weight', 'line-height', 'text-align'],
+  },
+  {
+    label: 'Flujo',
+    names: [
+      'flex-direction',
+      'gap',
+      'grid-template-columns',
+      'overflow-x',
+      'overflow-y',
+      'opacity',
+    ],
+  },
+];
+
+export function elementSelectorLabel(element: {
+  tag: string;
+  id: string | null;
+  classes: readonly string[];
+}): string {
+  const id = element.id !== null ? `#${element.id}` : '';
+  const classes = element.classes.map((name) => `.${name}`).join('');
+  return `${element.tag}${id}${classes}`;
+}
+
+export function elementStyleGroups(
+  styles: ReadonlyArray<{ name: string; value: string }>,
+): Array<{ label: string; value: string }> {
+  const groups: Array<{ label: string; value: string }> = [];
+  for (const group of ELEMENT_STYLE_GROUPS) {
+    const parts: string[] = [];
+    for (const name of group.names) {
+      const style = styles.find((entry) => entry.name === name);
+      if (style !== undefined && style.value !== '') parts.push(`${name}: ${style.value}`);
+    }
+    if (parts.length > 0) groups.push({ label: group.label, value: parts.join(' · ') });
+  }
+  return groups;
+}
+
+export function elementSizeLabel(element: {
+  rect: InspectionRect;
+  styles: ReadonlyArray<{ name: string; value: string }>;
+}): string {
+  const parts = [
+    `${String(Math.round(element.rect.width))} × ${String(Math.round(element.rect.height))} px`,
+  ];
+  for (const name of ['display', 'position']) {
+    const style = element.styles.find((entry) => entry.name === name);
+    if (style !== undefined && style.value !== '') parts.push(style.value);
+  }
+  return parts.join(' · ');
 }
 
 export type HandlerSource = 'listener' | 'react' | 'vue';
@@ -437,6 +520,7 @@ export interface InspectionCard {
   status: InspectionStatus;
   createdAt: number;
   element: InspectionElement;
+  elementInfo: InspectionElementInfo | null;
   handler: InspectionHandler | null;
   requests: InspectionRequest[];
   selectedRequestId: string | null;
@@ -475,9 +559,12 @@ export const BROWSER_PANEL_CHANNELS = {
   map: 'browser-panel:map',
   mapData: 'browser-panel:map-data',
   jsonData: 'browser-panel:json-data',
+  requestData: 'browser-panel:request-data',
   highlight: 'browser-panel:highlight',
   shift: 'browser-panel:shift',
   revealLocation: 'browser-panel:reveal-location',
+  mapDirty: 'browser-panel:map-dirty',
+  mapCloseBlocked: 'browser-panel:map-close-blocked',
 } as const;
 
 export interface BrowserChromeState {

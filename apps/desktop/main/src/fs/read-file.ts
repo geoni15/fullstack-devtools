@@ -61,5 +61,6 @@ export function readTextFile(scope: RootScope, relativePath: string): FileConten
     path: toPosixPath(path.relative(scope.rootReal, absolutePath)),
     size: buffer.byteLength,
     content,
+    mtimeMs: stat.mtimeMs,
   };
 }

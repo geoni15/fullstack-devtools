@@ -5,8 +5,10 @@ import type {
   HandlerSource,
   InspectionCodeBlock,
   InspectionElement,
+  InspectionElementInfo,
   InspectionHandler,
   InspectionMode,
+  InspectionRect,
 } from '@bdt/protocol';
 import type { Logger } from '../logger';
 import {
@@ -132,15 +134,19 @@ ${PAGE_DOM_HELPERS_SOURCE}
   };
 
   let tipHost = null;
+  let tipRoot = null;
   let tipMode = null;
   let tipTitle = null;
   let tipSub = null;
   let tipRows = null;
   let tipCode = null;
   let tipFooter = null;
+  let tipHint = null;
+  let tipBlock = null;
   let boxHost = null;
   let lastTipData = null;
   let shiftHeldNow = false;
+  let tipFrozen = false;
 
   const ensureBox = () => {
     if (boxHost !== null && boxHost.isConnected) return;
@@ -284,16 +290,19 @@ ${PAGE_DOM_HELPERS_SOURCE}
   const ensureTip = () => {
     if (tipHost !== null && tipHost.isConnected) return;
     tipHost = null;
+    tipRoot = null;
     tipMode = null;
     tipTitle = null;
     tipSub = null;
     tipRows = null;
     tipCode = null;
     tipFooter = null;
+    tipHint = null;
+    tipBlock = null;
     const host = document.createElement('bdt-hover-tip');
     style(host, 'position', 'fixed');
     style(host, 'z-index', '2147483647');
-    style(host, 'pointer-events', 'auto');
+    style(host, 'pointer-events', tipFrozen ? 'auto' : 'none');
     style(host, 'display', 'none');
     style(host, 'margin', '0');
     style(host, 'padding', '0');
@@ -303,12 +312,20 @@ ${PAGE_DOM_HELPERS_SOURCE}
 
     const shadow = host.attachShadow({ mode: 'closed' });
     const css = ':host { all: initial; } * { box-sizing: border-box; margin: 0; padding: 0; }' +
-      '.tip { width: 430px; max-width: 92vw; max-height: calc(100vh - 20px); overflow-y: auto; overscroll-behavior: contain; background: #0b1118; color: #d4d4d4; font: 11px/1.45 "Cascadia Mono", Consolas, monospace; }' +
+      '.tip { position: relative; width: 430px; max-width: 92vw; max-height: calc(100vh - 20px); overflow-y: auto; overscroll-behavior: contain; background: #0b1118; color: #d4d4d4; font: 11px/1.45 "Cascadia Mono", Consolas, monospace; }' +
+      '.tip::-webkit-scrollbar { width: 10px; }' +
+      '.tip::-webkit-scrollbar-track { background: #0b1118; }' +
+      '.tip::-webkit-scrollbar-thumb { background: #24384c; }' +
+      '.tip::-webkit-scrollbar-thumb:hover { background: #33506b; }' +
       '.mode { padding: 3px 8px; background: #1d3a5c; color: #cfe6ff; font: 600 9px/1.5 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.08em; text-transform: uppercase; }' +
       '.mode[data-mode="frontend"] { background: #3a2a56; color: #e6d6ff; }' +
       '.mode[data-mode="backend"] { background: #163a2a; color: #c8f0d8; }' +
       '.mode[data-mode="request"] { background: #3a2a1b; color: #ffd7a8; }' +
       '.mode[data-mode="database"] { background: #1f3a3a; color: #b8e8e8; }' +
+      '.hint { padding: 3px 8px; background: #101923; color: #8b98a5; font: 9px/1.5 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.04em; }' +
+      '.block { position: absolute; top: 0; right: 0; padding: 3px 8px; background: #1d3a5c; color: #cfe6ff; font: 600 9px/1.5 system-ui, "Segoe UI", sans-serif; letter-spacing: 0.08em; cursor: pointer; pointer-events: auto; }' +
+      '.block:hover { background: #27507c; }' +
+      '.block[hidden] { display: none; }' +
       '.title { padding: 6px 8px 0; color: #e6edf3; font: 600 12px/1.4 system-ui, "Segoe UI", sans-serif; word-break: break-word; }' +
       '.sub { padding: 1px 8px 4px; color: #7d8b99; font-size: 10px; word-break: break-word; }' +
       '.rows { display: flex; flex-direction: column; }' +
@@ -320,10 +337,16 @@ ${PAGE_DOM_HELPERS_SOURCE}
       '.row.is-warn .value { color: #ffd7a8; }' +
       '.row.is-dim .value { color: #8b98a5; }' +
       '.code { margin: 4px 8px 0; padding: 4px 6px; background: #070c11; overflow-x: auto; }' +
+      '.code::-webkit-scrollbar { height: 8px; }' +
+      '.code::-webkit-scrollbar-track { background: #070c11; }' +
+      '.code::-webkit-scrollbar-thumb { background: #24384c; }' +
       '.code-head { color: #a9cdf0; font-size: 10px; padding-bottom: 3px; word-break: break-all; }' +
       '.code-line { display: flex; gap: 8px; white-space: pre; }' +
       '.code-number { flex: none; width: 34px; color: #56616d; text-align: right; }' +
       '.code-text { color: #d4d4d4; }' +
+      '.tip.is-frozen .is-link { cursor: pointer; }' +
+      '.tip.is-frozen .code-line.is-link:hover { background: #132433; }' +
+      '.tip.is-frozen .code-head.is-link:hover { color: #d6e9ff; }' +
       '.footer { padding: 4px 8px 0; color: #7d8b99; font-size: 10px; }' +
       '.footer[hidden] { display: none; }';
     try {
@@ -338,8 +361,20 @@ ${PAGE_DOM_HELPERS_SOURCE}
 
     const root = document.createElement('div');
     root.className = 'tip';
+    tipRoot = root;
+    tipBlock = document.createElement('div');
+    tipBlock.className = 'block';
+    tipBlock.textContent = 'bloquear';
+    tipBlock.hidden = true;
+    tipBlock.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setTipFrozen(false);
+    });
     tipMode = document.createElement('div');
     tipMode.className = 'mode';
+    tipHint = document.createElement('div');
+    tipHint.className = 'hint';
     tipTitle = document.createElement('div');
     tipTitle.className = 'title';
     tipSub = document.createElement('div');
@@ -350,10 +385,11 @@ ${PAGE_DOM_HELPERS_SOURCE}
     tipCode.className = 'code';
     tipFooter = document.createElement('div');
     tipFooter.className = 'footer';
-    root.append(tipMode, tipTitle, tipSub, tipRows, tipCode, tipFooter);
+    root.append(tipBlock, tipMode, tipHint, tipTitle, tipSub, tipRows, tipCode, tipFooter);
     shadow.append(root);
     (document.documentElement || document.body).append(host);
     tipHost = host;
+    applyTipFrozen();
   };
 
   const setText = (node, value, max) => {
@@ -376,18 +412,54 @@ ${PAGE_DOM_HELPERS_SOURCE}
     style(tipHost, 'top', Math.round(top) + 'px');
   };
 
+  const applyTipFrozen = () => {
+    if (tipHost !== null) style(tipHost, 'pointer-events', tipFrozen ? 'auto' : 'none');
+    if (tipRoot !== null) tipRoot.classList.toggle('is-frozen', tipFrozen);
+    if (tipBlock !== null) tipBlock.hidden = !tipFrozen;
+    if (tipHint !== null) {
+      tipHint.textContent = tipFrozen
+        ? 'Bloqueado · clic en el código para abrir la línea · Esc: salir'
+        : 'Shift: ver · Ctrl: bloquear · Esc: cerrar';
+    }
+  };
+
+  const setTipFrozen = (value) => {
+    const next = value === true;
+    if (tipFrozen === next) return;
+    tipFrozen = next;
+    applyTipFrozen();
+    emit({ kind: 'tip-frozen', frozen: tipFrozen });
+    if (tipFrozen) {
+      if (lastTipData !== null) {
+        ensureTip();
+        style(tipHost, 'display', 'block');
+      }
+      return;
+    }
+    syncTipVisibility();
+  };
+
+  globalThis.__bdtSetTipFrozen = setTipFrozen;
+
   globalThis.__bdtShowTip = (data) => {
     if (!data || typeof data !== 'object') return;
+    // La tarjeta bloqueada conserva su contenido, su posición y su scroll.
+    if (tipFrozen) return;
     lastTipData = data;
     syncTipVisibility();
   };
 
   const syncTipVisibility = () => {
     const enabled =
+      tipFrozen ||
       globalThis.__BDT_HOVER_TIP_PINNED__ === true ||
       globalThis.__BDT_SHIFT_HELD__ === true ||
       shiftHeldNow;
     if (lastTipData !== null && enabled) {
+      if (tipFrozen && tipHost !== null && tipHost.style.display !== 'none') {
+        applyTipFrozen();
+        return;
+      }
       renderTip(lastTipData);
       return;
     }
@@ -423,11 +495,27 @@ ${PAGE_DOM_HELPERS_SOURCE}
     const code = data.code;
     if (code && typeof code === 'object' && Array.isArray(code.lines) && code.lines.length > 0) {
       tipCode.hidden = false;
+      const path = typeof code.path === 'string' && code.path !== '' ? code.path.slice(0, 4096) : null;
+      const codeEnd = typeof code.endLine === 'number' && isFinite(code.endLine) ? Math.round(code.endLine) : null;
+      const reveal = (line, endLine) => {
+        if (!tipFrozen || path === null) return;
+        if (typeof line !== 'number' || !isFinite(line) || line < 1) return;
+        emit({ kind: 'reveal', path, line: Math.round(line), endLine });
+      };
       const head = document.createElement('div');
       head.className = 'code-head';
       const file = typeof code.file === 'string' ? code.file : '';
       const range = typeof code.range === 'string' ? code.range : '';
       head.textContent = (file + ' ' + range).trim().slice(0, 240);
+      const firstLine = code.lines[0];
+      if (path !== null && firstLine && typeof firstLine.line === 'number') {
+        head.classList.add('is-link');
+        head.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          reveal(firstLine.line, codeEnd);
+        });
+      }
       tipCode.append(head);
       for (const line of code.lines) {
         if (!line || typeof line.text !== 'string') continue;
@@ -441,10 +529,19 @@ ${PAGE_DOM_HELPERS_SOURCE}
         const content = line.text.replace(/\t/g, '  ').slice(0, 180);
         text.textContent = content === '' ? ' ' : content;
         row.append(number, text);
+        if (path !== null && typeof line.line === 'number') {
+          row.classList.add('is-link');
+          row.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            reveal(line.line, null);
+          });
+        }
         tipCode.append(row);
       }
     }
     setText(tipFooter, data.footer, 240);
+    applyTipFrozen();
     style(tipHost, 'display', 'block');
     const x = typeof data.x === 'number' && isFinite(data.x) ? data.x : 0;
     const y = typeof data.y === 'number' && isFinite(data.y) ? data.y : 0;
@@ -457,6 +554,7 @@ ${PAGE_DOM_HELPERS_SOURCE}
   };
 
   globalThis.__bdtHideTip = () => {
+    if (tipFrozen) return;
     hideTip();
     hideBox();
   };
@@ -466,6 +564,7 @@ ${PAGE_DOM_HELPERS_SOURCE}
   let hoverY = 0;
 
   globalThis.__bdtHoverClear = () => {
+    if (tipFrozen) return;
     hoverTarget = null;
     globalThis.__bdtHoverTarget = null;
     lastTipData = null;
@@ -475,7 +574,7 @@ ${PAGE_DOM_HELPERS_SOURCE}
   };
 
   const endHover = () => {
-    if (hoverTarget === null) return;
+    if (tipFrozen || hoverTarget === null) return;
     hoverTarget = null;
     globalThis.__bdtHoverTarget = null;
     lastTipData = null;
@@ -810,6 +909,7 @@ ${PAGE_DOM_HELPERS_SOURCE}
 
   window.addEventListener('mousemove', (event) => {
     if (globalThis.__BDT_INSPECT_ENABLED__ === false) return;
+    if (tipFrozen) return;
     const target = event.target;
     if (!(target instanceof Element)) return;
     if (target === tipHost || target === boxHost) return;
@@ -895,7 +995,13 @@ ${PAGE_DOM_HELPERS_SOURCE}
       syncTipVisibility();
       return;
     }
+    if (event.key === 'Control' && !event.repeat) {
+      if (!inspectEnabled()) return;
+      setTipFrozen(!tipFrozen);
+      return;
+    }
     if (event.key !== 'Escape') return;
+    setTipFrozen(false);
     hideTip();
     hideBox();
     hoverTarget = null;
@@ -935,6 +1041,7 @@ ${PAGE_DOM_HELPERS_SOURCE}
     lastHoverSent = null;
     globalThis.__bdtHoverTarget = null;
     globalThis.__bdtClickTarget = null;
+    setTipFrozen(false);
     hideTip();
     hideBox();
   };
@@ -1464,13 +1571,6 @@ export interface InspectorClickSignal {
   element: InspectionElement;
 }
 
-export interface InspectorRect {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
 export interface InspectorHoverSignal {
   kind: 'hover';
   x: number;
@@ -1478,7 +1578,7 @@ export interface InspectorHoverSignal {
   docX: number;
   docY: number;
   contextId: number | null;
-  rect: InspectorRect | null;
+  rect: InspectionRect | null;
   ref: PageElementRef | null;
   element: InspectionElement;
 }
@@ -1494,11 +1594,25 @@ export interface InspectorDomChangedSignal {
   kind: 'dom-changed';
 }
 
+export interface InspectorRevealSignal {
+  kind: 'reveal';
+  path: string;
+  line: number;
+  endLine: number | null;
+}
+
+export interface InspectorTipFrozenSignal {
+  kind: 'tip-frozen';
+  frozen: boolean;
+}
+
 export type InspectorSignal =
   | InspectorClickSignal
   | InspectorHoverSignal
   | InspectorInteractionSignal
   | InspectorDomChangedSignal
+  | InspectorRevealSignal
+  | InspectorTipFrozenSignal
   | { kind: 'hover-end' }
   | { kind: 'escape' };
 
@@ -1523,7 +1637,7 @@ export interface HoverElementInfo {
   classes: string[];
   attributes: Array<{ name: string; value: string }>;
   text: string | null;
-  rect: InspectorRect;
+  rect: InspectionRect;
   styles: Array<{ name: string; value: string }>;
   reactComponents: string[];
   vueComponents: string[];
@@ -1542,6 +1656,25 @@ export interface HoverResolution {
   listeners: string[];
 }
 
+export interface ClickResolution {
+  handler: InspectionHandler | null;
+  elementInfo: InspectionElementInfo | null;
+}
+
+// El panel acoplado solo necesita la presentación del elemento; la evidencia de ejecución
+// sigue viviendo en los tipos del main que consume el tooltip.
+function projectElementInfo(info: HoverElementInfo): InspectionElementInfo {
+  return {
+    tag: info.tag,
+    id: info.id,
+    classes: [...info.classes],
+    text: info.text,
+    rect: { ...info.rect },
+    attributes: info.attributes.map((attribute) => ({ ...attribute })),
+    styles: info.styles.map((style) => ({ ...style })),
+  };
+}
+
 export type HoverTipTone = 'normal' | 'ok' | 'warn' | 'dim';
 
 export interface HoverTipRow {
@@ -1553,6 +1686,8 @@ export interface HoverTipRow {
 export interface HoverTipCode {
   file: string;
   range: string;
+  path: string | null;
+  endLine: number | null;
   lines: Array<{ line: number; text: string }>;
 }
 
@@ -1566,7 +1701,7 @@ export interface HoverTipData {
   footer: string | null;
   x: number;
   y: number;
-  rect: InspectorRect | null;
+  rect: InspectionRect | null;
 }
 
 interface RawRecord {
@@ -1593,7 +1728,7 @@ function finiteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-function parseRect(value: unknown): InspectorRect | null {
+function parseRect(value: unknown): InspectionRect | null {
   const record = asRecord(value);
   if (record === null) return null;
   const x = finiteNumber(record.x);
@@ -1741,6 +1876,24 @@ function parseSignal(raw: string, contextId: number | null): InspectorSignal | n
   }
   if (record.kind === 'dom-changed') {
     return { kind: 'dom-changed' };
+  }
+  if (record.kind === 'tip-frozen') {
+    return { kind: 'tip-frozen', frozen: record.frozen === true };
+  }
+  if (record.kind === 'reveal') {
+    const path = cleanString(record.path, 4096);
+    const rawLine = finiteNumber(record.line);
+    if (path === null || rawLine === null) return null;
+    const line = Math.round(rawLine);
+    if (line < 1 || line > 10_000_000) return null;
+    const rawEnd = finiteNumber(record.endLine);
+    const end = rawEnd === null ? null : Math.round(rawEnd);
+    return {
+      kind: 'reveal',
+      path,
+      line,
+      endLine: end !== null && end >= line && end <= 10_000_000 ? end : null,
+    };
   }
   if (record.kind === 'interaction') {
     if (!isFlowInteractionEvent(record.event)) return null;
@@ -2044,6 +2197,14 @@ export class ClickInspector {
     );
   }
 
+  setTipFrozen(frozen: boolean): void {
+    if (!this.installed) return;
+    const value = frozen ? 'true' : 'false';
+    void this.evaluateInWorlds(
+      `if (globalThis.__bdtSetTipFrozen) globalThis.__bdtSetTipFrozen(${value});`,
+    );
+  }
+
   setShiftHeld(held: boolean): void {
     this.shiftHeld = held;
     if (!this.installed) return;
@@ -2137,19 +2298,21 @@ export class ClickInspector {
     }
   }
 
-  async resolveHandler(signal: InspectorClickSignal): Promise<InspectionHandler | null> {
+  async resolveClick(signal: InspectorClickSignal): Promise<ClickResolution> {
     const target = this.target;
-    if (target === null || !this.installed) return null;
+    if (target === null || !this.installed) return { handler: null, elementInfo: null };
     const nodes = await this.nodesAt(target, signal, '__bdtClickTarget');
-    if (nodes === null) return null;
+    if (nodes === null) return { handler: null, elementInfo: null };
     try {
-      if (nodes.ids.length === 0) return null;
-      const primary = await this.findHandler(target, nodes.ids, signal.kind);
-      if (primary !== null) return primary;
-      if (signal.kind === 'click' && isSubmitLike(signal.element)) {
-        return this.findHandler(target, nodes.ids, 'submit');
+      const primary = nodes.ids[0];
+      const info = primary === undefined ? null : await this.elementInfo(target, primary);
+      const elementInfo = info === null ? null : projectElementInfo(info);
+      if (nodes.ids.length === 0) return { handler: null, elementInfo };
+      let handler = await this.findHandler(target, nodes.ids, signal.kind);
+      if (handler === null && signal.kind === 'click' && isSubmitLike(signal.element)) {
+        handler = await this.findHandler(target, nodes.ids, 'submit');
       }
-      return null;
+      return { handler, elementInfo };
     } finally {
       await this.releaseGroup(target, nodes.group);
     }

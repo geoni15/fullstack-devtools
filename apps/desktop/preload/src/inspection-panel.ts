@@ -1,25 +1,35 @@
 import { ipcRenderer } from 'electron';
 import {
   BROWSER_PANEL_CHANNELS,
+  ELEMENT_STYLE_GROUPS,
+  ERROR_CODES,
   INSPECTION_MODES,
+  IPC_CHANNELS,
+  elementSelectorLabel,
+  elementSizeLabel,
+  elementStyleGroups,
   handlerLabel,
   handlerProfileTags,
   normalizeSearchText,
   requestStatusView,
   type CapturedBody,
+  type FileContent,
+  type FileSaveResult,
   type InspectionCard,
   type InspectionCodeBlock,
+  type InspectionElementInfo,
   type InspectionExecution,
   type InspectionMode,
   type InspectionPanelState,
   type InspectionRequest,
   type InspectionRuntime,
   type InspectionSqlQuery,
+  type InspectionSqlResult,
+  type IpcResult,
 } from '@bdt/protocol';
 import {
   createHighlightState,
   highlightLine,
-  languageForFile,
   type HighlightLanguage,
   type HighlightToken,
 } from './highlight';
@@ -28,14 +38,31 @@ const MAX_BODY_LINES = 240;
 
 let currentCard: InspectionCard | null = null;
 let currentRuntime: InspectionRuntime = { status: 'off', port: null, message: null };
+let currentMode: InspectionMode = 'html';
 
 const MODE_HINT: Record<InspectionMode, string> = {
   html: 'Pasa el mouse: etiqueta, tamaño y estilos calculados.',
   frontend: 'Pasa el mouse: handler, componentes y código.',
   backend: 'Pasa el mouse: petición y ruta del backend.',
   request: 'Pasa el mouse: ruta JSON, objeto, petición y funciones.',
-  database: 'Pasa el mouse: rutas y SQL estático.',
+  database: 'Pasa el mouse: SQL estático y observado asociado a la ruta.',
 };
+
+// Cada modo enseña solo su categoría; el resto de secciones se oculta, no se atenúa.
+const MODE_SECTIONS: Record<InspectionMode, readonly string[]> = {
+  html: ['sec-html'],
+  frontend: ['sec-frontend'],
+  backend: ['sec-backend', 'sec-execution'],
+  request: ['sec-requests', 'sec-request'],
+  database: ['sec-sql'],
+};
+
+function applyModeSections(mode: InspectionMode): void {
+  const visible = MODE_SECTIONS[mode];
+  document.querySelectorAll<HTMLElement>('#content > section').forEach((section) => {
+    section.hidden = !visible.includes(section.id);
+  });
+}
 
 function element<T extends HTMLElement = HTMLElement>(id: string): T {
   const found = document.getElementById(id);
@@ -312,14 +339,233 @@ function renderHighlightedText(
   return lines.length > count;
 }
 
+interface PanelCodeBuffer {
+  path: string;
+  text: string;
+  baseText: string;
+  baseMtimeMs: number;
+  dirty: boolean;
+  loading: boolean;
+  error: string | null;
+  conflict: boolean;
+}
+
+interface PanelCodeEditor {
+  wrap: HTMLElement;
+  editor: HTMLTextAreaElement;
+  save: HTMLButtonElement;
+  reload: HTMLButtonElement;
+  overwrite: HTMLButtonElement;
+  dirty: HTMLElement;
+  status: HTMLElement;
+}
+
+const CODE_LINE_HEIGHT = 17;
+const codeBuffers = new Map<string, PanelCodeBuffer>();
+const codeEditors = new Map<string, PanelCodeEditor>();
+const codeOpen = new Set<string>();
+const codeReveal = new Map<string, number>();
+
+function syncCodeEditor(view: PanelCodeEditor, path: string): void {
+  const buffer = codeBuffers.get(path);
+  const ready = buffer !== undefined && !buffer.loading;
+  view.editor.readOnly = !ready;
+  view.editor.placeholder = ready ? '' : 'Cargando el archivo completo…';
+  if (ready && buffer !== undefined && document.activeElement !== view.editor) {
+    view.editor.value = buffer.text;
+  }
+  const conflict = buffer?.conflict ?? false;
+  view.save.hidden = conflict;
+  view.save.disabled = !ready || !(buffer?.dirty ?? false);
+  view.reload.hidden = !conflict;
+  view.overwrite.hidden = !conflict;
+  view.dirty.hidden = !(buffer?.dirty ?? false);
+  const error = buffer?.error ?? null;
+  view.status.hidden = error === null;
+  view.status.textContent = error ?? '';
+}
+
+function syncCodePath(path: string): void {
+  for (const view of codeEditors.values()) {
+    if (view.wrap.dataset.codePath === path) syncCodeEditor(view, path);
+  }
+}
+
+async function loadPanelCode(path: string, revealLine: number): Promise<void> {
+  const existing = codeBuffers.get(path);
+  if (existing !== undefined && (existing.loading || existing.error === null)) return;
+  const buffer: PanelCodeBuffer = {
+    path,
+    text: '',
+    baseText: '',
+    baseMtimeMs: 0,
+    dirty: false,
+    loading: true,
+    error: null,
+    conflict: false,
+  };
+  codeBuffers.set(path, buffer);
+  codeReveal.set(path, revealLine);
+  syncCodePath(path);
+  const result = (await ipcRenderer.invoke(IPC_CHANNELS.readFile, {
+    path,
+  })) as IpcResult<FileContent>;
+  if (codeBuffers.get(path) !== buffer) return;
+  buffer.loading = false;
+  if (!result.ok) {
+    buffer.error = result.error.message;
+    syncCodePath(path);
+    return;
+  }
+  buffer.text = result.value.content;
+  buffer.baseText = result.value.content;
+  buffer.baseMtimeMs = result.value.mtimeMs;
+  syncCodePath(path);
+  const reveal = codeReveal.get(path);
+  if (reveal === undefined) return;
+  codeReveal.delete(path);
+  for (const view of codeEditors.values()) {
+    if (view.wrap.dataset.codePath !== path) continue;
+    view.editor.scrollTop = Math.max(0, (reveal - 3) * CODE_LINE_HEIGHT);
+  }
+}
+
+async function savePanelCode(path: string, force = false): Promise<boolean> {
+  const buffer = codeBuffers.get(path);
+  if (buffer === undefined || buffer.loading) return false;
+  if (buffer.conflict && !force) return false;
+  const result = (await ipcRenderer.invoke(IPC_CHANNELS.saveFile, {
+    path,
+    content: buffer.text,
+    baseMtimeMs: buffer.baseMtimeMs,
+  })) as IpcResult<FileSaveResult>;
+  if (codeBuffers.get(path) !== buffer) return false;
+  if (!result.ok) {
+    buffer.conflict = result.error.code === ERROR_CODES.FILE_CONFLICT;
+    buffer.error = buffer.conflict
+      ? 'El archivo cambió en disco. Recarga o guarda encima.'
+      : result.error.message;
+    syncCodePath(path);
+    return false;
+  }
+  buffer.baseText = buffer.text;
+  buffer.baseMtimeMs = result.value.mtimeMs;
+  buffer.dirty = false;
+  buffer.conflict = false;
+  buffer.error = null;
+  syncCodePath(path);
+  return true;
+}
+
+async function overwritePanelCode(path: string): Promise<void> {
+  const read = (await ipcRenderer.invoke(IPC_CHANNELS.readFile, {
+    path,
+  })) as IpcResult<FileContent>;
+  const buffer = codeBuffers.get(path);
+  if (buffer === undefined) return;
+  if (!read.ok) {
+    buffer.error = read.error.message;
+    syncCodePath(path);
+    return;
+  }
+  buffer.baseMtimeMs = read.value.mtimeMs;
+  await savePanelCode(path, true);
+}
+
+async function reloadPanelCode(path: string): Promise<void> {
+  codeBuffers.delete(path);
+  await loadPanelCode(path, 0);
+}
+
+async function saveAllPanelCode(): Promise<void> {
+  for (const buffer of [...codeBuffers.values()]) {
+    if (!buffer.dirty) continue;
+    const saved = await savePanelCode(buffer.path);
+    if (!saved) return;
+  }
+}
+
+function savePanelCodeFromKeyboard(): void {
+  const active = document.activeElement;
+  if (active instanceof HTMLTextAreaElement && active.classList.contains('panel-editor')) {
+    const path = active.dataset.codePath;
+    if (path !== undefined) {
+      void savePanelCode(path);
+      return;
+    }
+  }
+  void saveAllPanelCode();
+}
+
+function codeButton(label: string, onClick: () => void): HTMLButtonElement {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'panel-save';
+  button.textContent = label;
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+function buildCodeEditor(container: HTMLElement, path: string): PanelCodeEditor {
+  const wrap = document.createElement('div');
+  wrap.className = 'panel-edit';
+  wrap.dataset.codePath = path;
+  const editor = document.createElement('textarea');
+  editor.className = 'panel-editor';
+  editor.spellcheck = false;
+  editor.wrap = 'off';
+  editor.dataset.codePath = path;
+  editor.setAttribute('aria-label', `Código de ${path}`);
+  const dirty = document.createElement('span');
+  dirty.className = 'panel-dirty';
+  dirty.textContent = 'Sin guardar';
+  const status = document.createElement('span');
+  status.className = 'panel-edit-status';
+  const view: PanelCodeEditor = {
+    wrap,
+    editor,
+    save: codeButton('Guardar · Ctrl+S', () => {
+      void savePanelCode(path);
+    }),
+    reload: codeButton('Recargar', () => {
+      void reloadPanelCode(path);
+    }),
+    overwrite: codeButton('Guardar encima', () => {
+      void overwritePanelCode(path);
+    }),
+    dirty,
+    status,
+  };
+  editor.addEventListener('input', () => {
+    const buffer = codeBuffers.get(path);
+    if (buffer === undefined) return;
+    buffer.text = editor.value;
+    buffer.dirty = buffer.text !== buffer.baseText;
+    syncCodePath(path);
+  });
+  const bar = document.createElement('div');
+  bar.className = 'panel-savebar';
+  bar.append(view.save, view.reload, view.overwrite, dirty, status);
+  wrap.append(editor, bar);
+  container.replaceChildren(wrap);
+  return view;
+}
+
+// El código se muestra plegado y se edita sobre el archivo completo: el bloque del snapshot
+// está recortado y no sirve para guardar sin perder contenido.
 function renderCode(
   container: HTMLElement,
   block: InspectionCodeBlock | null,
   note: string | null,
   highlightLineNumber: number | null,
 ): void {
-  container.replaceChildren();
+  const key = container.id;
+  const toggle = document.getElementById(`${key}-toggle`);
   if (block === null || block.lines.length === 0) {
+    codeEditors.delete(key);
+    if (toggle !== null) toggle.hidden = true;
+    container.hidden = false;
+    container.replaceChildren();
     const empty = document.createElement('div');
     empty.className = 'code-note';
     empty.textContent = note ?? block?.note ?? 'Código no disponible.';
@@ -327,41 +573,150 @@ function renderCode(
     return;
   }
 
-  const language = languageForFile(block.file);
-  const state = createHighlightState();
-  for (const line of block.lines) {
-    const row = document.createElement('div');
-    row.className = 'code-line';
-    if (highlightLineNumber !== null && line.line === highlightLineNumber) {
-      row.classList.add('is-executed');
-    }
-    const number = document.createElement('span');
-    number.className = 'code-number';
-    number.textContent = String(line.line);
-    const text = document.createElement('span');
-    text.className = 'code-text';
-    const fragment = tokenFragment(
-      highlightLine(line.text === '' ? ' ' : line.text, language, state),
-    );
-    if (fragment.childNodes.length === 0) {
-      text.textContent = ' ';
-    } else {
-      text.append(fragment);
-    }
-    row.append(number, text);
-    container.append(row);
+  const open = codeOpen.has(key);
+  if (toggle instanceof HTMLButtonElement) {
+    toggle.hidden = false;
+    toggle.textContent = open ? '▾ Código' : '▸ Código';
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    toggle.onclick = () => {
+      if (codeOpen.has(key)) {
+        codeOpen.delete(key);
+      } else {
+        codeOpen.add(key);
+      }
+      renderCode(container, block, note, highlightLineNumber);
+    };
   }
+  container.hidden = !open;
+  if (!open) return;
 
-  const executed = container.querySelector('.is-executed');
-  if (executed !== null) {
-    executed.scrollIntoView({ block: 'nearest' });
-  }
+  const existing = codeEditors.get(key);
+  const view =
+    existing !== undefined &&
+    existing.wrap.dataset.codePath === block.file &&
+    existing.wrap.parentElement === container
+      ? existing
+      : buildCodeEditor(container, block.file);
+  codeEditors.set(key, view);
+  syncCodeEditor(view, block.file);
+  void loadPanelCode(block.file, highlightLineNumber ?? block.startLine);
 }
 
 function lineRange(code: InspectionCodeBlock): string {
   return code.startLine === code.endLine
     ? `línea ${String(code.startLine)}`
     : `líneas ${String(code.startLine)}–${String(code.endLine)}`;
+}
+
+function kvRow(label: string, value: string): HTMLElement {
+  const row = document.createElement('div');
+  row.className = 'kv';
+  const key = document.createElement('span');
+  key.className = 'k';
+  key.textContent = label;
+  const text = document.createElement('span');
+  text.className = 'v';
+  text.textContent = value;
+  row.append(key, text);
+  return row;
+}
+
+function renderElementInfo(info: InspectionElementInfo | null, fallbackSelector: string): void {
+  const rows = element('html-rows');
+  rows.replaceChildren();
+  const empty = element('html-empty');
+  if (info === null) {
+    element('html-selector').textContent = fallbackSelector;
+    element('html-size').textContent = '';
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+  element('html-selector').textContent = elementSelectorLabel(info);
+  element('html-size').textContent =
+    `${elementSizeLabel(info)} · x ${String(Math.round(info.rect.x))} · y ${String(
+      Math.round(info.rect.y),
+    )}`;
+  for (const group of elementStyleGroups(info.styles)) {
+    rows.append(kvRow(group.label, group.value));
+  }
+  const grouped = new Set<string>(ELEMENT_STYLE_GROUPS.flatMap((group) => [...group.names]));
+  const rest = info.styles.filter((style) => !grouped.has(style.name) && style.value !== '');
+  if (rest.length > 0) {
+    rows.append(kvRow('Otros', rest.map((style) => `${style.name}: ${style.value}`).join(' · ')));
+  }
+  const attributes = info.attributes
+    .map((attribute) => `${attribute.name}="${attribute.value}"`)
+    .join(' ');
+  if (attributes !== '') rows.append(kvRow('Atributos', attributes));
+  if (info.text !== null) rows.append(kvRow('Texto', info.text));
+}
+
+function sqlCellText(value: string | number | boolean | null): string {
+  if (value === null) return 'NULL';
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  return String(value);
+}
+
+function sqlResultNode(result: InspectionSqlResult): HTMLElement {
+  const container = document.createElement('div');
+  container.className = 'sql-result';
+
+  const head = document.createElement('div');
+  head.className = 'result-head';
+  const driver = document.createElement('span');
+  driver.textContent = `${result.driver} · ${clock(result.observedAt)}`;
+  const count = document.createElement('span');
+  count.className = 'result-count';
+  count.textContent = result.rowCount === 1 ? '1 fila' : `${String(result.rowCount)} filas`;
+  head.append(driver, count);
+  container.append(head);
+
+  if (result.columns.length === 0 || result.rows.length === 0) {
+    const note = document.createElement('div');
+    note.className = 'result-note';
+    note.textContent =
+      result.rows.length === 0 ? 'La consulta no devolvió filas.' : 'Sin columnas en la muestra.';
+    container.append(note);
+    return container;
+  }
+
+  const grid = document.createElement('div');
+  grid.className = 'result-grid';
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  for (const column of result.columns) {
+    const th = document.createElement('th');
+    th.textContent = column;
+    headRow.append(th);
+  }
+  thead.append(headRow);
+  const tbody = document.createElement('tbody');
+  for (const row of result.rows) {
+    const tr = document.createElement('tr');
+    for (let index = 0; index < result.columns.length; index += 1) {
+      const td = document.createElement('td');
+      const value = row[index] ?? null;
+      td.textContent = sqlCellText(value);
+      if (value === null) td.className = 'is-null';
+      tr.append(td);
+    }
+    tbody.append(tr);
+  }
+  table.append(thead, tbody);
+  grid.append(table);
+  container.append(grid);
+
+  if (result.truncated || result.rows.length < result.rowCount) {
+    const note = document.createElement('div');
+    note.className = 'result-note';
+    note.textContent = `Muestra de ${String(result.rows.length)} de ${String(
+      result.rowCount,
+    )} filas · límite de captura en memoria.`;
+    container.append(note);
+  }
+  return container;
 }
 
 const SQL_OPERATION_LABEL: Record<InspectionSqlQuery['operation'], string> = {
@@ -404,6 +759,18 @@ function queryNode(
   if (query.tablesWritten.length > 0) {
     parts.push(document.createTextNode(`escribe ${query.tablesWritten.join(', ')}`));
   }
+  if (query.columns.length > 0) {
+    parts.push(
+      document.createTextNode(`columnas ${query.columns.map((column) => column.name).join(', ')}`),
+    );
+  }
+  if (query.dialect !== null) parts.push(document.createTextNode(query.dialect));
+  if (query.result === null && query.callMethod !== null) {
+    parts.push(document.createTextNode(query.callMethod));
+  }
+  if (query.observedAt !== null) {
+    parts.push(document.createTextNode(clock(query.observedAt)));
+  }
   if (query.line > 0) {
     const label = `línea ${String(query.line)}`;
     parts.push(
@@ -419,17 +786,33 @@ function queryNode(
     meta.append(part);
   });
   container.append(meta);
+
+  const flags: string[] = [];
+  if (query.dynamic) flags.push('SQL dinámico: el texto puede variar en ejecución');
+  if (query.selectStar) flags.push('SELECT *');
+  if (query.parse === 'fallback') flags.push('análisis por texto, sin AST');
+  if (query.note !== null && query.note !== '') flags.push(query.note);
+  if (flags.length > 0) {
+    const note = document.createElement('div');
+    note.className = 'meta';
+    note.textContent = flags.join(' · ');
+    container.append(note);
+  }
+
+  if (query.result !== null) container.append(sqlResultNode(query.result));
   return container;
 }
 
 function queriesEmptyText(card: InspectionCard): string {
   if (card.backend === null) {
-    return card.endpoint !== null ? 'Sin ruta' : 'Sin petición';
+    return card.endpoint !== null
+      ? 'Sin SQL asociado a este elemento: la petición no tiene ruta backend resuelta.'
+      : 'Sin SQL asociado a este elemento: no hay petición enlazada.';
   }
   if (!card.backend.resolved) {
-    return 'Manejador no resuelto';
+    return 'Sin SQL asociado a este elemento: el manejador de la ruta no está resuelto.';
   }
-  return 'Sin SQL en el manejador';
+  return 'Sin SQL en el manejador de esta ruta.';
 }
 
 function renderQueries(card: InspectionCard): void {
@@ -791,10 +1174,16 @@ function renderBackend(card: InspectionCard): void {
   renderCode(element('backend-code'), card.backend.code, card.backend.codeNote, highlight);
 }
 
-function render(card: InspectionCard | null, runtime: InspectionRuntime): void {
+function render(
+  card: InspectionCard | null,
+  runtime: InspectionRuntime,
+  mode: InspectionMode,
+): void {
   document.title = 'Inspección';
   currentCard = card;
   currentRuntime = runtime;
+  currentMode = mode;
+  applyModeSections(mode);
   const content = element('content');
   const idle = element('idle');
   if (card === null) {
@@ -820,6 +1209,8 @@ function render(card: InspectionCard | null, runtime: InspectionRuntime): void {
     details.push(`tipo ${card.element.inputType}`);
   }
   element('element-detail').textContent = details.join(' · ');
+
+  renderElementInfo(card.elementInfo, card.element.selector ?? `<${card.element.tag}>`);
 
   renderHandler(card);
 
@@ -894,7 +1285,7 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('map-toggle')?.addEventListener('click', openMap);
   document.getElementById('map-mode')?.addEventListener('click', openMap);
   document.getElementById('request-search')?.addEventListener('input', () => {
-    render(currentCard, currentRuntime);
+    render(currentCard, currentRuntime, currentMode);
   });
   document.querySelectorAll<HTMLButtonElement>('.mode[data-mode]').forEach((button) => {
     button.addEventListener('click', () => {
@@ -907,7 +1298,13 @@ window.addEventListener('DOMContentLoaded', () => {
   ipcRenderer.on(BROWSER_PANEL_CHANNELS.data, (_event, state: InspectionPanelState) => {
     renderRuntime(state.runtime);
     renderModes(state.mode);
-    render(state.card, state.runtime);
+    render(state.card, state.runtime, state.mode);
+  });
+  window.addEventListener('keydown', (event) => {
+    if (!(event.ctrlKey || event.metaKey)) return;
+    if (event.key !== 's' && event.key !== 'S') return;
+    event.preventDefault();
+    savePanelCodeFromKeyboard();
   });
   ipcRenderer.send(BROWSER_PANEL_CHANNELS.ready);
 });

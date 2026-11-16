@@ -352,6 +352,14 @@ button:focus-visible {
   letter-spacing: 0.4px;
 }
 
+.tab-dirty {
+  align-self: center;
+  width: 7px;
+  height: 7px;
+  background: #ffd7a8;
+  flex: none;
+}
+
 .tab-close {
   padding: 0 10px 0 6px;
   color: var(--faint);
@@ -370,6 +378,67 @@ button:focus-visible {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.7px;
+}
+
+.editor-tools,
+.editor-guard {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  height: 30px;
+  padding: 0 12px;
+  background: var(--panel);
+  font-size: 12px;
+}
+
+.editor-guard {
+  background: #33270f;
+}
+
+.editor-tools-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--faint);
+  font-family: 'Cascadia Mono', Consolas, monospace;
+  font-size: 11px;
+}
+
+.guard-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: #ffd7a8;
+}
+
+.editor-dirty {
+  color: #ffd7a8;
+}
+
+.editor-external {
+  color: #ffb4a8;
+}
+
+.editor-tools button,
+.editor-guard button {
+  padding: 3px 8px;
+  background: var(--raised);
+  color: var(--text);
+}
+
+.editor-tools button:hover,
+.editor-guard button:hover {
+  background: var(--hover);
+}
+
+.editor-tools button:disabled {
+  color: var(--faint);
+  cursor: default;
 }
 
 .editor-body {

@@ -75,6 +75,7 @@ export class RequestBuffer {
       error: null,
       initiator: normalizeInitiator(input.initiator),
       headers: maskHeaders(input.headers),
+      responseHeaders: {},
       requestBody: input.requestBody ?? null,
       responseBody: null,
     };
@@ -113,13 +114,13 @@ export class RequestBuffer {
     return updated;
   }
 
-  setHeaders(
+  setResponseHeaders(
     requestId: string,
     headers: Record<string, string> | null | undefined,
   ): CapturedRequest | null {
     const request = this.entries.get(requestId);
     if (request === undefined) return null;
-    const updated: CapturedRequest = { ...request, headers: maskHeaders(headers) };
+    const updated: CapturedRequest = { ...request, responseHeaders: maskHeaders(headers) };
     this.entries.set(requestId, updated);
     return updated;
   }

@@ -1,11 +1,17 @@
 import { ipcRenderer } from 'electron';
 import {
   BROWSER_PANEL_CHANNELS,
+  ERROR_CODES,
   FLOW_INTERACTION_EVENTS,
+  IPC_CHANNELS,
   handlerLabel,
   handlerProfileTags,
   normalizeSearchText,
+  reasonPhrase,
   requestStatusView,
+  type CapturedBody,
+  type FileContent,
+  type FileSaveResult,
   type FlowEdge,
   type FlowElementKind,
   type FlowInteractionEvent,
@@ -15,13 +21,21 @@ import {
   type FlowMapState,
   type FlowNode,
   type FlowNodeType,
+  type FlowNodeWeight,
+  type FlowRequestDetail,
+  type FlowRequestState,
   type FlowSnapshot,
+  type IpcResult,
   type RequestStatusView,
 } from '@bdt/protocol';
 import {
+  FLOW_MARGIN,
   FLOW_NODE_COMPACT_HEIGHT,
   FLOW_NODE_HEIGHT,
+  LAYER_GAP,
+  isFrontendLayerType,
   layoutFlow,
+  type FlowLayerInfo,
   type FlowLayout,
   type FlowLayoutMode,
   type FlowPlacedNode,
@@ -61,8 +75,12 @@ const CORRIDOR_OFFSET: Record<EdgeFlowClass, number> = {
   receive: 21,
   neutral: 28,
 };
-const JSON_RAIL_PREVIEW_CHARS = 480;
-const JSON_DETAIL_PREVIEW_CHARS = 1200;
+const MIDDLEWARE_MIN_WIDTH = 320;
+const MIDDLEWARE_MAX_WIDTH = 500;
+const MIDDLEWARE_INSET = 40;
+const MIDDLEWARE_SIDE_WIDTH = 400;
+const MIDDLEWARE_SIDE_MIN = 280;
+const MIDDLEWARE_SIDE_GAP = 32;
 const CARD_WIDTH_MIN = 52;
 const CARD_WIDTH_MAX = 440;
 const COLUMN_WIDTH_MIN = 44;
@@ -75,6 +93,7 @@ const TYPE_FONT = '600 8px system-ui, "Segoe UI", sans-serif';
 const SUB_FONT = '10px system-ui, "Segoe UI", sans-serif';
 const BADGE_FONT = '600 8px system-ui, "Segoe UI", sans-serif';
 const TIME_FONT = '9px "Cascadia Mono", Consolas, monospace';
+const CODE_LINE_HEIGHT = 13;
 const TYPE_LETTER_SPACING = 0.8;
 const AXIS_FONT = '600 9px system-ui, "Segoe UI", sans-serif';
 const AXIS_LETTER_SPACING = 0.9;
@@ -188,6 +207,33 @@ interface GraphModel {
   neighbors: Map<string, Set<string>>;
   traceElements: FlowNode[];
   runtimeReachable: Set<string>;
+  middleware: MiddlewareBand | null;
+  baseHeight: number;
+}
+
+interface MiddlewareBand {
+  x: number;
+  width: number;
+  gapStart: number;
+  gapEnd: number;
+  sideWidth: number;
+}
+
+interface MiddlewareRow {
+  key: string;
+  movement: FlowJsonMovement | null;
+  frontend: FlowNode | null;
+  backend: FlowNode | null;
+  detail: FlowRequestDetail | null;
+  detailCount: number;
+  detailHeuristic: boolean;
+}
+
+interface MiddlewareRowView {
+  row: MiddlewareRow;
+  left: HTMLElement | null;
+  center: HTMLElement | null;
+  right: HTMLElement | null;
 }
 
 interface PanState {
@@ -223,6 +269,31 @@ interface EdgeView {
   path: SVGPathElement;
   group: SVGGElement;
   glyph: SVGTextElement | null;
+}
+
+interface NodeView {
+  node: FlowNode;
+  group: SVGGElement;
+  card: HTMLElement | null;
+  cardKey: string;
+}
+
+interface CodeBuffer {
+  path: string;
+  text: string;
+  baseText: string;
+  baseMtimeMs: number;
+  dirty: boolean;
+  loading: boolean;
+  error: string | null;
+  conflict: boolean;
+}
+
+interface CodeFocus {
+  path: string;
+  start: number;
+  end: number;
+  top: number;
 }
 
 interface CorridorGroup {
@@ -265,14 +336,22 @@ let kindMode: 'all' | 'read' | 'write' = 'all';
 let selectedId: string | null = null;
 let selectionHighlight = false;
 let highlightScope: Set<string> | null = null;
-let currentCardRequests = new Set<string>();
 let searchTerm = '';
 let trafficMode: TrafficMode = 'interacted';
 let layoutMode: FlowLayoutMode = 'chronological';
-let compactMode = false;
+let compactMode = true;
 const columnWidths = new Map<FlowNodeType, number>();
+const expandedNodes = new Set<string>();
+const expandedHeights = new Map<string, number>();
+const sectionExpanded = new Set<string>();
+const codeBuffers = new Map<string, CodeBuffer>();
+const codeReveal = new Map<string, number>();
+let ctrlPending = false;
+let cardHeightPass = false;
+let middlewareSignature = '';
 let eventFilter: FlowInteractionEvent | null = null;
 let eventOnly = false;
+let statusFilter: string | null = null;
 let focusScope: Set<string> | null = null;
 let focusOriginId: string | null = null;
 let focusDirection: FocusDirection = 'both';
@@ -289,6 +368,7 @@ let branchLayer: SVGGElement | null = null;
 let trunkLayer: SVGGElement | null = null;
 let nodeLayer: SVGGElement | null = null;
 let cellRouteLayer: SVGGElement | null = null;
+let middlewareLinkLayer: SVGGElement | null = null;
 let axisEntries: Array<{ el: HTMLElement; x: number | null; width: number | null }> = [];
 let axisGrips: Array<{ el: HTMLElement; x: number }> = [];
 let columnResize: { type: FlowNodeType; startClientX: number; startWidth: number } | null = null;
@@ -297,7 +377,7 @@ const AXIS_HEIGHT = 22;
 let edgePlans: EdgePlan[] = [];
 let planById = new Map<string, EdgePlan>();
 let respondedScope = new Set<string>();
-let nodeViews = new Map<string, { node: FlowNode; group: SVGGElement }>();
+let nodeViews = new Map<string, NodeView>();
 let edgeViews = new Map<string, EdgeView>();
 let filterVisibility = new Map<string, boolean>();
 let viewportFrame = 0;
@@ -308,11 +388,11 @@ let planGrid = new Map<string, EdgePlan[]>();
 let nodeGrid = new Map<string, FlowPlacedNode[]>();
 let resizeObserver: ResizeObserver | null = null;
 let traceButtons = new Map<string, HTMLButtonElement>();
-let tooltipsPinned = false;
 let shiftHeld = false;
-let tipKey: string | null = null;
-let hoverKey: string | null = null;
-let hoverText = '';
+let tipFrozen = false;
+let tipSignature = '';
+let hoverCardId: string | null = null;
+let hoverProvider: (() => InfoCardModel | null) | null = null;
 let tipPointerX = 0;
 let tipPointerY = 0;
 let menuNodeId: string | null = null;
@@ -562,6 +642,76 @@ function requestStatus(node: FlowNode): RequestStatusView | null {
   });
 }
 
+const STATUS_CATEGORY_ORDER = ['2', '3', '4', '5', 'other'] as const;
+type StatusCategory = (typeof STATUS_CATEGORY_ORDER)[number];
+
+const STATUS_CATEGORY_LABEL: Record<StatusCategory, string> = {
+  '2': '2xx · Correctas',
+  '3': '3xx · Redirecciones',
+  '4': '4xx · Error del cliente',
+  '5': '5xx · Error del servidor',
+  other: 'Otros estados',
+};
+
+function statusCategoryOf(code: number): StatusCategory {
+  const category = String(Math.floor(code / 100));
+  return category === '2' || category === '3' || category === '4' || category === '5'
+    ? category
+    : 'other';
+}
+
+function statusCategoryKey(category: StatusCategory): string {
+  return category === 'other' ? 'cat:other' : `cat:${category}xx`;
+}
+
+// Las claves del filtro son exactamente lo que el nodo ya enseña: código, categoría,
+// pendiente, sin respuesta o sin estado. No se inventa un estado que el snapshot no trae.
+function statusFilterKeys(node: FlowNode): string[] {
+  const status = requestStatus(node);
+  if (status === null) return [];
+  if (status.kind === 'network-error') return ['err'];
+  if (status.kind === 'pending') return ['pending'];
+  const code = node.statusCode;
+  if (code === null || code === undefined) return ['none'];
+  return [statusCategoryKey(statusCategoryOf(code)), `code:${String(code)}`];
+}
+
+function statusKeyCategory(key: string): StatusCategory | 'special' | null {
+  if (key === 'err' || key === 'pending' || key === 'none') return 'special';
+  if (key.startsWith('cat:')) {
+    const raw = key.slice(4);
+    if (raw === 'other') return 'other';
+    const digit = raw.slice(0, 1);
+    return digit === '2' || digit === '3' || digit === '4' || digit === '5' ? digit : null;
+  }
+  if (key.startsWith('code:')) {
+    const code = Number(key.slice(5));
+    return Number.isFinite(code) ? statusCategoryOf(code) : null;
+  }
+  return null;
+}
+
+function statusKeyLabel(key: string): string {
+  if (key === 'err') return 'ERR · sin respuesta';
+  if (key === 'pending') return '··· · pendiente';
+  if (key === 'none') return '— · sin estado';
+  if (key.startsWith('cat:')) {
+    const raw = key.slice(4);
+    return raw === 'other' ? 'Otros · todas' : `${raw} · todas`;
+  }
+  const code = Number(key.slice(5));
+  return Number.isFinite(code) ? `${String(code)} ${reasonPhrase(code)}` : key;
+}
+
+function statusMatchCount(key: string): number {
+  if (model === null) return 0;
+  let total = 0;
+  for (const node of model.snapshot.nodes) {
+    if (statusFilterKeys(node).includes(key)) total += 1;
+  }
+  return total;
+}
+
 function eventSummary(node: FlowNode): string | null {
   const events = node.events ?? [];
   if (events.length === 0) return null;
@@ -571,61 +721,1149 @@ function eventSummary(node: FlowNode): string | null {
     .join(' · ');
 }
 
-function nodeTooltip(node: FlowNode): string {
-  const parts = [nodeTypeLabel(node), node.title];
-  if (node.subtitle !== null && node.subtitle !== '') parts.push(node.subtitle);
+type InfoTone = 'neutral' | 'request' | 'response' | 'ok' | 'warn' | 'error';
+
+interface InfoRow {
+  label: string;
+  value: string;
+  file: string | null;
+  line: number | null;
+  endLine: number | null;
+}
+
+interface InfoSectionEditor {
+  path: string;
+  value: string;
+  dirty: boolean;
+  loading: boolean;
+  error: string | null;
+  conflict: boolean;
+  onInput: (value: string) => void;
+  onSave: () => void;
+  onReload: () => void;
+  onOverwrite: () => void;
+  onMount?: (editor: HTMLTextAreaElement) => void;
+}
+
+interface InfoSection {
+  id: string;
+  label: string;
+  text: string;
+  expanded: boolean;
+  onToggle: () => void;
+  editable?: InfoSectionEditor;
+}
+
+interface InfoCardExpansion {
+  expanded: boolean;
+  onToggle: () => void;
+}
+
+interface InfoCardModel {
+  id: string;
+  eyebrow: string;
+  title: string;
+  subtitle: string;
+  status: string;
+  meta: string;
+  tone: InfoTone;
+  chips: readonly string[];
+  rows: readonly InfoRow[];
+  sections: readonly InfoSection[];
+  location: InfoRow | null;
+  footer: { label: string; onClick: () => void } | null;
+  expansion: InfoCardExpansion | null;
+}
+
+interface InfoCardOptions {
+  variant: 'tip' | 'rail' | 'middleware' | 'detail' | 'node';
+  rows: 'all' | 'body';
+  className?: string;
+  collapsed?: boolean;
+}
+
+interface InfoCardInput {
+  id: string;
+  eyebrow: string;
+  title: string;
+  subtitle?: string;
+  status?: string;
+  meta?: string;
+  tone?: InfoTone;
+  chips?: readonly string[];
+  rows?: readonly InfoRow[];
+  sections?: readonly InfoSection[];
+  location?: InfoRow | null;
+  footer?: { label: string; onClick: () => void } | null;
+  expansion?: InfoCardExpansion | null;
+}
+
+// Única puerta de entrada a una tarjeta: todas las superficies (tooltip, raíl,
+// middleware, detalle, celdas, etapas y corredores) comparten estas propiedades.
+function infoCard(input: InfoCardInput): InfoCardModel {
+  return {
+    id: input.id,
+    eyebrow: input.eyebrow,
+    title: input.title,
+    subtitle: input.subtitle ?? '',
+    status: input.status ?? '',
+    meta: input.meta ?? '',
+    tone: input.tone ?? 'neutral',
+    chips: input.chips ?? [],
+    rows: input.rows ?? [],
+    sections: input.sections ?? [],
+    location: input.location ?? null,
+    footer: input.footer ?? null,
+    expansion: input.expansion ?? null,
+  };
+}
+
+const JSON_DIRECTION_LABEL: Record<FlowJsonMovement['direction'], string> = {
+  in: 'entrada',
+  out: 'salida',
+  internal: 'interno',
+};
+
+function infoRow(
+  label: string,
+  value: string | null | undefined,
+  file: string | null = null,
+  line: number | null = null,
+  endLine: number | null = null,
+): InfoRow | null {
+  if (value === null || value === undefined || value === '') return null;
+  return { label, value, file, line, endLine };
+}
+
+function pushInfoRow(
+  rows: InfoRow[],
+  label: string,
+  value: string | null | undefined,
+  file: string | null = null,
+  line: number | null = null,
+  endLine: number | null = null,
+): void {
+  const row = infoRow(label, value, file, line, endLine);
+  if (row !== null) rows.push(row);
+}
+
+function toneFromStatus(tone: RequestStatusView['tone']): InfoTone {
+  if (tone === 'ok') return 'ok';
+  if (tone === 'warning' || tone === 'pending') return 'warn';
+  if (tone === 'error') return 'error';
+  return 'neutral';
+}
+
+function jsonBodySection(movement: FlowJsonMovement, text: string): InfoSection {
+  const key = `json:${movement.id}`;
+  return {
+    id: key,
+    label: `Cuerpo JSON · ${JSON_KIND_LABEL[movement.kind]} · ${clock(movement.at)}`,
+    text,
+    expanded: sectionExpanded.has(key),
+    onToggle: () => {
+      toggleSection(key);
+    },
+  };
+}
+
+function cardForJsonMovement(movement: FlowJsonMovement): InfoCardModel {
+  const formatted = movement.body === null ? null : formatJsonBody(movement);
+  const rows: InfoRow[] = [];
+  pushInfoRow(rows, 'Hora', clock(movement.at));
+  pushInfoRow(rows, 'Dirección', JSON_DIRECTION_LABEL[movement.direction]);
+  if (movement.method !== null || movement.path !== null) {
+    pushInfoRow(rows, 'Camino', [movement.method ?? '', movement.path ?? ''].join(' ').trim());
+  }
+  pushInfoRow(rows, 'Estado', movement.status === null ? null : String(movement.status));
+  pushInfoRow(rows, 'Repeticiones', movement.count > 1 ? String(movement.count) : null);
+  const owner = jsonOwnerNode(movement);
+  pushInfoRow(rows, 'Asociado', owner === null ? null : `${nodeTypeLabel(owner)} · ${owner.title}`);
+  pushInfoRow(
+    rows,
+    'Cuerpo',
+    formatted === null
+      ? movement.body === null
+        ? 'sin cuerpo visible'
+        : 'oculto para la celda elegida'
+      : jsonBodySummary(formatted.text, textBytes(movement.body ?? formatted.text)),
+  );
+  if (movement.truncated) pushInfoRow(rows, 'Aviso', 'El capturador recortó este cuerpo.');
+  const where = movement.file === null ? null : movement.file;
+  return infoCard({
+    id: `json:${movement.id}`,
+    eyebrow: `JSON · ${JSON_KIND_LABEL[movement.kind]}`,
+    title:
+      movement.method !== null && movement.path !== null
+        ? `${movement.method} ${movement.path}`
+        : (movement.file ?? 'Movimiento JSON'),
+    subtitle: `${JSON_DIRECTION_LABEL[movement.direction]} · ${clock(movement.at)}${
+      movement.count > 1 ? ` · ${String(movement.count)} apariciones` : ''
+    }`,
+    status: movement.status === null ? '' : String(movement.status),
+    tone:
+      movement.kind === 'response'
+        ? 'response'
+        : movement.kind === 'request'
+          ? 'request'
+          : 'neutral',
+    chips: movement.truncated ? ['RECORTADO'] : [],
+    rows,
+    sections:
+      formatted !== null && movement.body !== null
+        ? [jsonBodySection(movement, formatted.text)]
+        : [],
+    location:
+      where === null
+        ? null
+        : {
+            label: 'Ubicación',
+            value: movement.line > 0 ? `${where}:${String(movement.line)}` : where,
+            file: where,
+            line: movement.line > 0 ? movement.line : null,
+            endLine: null,
+          },
+    footer:
+      owner === null
+        ? null
+        : {
+            label: `Enfocar ${nodeTypeLabel(owner)} · ${owner.title}`,
+            onClick: () => {
+              selectNode(owner.id);
+              fitToNodes([owner.id]);
+            },
+          },
+  });
+}
+
+function dirtyCodePaths(): string[] {
+  return [...codeBuffers.values()].filter((buffer) => buffer.dirty).map((buffer) => buffer.path);
+}
+
+function pushCodeDirty(): void {
+  ipcRenderer.send(BROWSER_PANEL_CHANNELS.mapDirty, { paths: dirtyCodePaths() });
+}
+
+function captureCodeFocus(): CodeFocus | null {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLTextAreaElement) || !active.classList.contains('info-editor')) {
+    return null;
+  }
+  const path = active.dataset.codePath;
+  if (path === undefined) return null;
+  return { path, start: active.selectionStart, end: active.selectionEnd, top: active.scrollTop };
+}
+
+function restoreCodeFocus(focus: CodeFocus | null): void {
+  if (focus === null) return;
+  for (const editor of Array.from(document.querySelectorAll('textarea.info-editor'))) {
+    if (!(editor instanceof HTMLTextAreaElement) || editor.dataset.codePath !== focus.path)
+      continue;
+    editor.focus();
+    editor.setSelectionRange(focus.start, focus.end);
+    editor.scrollTop = focus.top;
+    return;
+  }
+}
+
+// Repintar las tarjetas sustituye el textarea: se conserva el foco y el cursor para que
+// escribir no se interrumpa cuando llega evidencia nueva o se guarda.
+function refreshCodeSurfaces(): void {
+  const focus = captureCodeFocus();
+  refreshNodeCards();
+  if (selectedId !== null && model !== null) {
+    const node = model.nodesById.get(selectedId);
+    if (node !== undefined) renderDetail(node);
+  }
+  refreshFrozenTip();
+  renderStatus();
+  restoreCodeFocus(focus);
+}
+
+async function loadCodeBuffer(path: string, revealLine: number | null): Promise<void> {
+  const existing = codeBuffers.get(path);
+  if (existing !== undefined && (existing.loading || existing.error === null)) return;
+  const buffer: CodeBuffer = existing ?? {
+    path,
+    text: '',
+    baseText: '',
+    baseMtimeMs: 0,
+    dirty: false,
+    loading: true,
+    error: null,
+    conflict: false,
+  };
+  buffer.loading = true;
+  buffer.error = null;
+  codeBuffers.set(path, buffer);
+  refreshCodeSurfaces();
+  const result = (await ipcRenderer.invoke(IPC_CHANNELS.readFile, {
+    path,
+  })) as IpcResult<FileContent>;
+  buffer.loading = false;
+  if (!result.ok) {
+    buffer.error = result.error.message;
+    refreshCodeSurfaces();
+    return;
+  }
+  buffer.text = result.value.content;
+  buffer.baseText = result.value.content;
+  buffer.baseMtimeMs = result.value.mtimeMs;
+  buffer.dirty = false;
+  buffer.conflict = false;
+  if (revealLine !== null && revealLine > 0) codeReveal.set(path, revealLine);
+  refreshCodeSurfaces();
+}
+
+async function saveCodeBuffer(path: string, force = false): Promise<boolean> {
+  const buffer = codeBuffers.get(path);
+  if (buffer === undefined || buffer.loading) return false;
+  if (buffer.conflict && !force) return false;
+  if (!buffer.dirty && !force) return true;
+  const result = (await ipcRenderer.invoke(IPC_CHANNELS.saveFile, {
+    path,
+    content: buffer.text,
+    baseMtimeMs: buffer.baseMtimeMs,
+  })) as IpcResult<FileSaveResult>;
+  if (!result.ok) {
+    buffer.conflict = result.error.code === ERROR_CODES.FILE_CONFLICT;
+    buffer.error = buffer.conflict
+      ? 'El archivo cambió en disco. Recarga o guarda encima.'
+      : result.error.message;
+    refreshCodeSurfaces();
+    return false;
+  }
+  buffer.baseMtimeMs = result.value.mtimeMs;
+  buffer.baseText = buffer.text;
+  buffer.dirty = false;
+  buffer.conflict = false;
+  buffer.error = null;
+  pushCodeDirty();
+  refreshCodeSurfaces();
+  return true;
+}
+
+async function overwriteCodeBuffer(path: string): Promise<boolean> {
+  const buffer = codeBuffers.get(path);
+  if (buffer === undefined) return false;
+  const result = (await ipcRenderer.invoke(IPC_CHANNELS.readFile, {
+    path,
+  })) as IpcResult<FileContent>;
+  if (!result.ok) {
+    buffer.error = result.error.message;
+    refreshCodeSurfaces();
+    return false;
+  }
+  buffer.baseMtimeMs = result.value.mtimeMs;
+  buffer.conflict = false;
+  buffer.error = null;
+  return saveCodeBuffer(path, true);
+}
+
+async function reloadCodeBuffer(path: string): Promise<void> {
+  codeBuffers.delete(path);
+  pushCodeDirty();
+  await loadCodeBuffer(path, null);
+}
+
+async function saveAllCodeBuffers(): Promise<boolean> {
+  for (const path of dirtyCodePaths()) {
+    const saved = await saveCodeBuffer(path);
+    if (!saved) return false;
+  }
+  return true;
+}
+
+function saveCodeFromKeyboard(): void {
+  const active = document.activeElement;
+  if (active instanceof HTMLTextAreaElement && active.classList.contains('info-editor')) {
+    const path = active.dataset.codePath;
+    if (path !== undefined) {
+      void saveCodeBuffer(path);
+      return;
+    }
+  }
+  if (dirtyCodePaths().length === 0) return;
+  void saveAllCodeBuffers();
+}
+
+function codeSectionFor(node: FlowNode): InfoSection | null {
+  const path = node.file;
+  if (path === null) return null;
+  const key = `code:${node.id}`;
+  const expanded = sectionExpanded.has(key);
+  const buffer = codeBuffers.get(path) ?? null;
+  const range =
+    node.line === null
+      ? ''
+      : ` (líneas ${String(node.line)}${node.endLine === null ? '' : `–${String(node.endLine)}`})`;
+  const editable: InfoSectionEditor = {
+    path,
+    value: buffer?.text ?? '',
+    dirty: buffer?.dirty ?? false,
+    loading: buffer === null || buffer.loading,
+    error: buffer?.error ?? null,
+    conflict: buffer?.conflict ?? false,
+    onInput: (value) => {
+      if (buffer === null) return;
+      const before = buffer.dirty;
+      buffer.text = value;
+      buffer.dirty = value !== buffer.baseText;
+      editable.dirty = buffer.dirty;
+      if (before === buffer.dirty) return;
+      pushCodeDirty();
+      renderStatus();
+    },
+    onSave: () => {
+      void saveCodeBuffer(path);
+    },
+    onReload: () => {
+      void reloadCodeBuffer(path);
+    },
+    onOverwrite: () => {
+      void overwriteCodeBuffer(path);
+    },
+    onMount: (editor) => {
+      const reveal = codeReveal.get(path);
+      if (reveal === undefined) return;
+      codeReveal.delete(path);
+      editor.scrollTop = Math.max(0, (reveal - 3) * CODE_LINE_HEIGHT);
+    },
+  };
+  return {
+    id: key,
+    label: `Código · ${path}${range}`,
+    text: '',
+    expanded,
+    onToggle: () => {
+      toggleSection(key);
+      if (!sectionExpanded.has(key)) return;
+      void loadCodeBuffer(path, node.line);
+    },
+    editable,
+  };
+}
+
+function cardForNode(node: FlowNode): InfoCardModel {
+  const rows: InfoRow[] = [];
   const table = tableDataOf(node);
-  if (table !== null) {
-    const ways = [table.read ? 'lecturas' : '', table.write ? 'escrituras' : '']
-      .filter((part) => part !== '')
-      .join(' y ');
-    parts.push(
-      `${String(table.columns.length)} columnas · ${String(table.queries.length)} SQL${
-        ways === '' ? '' : ` · ${ways}`
-      }`,
+  if (node.type === 'structure' || node.type === 'asset' || node.type === 'element') {
+    pushInfoRow(rows, 'Selector', node.selector ?? null);
+  }
+  if (node.type === 'asset') pushInfoRow(rows, 'Archivo', node.href ?? null);
+  if (node.type === 'element') {
+    pushInfoRow(rows, 'Destino del enlace', node.href ?? null);
+    if (node.formAction !== null && node.formAction !== undefined) {
+      pushInfoRow(rows, 'Formulario', `${node.formMethod ?? 'GET'} ${node.formAction}`);
+    } else if (node.formKey !== null && node.formKey !== undefined) {
+      pushInfoRow(rows, 'Formulario', 'sin action declarada');
+    }
+    if (node.disabled === true) pushInfoRow(rows, 'Estado del control', 'deshabilitado');
+    if (node.visible === false) pushInfoRow(rows, 'Estado del control', 'oculto en el DOM');
+    const handlers = (node.handlers ?? []).map((hint) => {
+      const tags = handlerProfileTags(hint.profile ?? null);
+      const suffix = tags.length === 0 ? '' : ` · ${tags.join(' · ')}`;
+      return `${eventLabel(hint.event)} → ${handlerLabel(hint.name, hint.profile ?? null)}${suffix}`;
+    });
+    pushInfoRow(rows, 'Manejadores', handlers.join('\n'));
+    pushInfoRow(rows, 'Eventos', eventSummary(node));
+    const routes = reachableNodeList(node.id).filter((item) => item.type === 'route');
+    pushInfoRow(
+      rows,
+      'Rutas alcanzables',
+      routes
+        .map((route) => [route.method ?? '', route.path ?? route.title].join(' ').trim())
+        .join('\n'),
     );
-    if (table.grid.rows.length > 0) {
-      parts.push(
-        `${String(table.grid.rows.length)} filas observadas · clic en una celda para seguir su recorrido`,
+    pushInfoRow(rows, 'Peticiones alcanzables', reachableRequests(node).join('\n'));
+  }
+  if (table !== null) {
+    pushInfoRow(rows, 'Columnas', String(table.columns.length));
+    pushInfoRow(rows, 'Consultas', String(table.queries.length));
+    pushInfoRow(
+      rows,
+      'Operaciones',
+      [table.read ? 'lecturas' : '', table.write ? 'escrituras' : '']
+        .filter((part) => part !== '')
+        .join(' y '),
+    );
+    pushInfoRow(
+      rows,
+      'Filas observadas',
+      table.grid.rows.length > 0
+        ? `${String(table.grid.rows.length)} · clic en una celda para seguir su recorrido`
+        : null,
+    );
+    pushInfoRow(
+      rows,
+      'Lista de columnas',
+      table.columns.length === 0
+        ? null
+        : table.columns
+            .map((column) => {
+              const tags = usageTags(column).map(usageText).join(' · ');
+              return `${column.name}${tags === '' ? '' : ` · ${tags}`}${
+                column.runtime ? ' · RUNTIME' : ''
+              }`;
+            })
+            .join('\n'),
+    );
+    pushInfoRow(
+      rows,
+      'SQL asociado',
+      table.queries.length === 0 ? null : table.queries.map(tableQueryLine).join('\n'),
+    );
+    pushInfoRow(rows, 'Notas', table.notes.length === 0 ? null : table.notes.join('\n'));
+  }
+  if (node.method !== null && node.path !== null) {
+    pushInfoRow(rows, 'Camino', `${node.method} ${node.path}`);
+  }
+  pushInfoRow(rows, 'URL', node.url ?? null);
+  pushInfoRow(rows, 'Petición', requestSummary(node));
+  const status = requestStatus(node);
+  if (status !== null) {
+    pushInfoRow(rows, 'Estado', status.label);
+    pushInfoRow(rows, 'Ciclo', status.phase);
+    if (node.backendObserved === true) {
+      pushInfoRow(rows, 'Backend', 'ejecución capturada con Node Inspector');
+    } else if (node.backendObserved === false) {
+      pushInfoRow(rows, 'Backend', 'sin evidencia de ejecución');
+    }
+  }
+  pushInfoRow(rows, 'Iniciador', node.initiatorFunction ?? null);
+  pushInfoRow(rows, 'SQL', querySummary(node));
+  pushInfoRow(rows, 'Conexiones', connectionSummary(node));
+  const outgoing = connectionItems(node, 'out');
+  if (outgoing.length > 0) pushInfoRow(rows, 'Sale hacia', outgoing.join('\n'));
+  const incoming = connectionItems(node, 'in');
+  if (incoming.length > 0) pushInfoRow(rows, 'Llega desde', incoming.join('\n'));
+  if ((node.tablesRead ?? []).length > 0) {
+    pushInfoRow(rows, 'Lee', (node.tablesRead ?? []).join('\n'));
+  }
+  if ((node.tablesWritten ?? []).length > 0) {
+    pushInfoRow(rows, 'Escribe', (node.tablesWritten ?? []).join('\n'));
+  }
+  pushInfoRow(rows, 'Motor', node.engine ?? null);
+  pushInfoRow(rows, 'Base de datos', node.database ?? null);
+  pushInfoRow(rows, 'Detalle', node.subtitle);
+  if (node.type === 'element') {
+    pushInfoRow(rows, 'Interacciones', String(Math.max(node.occurrences, eventTotal(node))));
+  } else if (node.countLabel !== null && node.countLabel !== undefined && node.occurrences > 0) {
+    pushInfoRow(rows, node.countLabel, String(node.occurrences));
+  } else if (node.occurrences > 1) {
+    pushInfoRow(rows, 'Repeticiones', String(node.occurrences));
+  }
+  pushInfoRow(
+    rows,
+    'Peticiones',
+    node.requestIds.length > 0 ? String(node.requestIds.length) : null,
+  );
+  pushInfoRow(rows, 'Trazas', node.traceIds.length > 0 ? String(node.traceIds.length) : null);
+  if (node.firstSeen > 0) {
+    pushInfoRow(
+      rows,
+      'Visto',
+      node.firstSeen === node.lastSeen
+        ? clock(node.firstSeen)
+        : `${clock(node.firstSeen)} → ${clock(node.lastSeen)}`,
+    );
+  }
+  pushInfoRow(rows, 'Peso', nodeWeightText(node));
+  pushInfoRow(rows, 'Evidencia', node.evidence.join(' · '));
+  pushInfoRow(rows, 'Nota', node.note);
+
+  const sections: InfoSection[] = [];
+  if (node.sql !== null && node.sql !== undefined && node.sql !== '') {
+    const key = `sql:${node.id}`;
+    sections.push({
+      id: key,
+      label: 'Consulta SQL',
+      text: node.sql,
+      expanded: sectionExpanded.has(key),
+      onToggle: () => {
+        toggleSection(key);
+      },
+    });
+  }
+  if (table !== null) {
+    for (const query of table.queries) {
+      const sql = query.node.sql;
+      if (sql === null || sql === undefined || sql === '') continue;
+      if (query.node.id === node.id) continue;
+      const key = `sql:${query.node.id}`;
+      sections.push({
+        id: key,
+        label: `Consulta SQL · ${tableQueryLine(query)}`,
+        text: sql,
+        expanded: sectionExpanded.has(key),
+        onToggle: () => {
+          toggleSection(key);
+        },
+      });
+    }
+  }
+  for (const movement of jsonMovementsForNode(node)) {
+    if (movement.body === null) continue;
+    const formatted = formatJsonBody(movement);
+    if (formatted === null) continue;
+    sections.push(jsonBodySection(movement, formatted.text));
+  }
+  const code = codeSectionFor(node);
+  if (code !== null) sections.push(code);
+
+  const location = locationText(node);
+  if (node.type === 'request') {
+    const pick = pickRequestDetail(node, null);
+    if (pick.detail === null) {
+      pushInfoRow(rows, 'Contenido', 'sin detalle capturado de esta petición');
+    } else {
+      if (pick.count > 1) {
+        pushInfoRow(rows, 'Peticiones capturadas', `${String(pick.count)} · mostrando la última`);
+      }
+      sections.push(...requestDetailSections(pick.detail, `node:${node.id}`));
+    }
+  }
+  return infoCard({
+    id: `node:${node.id}`,
+    eyebrow: nodeTypeLabel(node),
+    title: node.title,
+    subtitle: node.subtitle ?? '',
+    status: status?.label ?? '',
+    tone: status === null ? 'neutral' : toneFromStatus(status.tone),
+    chips: node.evidence,
+    rows,
+    sections,
+    location:
+      location === null || node.file === null
+        ? null
+        : {
+            label: 'Ubicación',
+            value: location,
+            file: node.file,
+            line: node.line,
+            endLine: node.endLine,
+          },
+  });
+}
+
+function cardForCell(
+  tableId: string,
+  columnName: string,
+  rowIndex: number | null,
+): InfoCardModel | null {
+  const table = tableIndex?.of(tableId);
+  if (table === null || table === undefined) return null;
+  const row = rowIndex === null ? null : (table.grid.rows[rowIndex] ?? null);
+  const gridColumn = table.grid.columns.find(
+    (entry) => entry.name.toLowerCase() === columnName.toLowerCase(),
+  );
+  const value = rowIndex === null ? null : tableCellAt(table, columnName, rowIndex);
+  const query = row?.query ?? null;
+  const rows: InfoRow[] = [];
+  pushInfoRow(rows, 'Tabla', table.name);
+  pushInfoRow(rows, 'Columna', columnName);
+  pushInfoRow(rows, 'Fila', rowIndex === null ? 'columna completa' : String(rowIndex + 1));
+  pushInfoRow(rows, 'Valor', value ?? (rowIndex === null ? null : '·'));
+  if (gridColumn !== undefined) {
+    pushInfoRow(
+      rows,
+      'Uso',
+      gridColumn.tags.length === 0 ? null : gridColumn.tags.map(usageText).join(' · '),
+    );
+  }
+  if (query !== null) {
+    pushInfoRow(rows, 'Consulta', tableQueryLine(query));
+    if (query.functionNode !== null) {
+      const fn = query.functionNode;
+      pushInfoRow(rows, 'Función', fn.title, fn.file, fn.line, fn.endLine);
+    }
+    const result = query.node.result;
+    if (result !== null && result !== undefined) {
+      pushInfoRow(
+        rows,
+        'Ejecución',
+        `${result.driver} · ${clock(result.observedAt)} · ${String(result.rows.length)} ${
+          result.rows.length === 1 ? 'fila' : 'filas'
+        }${result.truncated ? ' · truncada' : ''}`,
       );
     }
   }
-  if (node.file !== null) {
-    const line = node.line === null ? '' : `:${String(node.line)}`;
-    parts.push(`${node.file}${line}`);
+  const sections: InfoSection[] = [];
+  if (
+    query !== null &&
+    query.node.sql !== null &&
+    query.node.sql !== undefined &&
+    query.node.sql !== ''
+  ) {
+    const key = `sql:${query.node.id}`;
+    sections.push({
+      id: key,
+      label: 'Consulta SQL',
+      text: query.node.sql,
+      expanded: sectionExpanded.has(key),
+      onToggle: () => {
+        toggleSection(key);
+      },
+    });
   }
-  const status = requestStatus(node);
-  if (status !== null) {
-    parts.push(`Estado: ${status.phase}`);
-    if (status.detail !== status.phase) parts.push(status.detail);
-  }
-  if (node.countLabel !== null && node.countLabel !== undefined && node.occurrences > 0) {
-    parts.push(`${node.countLabel}: ${String(node.occurrences)}`);
-  }
-  const events = eventSummary(node);
-  if (events !== null) parts.push(`Eventos: ${events}`);
-  if (node.firstSeen > 0) {
-    parts.push(
-      node.firstSeen === node.lastSeen
-        ? `Visto: ${clock(node.firstSeen)}`
-        : `Visto: ${clock(node.firstSeen)} → ${clock(node.lastSeen)}`,
-    );
-  }
-  if (node.note !== null && node.note !== '') parts.push(node.note);
-  return parts.join('\n');
+  return infoCard({
+    id: cellCardId(table.id, columnName, rowIndex),
+    eyebrow: 'Celda SQL',
+    title: `${table.name}.${columnName}`,
+    subtitle: rowIndex === null ? 'Columna completa' : `Fila ${String(rowIndex + 1)}`,
+    chips: query !== null && query.runtime ? ['RUNTIME'] : [],
+    rows,
+    sections,
+    location:
+      query === null || query.node.file === null
+        ? null
+        : {
+            label: 'Ubicación',
+            value: locationText(query.node) ?? query.node.file,
+            file: query.node.file,
+            line: query.node.line,
+            endLine: query.node.endLine,
+          },
+    footer:
+      query === null
+        ? null
+        : {
+            label: `Enfocar SQL · ${truncate(query.node.title, 40)}`,
+            onClick: () => {
+              selectNode(query.node.id);
+              fitToNodes([query.node.id]);
+            },
+          },
+  });
 }
 
-function edgeTooltip(edge: FlowEdge, flowClass: EdgeFlowClass, roundTrip: boolean): string {
-  const parts = [
-    directionLabel(flowClass, roundTrip),
-    `${edge.type} · ${edge.evidence.join(' + ')} · ${
-      edge.correlation === 'direct' ? 'directa' : 'heurística'
-    }`,
-  ];
-  if (edge.occurrences > 1) parts.push(`${String(edge.occurrences)} apariciones`);
-  if (edge.lastSeen > 0) parts.push(`Visto: ${clock(edge.lastSeen)}`);
-  if (edge.note !== null && edge.note !== '') parts.push(edge.note);
-  return parts.join('\n');
+function cardForPlan(plan: EdgePlan): InfoCardModel {
+  const rows: InfoRow[] = [];
+  const target = plan.to === '' ? null : (model?.nodesById.get(plan.to) ?? null);
+  const sources = plan.sources
+    .map((id) => model?.nodesById.get(id))
+    .filter((node): node is FlowNode => node !== undefined);
+  pushInfoRow(
+    rows,
+    'Desde',
+    sources.map((node) => `${nodeTypeLabel(node)} · ${node.title}`).join('\n'),
+  );
+  pushInfoRow(rows, 'Hacia', target === null ? null : `${nodeTypeLabel(target)} · ${target.title}`);
+  const edges =
+    model === null ? [] : model.snapshot.edges.filter((edge) => plan.edgeIds.includes(edge.id));
+  const types = [...new Set(edges.map((edge) => edge.type))];
+  pushInfoRow(rows, 'Relación', types.join(' · '));
+  const evidence = [...new Set(edges.flatMap((edge) => edge.evidence))];
+  pushInfoRow(rows, 'Evidencia', evidence.join(' · '));
+  if (edges.length > 0) {
+    const heuristics = edges.filter((edge) => edge.correlation === 'heuristic').length;
+    pushInfoRow(
+      rows,
+      'Correlación',
+      `${String(edges.length - heuristics)} directas · ${String(heuristics)} heurísticas`,
+    );
+    const occurrences = Math.max(...edges.map((edge) => edge.occurrences), 1);
+    if (occurrences > 1) pushInfoRow(rows, 'Apariciones', String(occurrences));
+    const lastSeen = Math.max(...edges.map((edge) => edge.lastSeen), 0);
+    if (lastSeen > 0) pushInfoRow(rows, 'Visto', clock(lastSeen));
+    pushInfoRow(
+      rows,
+      'Nota',
+      edges
+        .map((edge) => edge.note)
+        .filter((note): note is string => note !== null && note !== '')
+        .join('\n'),
+    );
+  }
+  return infoCard({
+    id: `plan:${plan.id}`,
+    eyebrow: plan.kind === 'trunk' ? 'Corredor' : plan.kind === 'branch' ? 'Rama' : 'Conexión',
+    title: plan.tooltip,
+    subtitle: directionLabel(plan.flowClass, plan.roundTrip),
+    tone:
+      plan.flowClass === 'send' ? 'request' : plan.flowClass === 'receive' ? 'response' : 'neutral',
+    rows,
+    footer:
+      target === null
+        ? null
+        : {
+            label: `Enfocar ${nodeTypeLabel(target)} · ${truncate(target.title, 40)}`,
+            onClick: () => {
+              selectNode(target.id);
+              fitToNodes([target.id]);
+            },
+          },
+  });
+}
+
+function renderSectionBody(text: string): HTMLElement {
+  const body = document.createElement('pre');
+  body.className = 'info-body';
+  body.textContent = text;
+  return body;
+}
+
+interface CodeEditState {
+  loading: boolean;
+  dirty: boolean;
+  conflict: boolean;
+  error: string | null;
+}
+
+function syncCodeSaveBar(wrap: HTMLElement, state: CodeEditState): void {
+  const save = wrap.querySelector('.info-save-run');
+  const reload = wrap.querySelector('.info-save-reload');
+  const overwrite = wrap.querySelector('.info-save-over');
+  const dirty = wrap.querySelector('.info-dirty');
+  const status = wrap.querySelector('.info-edit-status');
+  if (save instanceof HTMLButtonElement) {
+    save.hidden = state.conflict;
+    save.disabled = state.loading || !state.dirty;
+  }
+  if (reload instanceof HTMLElement) reload.hidden = !state.conflict;
+  if (overwrite instanceof HTMLElement) overwrite.hidden = !state.conflict;
+  if (dirty instanceof HTMLElement) dirty.hidden = !state.dirty;
+  if (status instanceof HTMLElement) {
+    status.hidden = state.error === null;
+    status.textContent = state.error ?? '';
+  }
+}
+
+// La tarjeta con el cursor dentro no se reconstruye: se sincroniza en sitio para que llegar
+// el archivo, guardar o recibir evidencia nueva no interrumpa la escritura.
+function syncFocusedCodeEditor(): void {
+  const editor = document.activeElement;
+  if (!(editor instanceof HTMLTextAreaElement) || !editor.classList.contains('info-editor')) return;
+  const path = editor.dataset.codePath;
+  if (path === undefined) return;
+  const wrap = editor.closest('.info-edit');
+  if (!(wrap instanceof HTMLElement)) return;
+  const buffer = codeBuffers.get(path);
+  const loading = buffer === undefined || buffer.loading;
+  editor.readOnly = loading;
+  editor.placeholder = loading ? 'Cargando el archivo completo…' : '';
+  if (!loading && buffer !== undefined && editor.value !== buffer.text) {
+    editor.value = buffer.text;
+  }
+  syncCodeSaveBar(wrap, {
+    loading,
+    dirty: buffer?.dirty ?? false,
+    conflict: buffer?.conflict ?? false,
+    error: buffer?.error ?? null,
+  });
+}
+
+function renderSectionEditor(editable: InfoSectionEditor): HTMLElement {
+  const wrap = document.createElement('div');
+  wrap.className = 'info-edit';
+  const editor = document.createElement('textarea');
+  editor.className = 'info-editor';
+  editor.spellcheck = false;
+  editor.wrap = 'off';
+  editor.value = editable.value;
+  editor.dataset.codePath = editable.path;
+  editor.readOnly = editable.loading;
+  editor.placeholder = editable.loading ? 'Cargando el archivo completo…' : '';
+  editor.setAttribute('aria-label', `Código de ${editable.path}`);
+  const save = document.createElement('button');
+  save.type = 'button';
+  save.className = 'info-save info-save-run';
+  save.textContent = 'Guardar · Ctrl+S';
+  const reload = document.createElement('button');
+  reload.type = 'button';
+  reload.className = 'info-save info-save-reload';
+  reload.textContent = 'Recargar';
+  const overwrite = document.createElement('button');
+  overwrite.type = 'button';
+  overwrite.className = 'info-save info-save-over';
+  overwrite.textContent = 'Guardar encima';
+  const dirty = document.createElement('span');
+  dirty.className = 'info-dirty';
+  dirty.textContent = 'Sin guardar';
+  const status = document.createElement('span');
+  status.className = 'info-edit-status';
+  const sync = (): void => {
+    syncCodeSaveBar(wrap, editable);
+  };
+  save.addEventListener('click', (event) => {
+    event.stopPropagation();
+    editable.onSave();
+  });
+  reload.addEventListener('click', (event) => {
+    event.stopPropagation();
+    editable.onReload();
+  });
+  overwrite.addEventListener('click', (event) => {
+    event.stopPropagation();
+    editable.onOverwrite();
+  });
+  editor.addEventListener('click', (event) => {
+    event.stopPropagation();
+  });
+  editor.addEventListener('input', () => {
+    editable.onInput(editor.value);
+    sync();
+  });
+  const bar = document.createElement('div');
+  bar.className = 'info-savebar';
+  bar.append(save, reload, overwrite, dirty, status);
+  wrap.append(editor, bar);
+  sync();
+  editable.onMount?.(editor);
+  return wrap;
+}
+
+function renderInfoCard(card: InfoCardModel, options: InfoCardOptions): HTMLElement {
+  const root = document.createElement('div');
+  root.className = `info-card is-${options.variant} is-${card.tone}`;
+  if (options.className !== undefined && options.className !== '') {
+    for (const name of options.className.split(' ')) root.classList.add(name);
+  }
+  root.dataset.cardId = card.id;
+
+  const head = document.createElement('div');
+  head.className = 'info-head';
+  const top = document.createElement('div');
+  top.className = 'info-head-top';
+  const expansion = card.expansion;
+  if (expansion !== null && options.variant === 'node') {
+    const expander = document.createElement('button');
+    expander.type = 'button';
+    expander.className = 'info-expander';
+    expander.textContent = expansion.expanded ? '▾' : '▸';
+    expander.title = expansion.expanded ? 'Contraer la tarjeta' : 'Desplegar la tarjeta';
+    expander.setAttribute('aria-expanded', expansion.expanded ? 'true' : 'false');
+    expander.addEventListener('click', (event) => {
+      event.stopPropagation();
+      expansion.onToggle();
+    });
+    top.append(expander);
+    head.classList.add('is-toggleable');
+    head.addEventListener('click', (event) => {
+      event.stopPropagation();
+      expansion.onToggle();
+    });
+  }
+  const eyebrow = document.createElement('span');
+  eyebrow.className = 'info-eyebrow';
+  eyebrow.textContent = card.eyebrow;
+  top.append(eyebrow);
+  if (card.meta !== '') {
+    const meta = document.createElement('span');
+    meta.className = 'info-meta';
+    meta.textContent = card.meta;
+    top.append(meta);
+  }
+  if (card.status !== '') {
+    const status = document.createElement('span');
+    status.className = `info-status is-${card.tone}`;
+    status.textContent = card.status;
+    top.append(status);
+  }
+  head.append(top);
+  const title = document.createElement('div');
+  title.className = 'info-title';
+  title.textContent = card.title;
+  head.append(title);
+  if (card.subtitle !== '') {
+    const subtitle = document.createElement('div');
+    subtitle.className = 'info-sub';
+    subtitle.textContent = card.subtitle;
+    head.append(subtitle);
+  }
+  root.append(head);
+  if (options.collapsed === true) return root;
+
+  if (card.chips.length > 0) {
+    const chips = document.createElement('div');
+    chips.className = 'info-chips';
+    for (const chip of card.chips) {
+      const item = document.createElement('span');
+      item.className = `info-chip is-${chip.toLowerCase()}`;
+      item.textContent = chip;
+      chips.append(item);
+    }
+    root.append(chips);
+  }
+
+  const rows =
+    options.rows === 'body' ? card.rows.filter((row) => row.label === 'Cuerpo') : card.rows;
+  if (rows.length > 0) {
+    const list = document.createElement('div');
+    list.className = 'info-rows';
+    for (const row of rows) {
+      const item = document.createElement('div');
+      item.className = 'info-row';
+      const label = document.createElement('span');
+      label.className = 'info-label';
+      label.textContent = row.label;
+      const value = document.createElement('span');
+      value.className = 'info-value';
+      if (row.file === null) {
+        value.textContent = row.value;
+      } else {
+        value.append(codeLink(row.value, row.file, row.line, row.endLine));
+      }
+      item.append(label, value);
+      list.append(item);
+    }
+    root.append(list);
+  }
+
+  if (card.sections.length > 0) {
+    const sections = document.createElement('div');
+    sections.className = 'info-sections';
+    for (const section of card.sections) {
+      const wrap = document.createElement('div');
+      wrap.className = 'info-section';
+      wrap.classList.toggle('is-open', section.expanded);
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'info-toggle';
+      toggle.setAttribute('aria-expanded', section.expanded ? 'true' : 'false');
+      toggle.title = section.expanded ? `Contraer ${section.label}` : `Ver ${section.label}`;
+      const caret = document.createElement('span');
+      caret.className = 'info-caret';
+      caret.textContent = section.expanded ? '▾' : '▸';
+      const name = document.createElement('span');
+      name.className = 'info-name';
+      name.textContent = section.label;
+      toggle.append(caret, name);
+      toggle.addEventListener('click', (event) => {
+        event.stopPropagation();
+        const open = !wrap.classList.contains('is-open');
+        wrap.classList.toggle('is-open', open);
+        toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+        toggle.title = open ? `Contraer ${section.label}` : `Ver ${section.label}`;
+        caret.textContent = open ? '▾' : '▸';
+        body.hidden = !open;
+        section.onToggle();
+      });
+      const body =
+        section.editable === undefined
+          ? renderSectionBody(section.text)
+          : renderSectionEditor(section.editable);
+      body.hidden = !section.expanded;
+      wrap.append(toggle, body);
+      sections.append(wrap);
+    }
+    root.append(sections);
+  }
+
+  if (card.location !== null) {
+    const location = document.createElement('div');
+    location.className = 'info-location';
+    const label = document.createElement('span');
+    label.className = 'info-label';
+    label.textContent = card.location.label;
+    const value = document.createElement('span');
+    value.className = 'info-value';
+    value.append(
+      codeLink(card.location.value, card.location.file, card.location.line, card.location.endLine),
+    );
+    location.append(label, value);
+    root.append(location);
+  }
+
+  if (card.footer !== null) {
+    const footer = document.createElement('div');
+    footer.className = 'info-footer';
+    const action = document.createElement('button');
+    action.type = 'button';
+    action.className = 'info-action';
+    action.textContent = card.footer.label;
+    action.addEventListener('click', (event) => {
+      event.stopPropagation();
+      card.footer?.onClick();
+    });
+    footer.append(action);
+    root.append(footer);
+  }
+  return root;
+}
+
+const infoProviders = new Map<string, () => InfoCardModel | null>();
+
+function mountInfoCard(
+  card: InfoCardModel,
+  options: InfoCardOptions,
+  provider: () => InfoCardModel | null,
+): HTMLElement {
+  const root = renderInfoCard(card, options);
+  infoProviders.set(card.id, provider);
+  return root;
+}
+
+function nodeInfoProvider(id: string): () => InfoCardModel | null {
+  return () => {
+    const current = model;
+    const node = current?.nodesById.get(id);
+    if (current === null || node === undefined) return null;
+    if (!current.viewNodes.some((entry) => entry.id === id)) return null;
+    return cardForNode(node);
+  };
+}
+
+function jsonCardProvider(id: string): () => InfoCardModel | null {
+  return () => {
+    const movement = findJsonMovement(id);
+    if (movement === null || !jsonMovementVisible(movement)) return null;
+    return cardForJsonMovement(movement);
+  };
+}
+
+function planInfoProvider(id: string): () => InfoCardModel | null {
+  return () => {
+    const plan = planById.get(id);
+    return plan === undefined ? null : cardForPlan(plan);
+  };
+}
+
+function stageInfoProvider(id: string): () => InfoCardModel | null {
+  return () => {
+    const snapshot = state.snapshot;
+    if (snapshot === null) return null;
+    const stage = stackStages(snapshot).find((entry) => entry.id === id);
+    return stage === undefined ? null : cardForStage(stage, snapshot);
+  };
+}
+
+function bindStageInfo(el: Element, id: string): void {
+  el.setAttribute('data-card-id', `stage:${id}`);
+  infoProviders.set(`stage:${id}`, stageInfoProvider(id));
+}
+
+function bindNodeInfo(el: Element, id: string): void {
+  el.setAttribute('data-card-id', `node:${id}`);
+  infoProviders.set(`node:${id}`, nodeInfoProvider(id));
+}
+
+function bindPlanInfo(el: Element, id: string): void {
+  el.setAttribute('data-card-id', `plan:${id}`);
+  infoProviders.set(`plan:${id}`, planInfoProvider(id));
+}
+
+function cellCardId(tableId: string, column: string, rowIndex: number | null): string {
+  return `cell:${tableId}|${column.toLowerCase()}|${rowIndex === null ? '*' : String(rowIndex)}`;
+}
+
+function cellInfoProvider(
+  tableId: string,
+  column: string,
+  rowIndex: number | null,
+): () => InfoCardModel | null {
+  return () => {
+    const current = model;
+    if (current === null) return null;
+    if (!current.viewNodes.some((entry) => entry.id === tableId)) return null;
+    return cardForCell(tableId, column, rowIndex);
+  };
+}
+
+function bindCellInfo(el: Element, tableId: string, column: string, rowIndex: number | null): void {
+  const id = cellCardId(tableId, column, rowIndex);
+  el.setAttribute('data-card-id', id);
+  infoProviders.set(id, cellInfoProvider(tableId, column, rowIndex));
 }
 
 function isInteractedElement(node: FlowNode): boolean {
@@ -689,6 +1927,10 @@ function nodeHeightOf(node: FlowNode): number {
     const height = tableIndex.heightOf(node.id);
     if (height !== null) return compactMode ? TABLE_HEAD : height;
   }
+  if (!compactMode && expandedNodes.has(node.id)) {
+    const measured = expandedHeights.get(node.id);
+    if (measured !== undefined) return measured;
+  }
   return nodeHeight();
 }
 
@@ -709,21 +1951,18 @@ function naturalNodeWidth(node: FlowNode): number {
   }
   const badge = badgeText(node);
   const badgeWidth = badge === '' ? 0 : 8 + textWidth(badge, BADGE_FONT);
-  let required: number;
-  if (compactMode) {
-    required = CARD_TEXT_LEFT + textWidth(node.title, TITLE_FONT) + badgeWidth + CARD_TEXT_RIGHT;
-  } else {
-    const typeWidth = textWidth(nodeTypeLabel(node), TYPE_FONT, TYPE_LETTER_SPACING);
-    const seen = node.firstSeen > 0 ? clock(node.firstSeen) : '';
-    const timeWidth = seen === '' ? 0 : 8 + textWidth(seen, TIME_FONT);
-    const subtitle = node.subtitle ?? '';
-    const subWidth = subtitle === '' ? 0 : textWidth(subtitle, SUB_FONT) + timeWidth;
-    required = Math.max(
-      CARD_TEXT_LEFT + typeWidth + badgeWidth + CARD_TEXT_RIGHT,
-      CARD_TEXT_LEFT + textWidth(node.title, TITLE_FONT) + CARD_TEXT_RIGHT,
-      CARD_TEXT_LEFT + subWidth + CARD_TEXT_RIGHT,
-    );
-  }
+  const weight = nodeWeightLabel(node);
+  const weightWidth = weight === null ? 0 : 8 + textWidth(weight, BADGE_FONT);
+  const typeWidth = textWidth(nodeTypeLabel(node), TYPE_FONT, TYPE_LETTER_SPACING);
+  const seen = node.firstSeen > 0 ? clock(node.firstSeen) : '';
+  const timeWidth = seen === '' ? 0 : 8 + textWidth(seen, TIME_FONT);
+  const subtitle = node.subtitle ?? '';
+  const subWidth = subtitle === '' ? 0 : textWidth(subtitle, SUB_FONT) + timeWidth;
+  const required = Math.max(
+    CARD_TEXT_LEFT + typeWidth + badgeWidth + weightWidth + CARD_TEXT_RIGHT,
+    CARD_TEXT_LEFT + textWidth(node.title, TITLE_FONT) + CARD_TEXT_RIGHT,
+    CARD_TEXT_LEFT + subWidth + CARD_TEXT_RIGHT,
+  );
   return Math.round(clamp(required, CARD_WIDTH_MIN, CARD_WIDTH_MAX));
 }
 
@@ -736,12 +1975,109 @@ function nodeWidthOf(node: FlowNode): number {
   return naturalNodeWidth(node);
 }
 
+function exchangeGapWidth(): number {
+  return (
+    MIDDLEWARE_INSET * 2 +
+    MIDDLEWARE_SIDE_WIDTH * 2 +
+    MIDDLEWARE_MAX_WIDTH +
+    MIDDLEWARE_SIDE_GAP * 2
+  );
+}
+
+// El hueco se decide con la lista ya filtrada, nunca con posiciones colocadas: si dependiera
+// del layout, el layout dependería de sí mismo.
+function exchangeActive(): boolean {
+  if (layoutMode === 'hierarchical' || model === null) return false;
+  let frontend = false;
+  let backend = false;
+  for (const node of model.viewNodes) {
+    if (isFrontendLayerType(node.type)) frontend = true;
+    else backend = true;
+  }
+  if (!frontend || !backend) return false;
+  if (visibleJsonMovements(['request', 'response']).length > 0) return true;
+  return pickedCellText() === null && middlewareRequestNodes().length > 0;
+}
+
 function layoutOptions(): {
   compact: boolean;
   widthOf: (node: FlowNode) => number;
   heightOf: (node: FlowNode) => number;
+  boundaryGap: number;
 } {
-  return { compact: compactMode, widthOf: nodeWidthOf, heightOf: nodeHeightOf };
+  return {
+    compact: compactMode,
+    widthOf: nodeWidthOf,
+    heightOf: nodeHeightOf,
+    boundaryGap: exchangeActive() ? exchangeGapWidth() : LAYER_GAP,
+  };
+}
+
+function computeMiddlewareBand(layout: FlowLayout): MiddlewareBand | null {
+  if (layout.mode === 'hierarchical') return null;
+  let lastFrontend: FlowLayerInfo | null = null;
+  let firstBackend: FlowLayerInfo | null = null;
+  for (const layer of layout.layers) {
+    if (isFrontendLayerType(layer.type)) {
+      lastFrontend = layer;
+    } else if (firstBackend === null) {
+      firstBackend = layer;
+    }
+  }
+  if (lastFrontend === null || firstBackend === null) return null;
+  const gapStart = lastFrontend.x + (lastFrontend.width ?? 0);
+  const gapEnd = firstBackend.x;
+  if (gapEnd - gapStart < MIDDLEWARE_MIN_WIDTH + 48) return null;
+  const width = Math.round(
+    clamp(gapEnd - gapStart - 160, MIDDLEWARE_MIN_WIDTH, MIDDLEWARE_MAX_WIDTH),
+  );
+  // Las tarjetas laterales solo aparecen si el hueco deja sitio a las tres columnas
+  // con la separación actual; si no, queda la banda central sola.
+  const inner = gapEnd - gapStart - MIDDLEWARE_INSET * 2;
+  const room = Math.floor((inner - width - MIDDLEWARE_SIDE_GAP * 2) / 2);
+  const sideWidth = room >= MIDDLEWARE_SIDE_MIN ? Math.min(MIDDLEWARE_SIDE_WIDTH, room) : 0;
+  return {
+    x: Math.round(gapStart + (gapEnd - gapStart - width) / 2),
+    width,
+    gapStart,
+    gapEnd,
+    sideWidth,
+  };
+}
+
+function applyMiddlewareGeometry(): void {
+  if (model === null) return;
+  model.middleware = computeMiddlewareBand(model.layout);
+  model.baseHeight = model.layout.height;
+}
+
+function sectionNodeAlive(rest: string, alive: Set<string>): boolean {
+  let index = rest.indexOf(':');
+  while (index !== -1) {
+    if (alive.has(rest.slice(0, index))) return true;
+    index = rest.indexOf(':', index + 1);
+  }
+  return alive.has(rest);
+}
+
+// Los ids son estables entre revisiones, pero un nodo puede desaparecer: su tarjeta
+// desplegada, su altura medida y sus secciones abiertas no deben sobrevivirle.
+function pruneExpansion(nodesById: Map<string, FlowNode>): void {
+  const alive = new Set(nodesById.keys());
+  for (const id of [...expandedNodes]) {
+    if (alive.has(id)) continue;
+    expandedNodes.delete(id);
+    expandedHeights.delete(id);
+  }
+  for (const id of [...expandedHeights.keys()]) {
+    if (!alive.has(id)) expandedHeights.delete(id);
+  }
+  for (const key of [...sectionExpanded]) {
+    const colon = key.indexOf(':');
+    const prefix = key.slice(0, colon);
+    if (prefix !== 'node' && prefix !== 'sql' && prefix !== 'code') continue;
+    if (!sectionNodeAlive(key.slice(colon + 1), alive)) sectionExpanded.delete(key);
+  }
 }
 
 function prepare(snapshot: FlowSnapshot): void {
@@ -753,6 +2089,7 @@ function prepare(snapshot: FlowSnapshot): void {
   for (const node of snapshot.nodes) {
     nodesById.set(node.id, node);
   }
+  pruneExpansion(nodesById);
   const outgoing = new Map<string, string[]>();
   const incoming = new Map<string, string[]>();
   const neighbors = new Map<string, Set<string>>();
@@ -784,11 +2121,10 @@ function prepare(snapshot: FlowSnapshot): void {
     neighbors,
     traceElements,
     runtimeReachable: computeRuntimeReachable(snapshot),
+    middleware: null,
+    baseHeight: layout.height,
   };
-}
-
-function setFlowCardRequests(ids: readonly string[]): void {
-  currentCardRequests = new Set(ids);
+  applyMiddlewareGeometry();
 }
 
 function worldBounds(): WorldBounds | null {
@@ -898,6 +2234,7 @@ function updateVisibleViews(): void {
   for (const [id, nodeView] of nodeViews) {
     const placed = model.layout.positions.get(id);
     if (placed === undefined || !nodeInBounds(placed, bounds)) {
+      unmountNodeCard(nodeView);
       nodeView.group.remove();
       nodeViews.delete(id);
     }
@@ -911,13 +2248,10 @@ function updateVisibleViews(): void {
     if (!planInBounds(edgeView.plan, bounds)) {
       edgeView.group.remove();
       edgeViews.delete(id);
-      if (hoverKey === `plan:${id}`) {
-        hoverKey = null;
-        hoverText = '';
-        hideTip();
-      }
+      if (hoverCardId === `plan:${id}`) hideTip();
     }
   }
+  correctNodeCardHeights(true);
 }
 
 function applyStrokeWidths(): void {
@@ -941,6 +2275,7 @@ function applyView(): void {
   applyStrokeWidths();
   syncTextVisibility();
   positionAxis();
+  syncOverlayTransforms();
   scheduleViewportUpdate();
 }
 
@@ -950,6 +2285,10 @@ function syncTextVisibility(): void {
   textsHidden = hidden;
   const svg = document.getElementById('map-svg');
   if (svg !== null) svg.classList.toggle('is-zoom-out', hidden);
+  const middleware = document.getElementById('map-middleware');
+  if (middleware !== null) middleware.classList.toggle('is-zoom-out', hidden);
+  const cards = document.getElementById('map-cards');
+  if (cards !== null) cards.classList.toggle('is-zoom-out', hidden);
 }
 
 function fitView(): void {
@@ -1130,6 +2469,37 @@ function renderAxis(): void {
     bar.append(grip);
     axisGrips.push({ el: grip, x: layer.x + (layer.width ?? 0) });
   }
+  if (!hierarchical && model !== null && model.middleware !== null) {
+    const rows = buildMiddlewareRows();
+    const band = model.middleware;
+    const messages = rows.filter((row) => row.movement !== null).length;
+    const label = document.createElement('span');
+    label.className = 'axis-label is-middleware is-mw-json';
+    label.textContent = `⇄ JSON · ${String(messages)}`;
+    label.title = `Middleware JSON · ${String(messages)} mensajes entre el frontend y el backend`;
+    bar.append(label);
+    axisEntries.push({ el: label, x: band.x, width: band.width });
+    if (band.sideWidth > 0) {
+      const requests = document.createElement('span');
+      requests.className = 'axis-label is-middleware is-mw-requests';
+      requests.textContent = `PETICIONES · ${String(rows.length)}`;
+      bar.append(requests);
+      axisEntries.push({
+        el: requests,
+        x: band.gapStart + MIDDLEWARE_INSET,
+        width: band.sideWidth,
+      });
+      const routes = document.createElement('span');
+      routes.className = 'axis-label is-middleware is-mw-routes';
+      routes.textContent = `RUTAS · ${String(rows.length)}`;
+      bar.append(routes);
+      axisEntries.push({
+        el: routes,
+        x: band.gapEnd - MIDDLEWARE_INSET - band.sideWidth,
+        width: band.sideWidth,
+      });
+    }
+  }
   positionAxis();
 }
 
@@ -1141,40 +2511,6 @@ function mergeEvidence(edges: readonly FlowEdge[]): string[] {
     }
   }
   return result;
-}
-
-function lastSeenOf(edges: readonly FlowEdge[]): number {
-  let latest = 0;
-  for (const edge of edges) latest = Math.max(latest, edge.lastSeen);
-  return latest;
-}
-
-function mergedEdgeTooltip(
-  target: FlowNode,
-  edges: readonly FlowEdge[],
-  flowClass: EdgeFlowClass,
-  roundTrip: boolean,
-): string {
-  const kinds = edges.map(
-    (edge) =>
-      `${edge.type}${edge.occurrences > 1 ? ` ×${String(edge.occurrences)}` : ''}${
-        edge.correlation === 'heuristic' ? ' (heurística)' : ''
-      }`,
-  );
-  const parts = [
-    directionLabel(flowClass, roundTrip),
-    `${String(edges.length)} conexiones hacia ${TYPE_LABEL[target.type]} ${target.title}`,
-    kinds.join(' · '),
-  ];
-  const latest = lastSeenOf(edges);
-  if (latest > 0) parts.push(`Visto: ${clock(latest)}`);
-  const notes = [
-    ...new Set(
-      edges.map((edge) => edge.note).filter((note): note is string => note !== null && note !== ''),
-    ),
-  ];
-  if (notes.length > 0) parts.push(notes.join(' · '));
-  return parts.join('\n');
 }
 
 function edgeClassName(
@@ -1337,7 +2673,7 @@ function buildSinglePlan(item: SingleEdgeItem): EdgePlan {
     sources: [edge.from],
     to: edge.to,
     edgeIds: [edge.id],
-    tooltip: edgeTooltip(edge, flowClass, roundTrip),
+    tooltip: directionLabel(flowClass, roundTrip),
     d,
     marker,
     startMarker: roundTrip ? marker : '',
@@ -1398,7 +2734,7 @@ function buildHierarchyPlan(item: SingleEdgeItem): EdgePlan {
     sources: [edge.from],
     to: edge.to,
     edgeIds: [edge.id],
-    tooltip: edgeTooltip(edge, flowClass, roundTrip),
+    tooltip: directionLabel(flowClass, roundTrip),
     d: hierarchyEdgePath(item.source, item.target, anchorY),
     marker,
     startMarker: roundTrip ? marker : '',
@@ -1535,9 +2871,6 @@ function buildCorridorPlans(group: CorridorGroup): EdgePlan[] {
   const originIds = origins.map((origin) => origin.originId);
   const destIds = dests.map((dest) => dest.destId);
   const allIds = [...originIds, ...destIds];
-  const latest = lastSeenOf(allEdges);
-  const destLabel = TYPE_LABEL[firstDest.destNode.type];
-  const originLabel = TYPE_LABEL[firstOrigin.originNode.type];
   const className = edgeClassName(
     trunkEvidence,
     trunkHeuristic,
@@ -1545,24 +2878,10 @@ function buildCorridorPlans(group: CorridorGroup): EdgePlan[] {
     group.flowClass,
     anyRoundTrip,
   );
-  const summaryParts = neutral
-    ? [
-        'Contención agrupada en un solo eje',
-        `${String(origins.length)} orígenes · ${String(dests.length)} destinos · ${String(allEdges.length)} conexiones`,
-      ]
-    : [
-        directionLabel(group.flowClass, anyRoundTrip),
-        `Corredor hacia ${destLabel}`,
-        `${String(origins.length)} orígenes · ${String(dests.length)} destinos · ${String(allEdges.length)} conexiones en un solo eje`,
-      ];
-  if (latest > 0) summaryParts.push(`Visto: ${clock(latest)}`);
-  const summary = summaryParts.join('\n');
-  const railParts = [
-    `${String(origins.length)} ${origins.length === 1 ? 'origen' : 'orígenes'} · ${String(allEdges.length)} conexiones`,
-    `Desde ${originLabel}`,
-  ];
-  if (latest > 0) railParts.push(`Visto: ${clock(latest)}`);
-  const railTooltip = railParts.join('\n');
+  const summary = neutral
+    ? 'Contención agrupada en un solo eje'
+    : directionLabel(group.flowClass, anyRoundTrip);
+  const railTooltip = `${String(origins.length)} ${origins.length === 1 ? 'origen' : 'orígenes'} · ${String(allEdges.length)} conexiones`;
 
   const plans: EdgePlan[] = [];
   const stubs = origins.map(
@@ -1629,8 +2948,7 @@ function buildCorridorPlans(group: CorridorGroup): EdgePlan[] {
     );
   }
   for (const dest of dests) {
-    const first = dest.edges[0];
-    if (first === undefined) continue;
+    if (dest.edges.length === 0) continue;
     const y = dest.ySum / dest.yCount;
     plans.push(
       makePlan({
@@ -1639,10 +2957,7 @@ function buildCorridorPlans(group: CorridorGroup): EdgePlan[] {
         sources: [...dest.originIds],
         to: dest.destId,
         edgeIds: dest.edges.map((edge) => edge.id),
-        tooltip:
-          dest.edges.length === 1
-            ? edgeTooltip(first, group.flowClass, dest.roundTrip)
-            : mergedEdgeTooltip(dest.destNode, dest.edges, group.flowClass, dest.roundTrip),
+        tooltip: directionLabel(group.flowClass, dest.roundTrip),
         d: `M ${String(junctionX)} ${String(y)} L ${String(targetConnX)} ${String(y)}`,
         marker,
         startMarker: dest.roundTrip ? marker : '',
@@ -1763,14 +3078,14 @@ function buildEdgePlans(): EdgePlan[] {
 
 function mountPlan(plan: EdgePlan): void {
   const group = svgElement('g');
+  bindPlanInfo(group, plan.id);
   const attributes: Record<string, string> = {
     class: plan.className,
     d: plan.d,
-    'data-plan-id': plan.id,
   };
   if (plan.marker !== '') attributes['marker-end'] = plan.marker;
   if (plan.startMarker !== '') attributes['marker-start'] = plan.startMarker;
-  group.append(svgElement('path', { class: 'flow-edge-hit', d: plan.d, 'data-plan-id': plan.id }));
+  group.append(svgElement('path', { class: 'flow-edge-hit', d: plan.d }));
   const path = svgElement('path', attributes);
   group.append(path);
   let glyph: SVGTextElement | null = null;
@@ -1789,14 +3104,160 @@ function mountNode(placed: FlowPlacedNode): void {
   if (nodeLayer === null) return;
   const group = createNodeGroup(placed);
   nodeLayer.append(group);
-  const view = { node: placed.node, group };
+  const built = buildNodeCard(placed);
+  if (built !== null) nodeCardWorld()?.append(built.root);
+  const view: NodeView = {
+    node: placed.node,
+    group,
+    card: built?.root ?? null,
+    cardKey: built?.key ?? '',
+  };
   nodeViews.set(placed.node.id, view);
   applyNodeViewState(view);
 }
 
+function nodeCardWorld(): HTMLElement | null {
+  return document.getElementById('map-cards-world');
+}
+
+function nodeCardModel(node: FlowNode): InfoCardModel {
+  const card = cardForNode(node);
+  const weight = nodeWeightLabel(node);
+  const badge = badgeText(node);
+  const meta = [weight ?? '', badge].filter((part) => part !== '').join(' · ');
+  const seen = node.firstSeen > 0 ? clock(node.firstSeen) : '';
+  const subtitle = [node.subtitle ?? '', seen].filter((part) => part !== '').join(' · ');
+  return {
+    ...card,
+    id: `canvas:${node.id}`,
+    subtitle,
+    meta,
+    expansion: {
+      expanded: expandedNodes.has(node.id),
+      onToggle: () => {
+        toggleNodeCard(node.id);
+      },
+    },
+  };
+}
+
+function nodeCardProvider(id: string): () => InfoCardModel | null {
+  return () => {
+    const current = model;
+    const node = current?.nodesById.get(id);
+    if (current === null || node === undefined) return null;
+    if (!current.viewNodes.some((entry) => entry.id === id)) return null;
+    return nodeCardModel(node);
+  };
+}
+
+interface NodeCardBuild {
+  root: HTMLElement;
+  key: string;
+}
+
+// El SVG conserva la geometría y la interacción; la tarjeta HTML solo pinta el contenido.
+// Las tablas se quedan en el SVG: su despliegue es la rejilla SQL con interacción por celda.
+function buildNodeCard(placed: FlowPlacedNode): NodeCardBuild | null {
+  if (compactMode || placed.node.type === 'table') return null;
+  const card = nodeCardModel(placed.node);
+  const expanded = expandedNodes.has(placed.node.id);
+  const root = mountInfoCard(
+    card,
+    {
+      variant: 'node',
+      rows: 'all',
+      collapsed: !expanded,
+      className: expanded ? 'is-expanded' : 'is-collapsed',
+    },
+    nodeCardProvider(placed.node.id),
+  );
+  root.style.left = `${String(placed.x)}px`;
+  root.style.top = `${String(placed.y)}px`;
+  root.style.width = `${String(placed.width)}px`;
+  if (!expanded) root.style.height = `${String(placed.height)}px`;
+  root.addEventListener('click', (event) => {
+    event.stopPropagation();
+    selectNode(placed.node.id);
+  });
+  root.addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    openNodeMenu(placed.node.id, event.clientX, event.clientY);
+  });
+  return { root, key: infoCardSignature(card) };
+}
+
+function unmountNodeCard(view: NodeView): void {
+  if (view.card === null) return;
+  view.card.remove();
+  infoProviders.delete(`canvas:${view.node.id}`);
+  view.card = null;
+  view.cardKey = '';
+}
+
+// Repinta en sitio cuando llega evidencia nueva (detalle de peticiones, secciones abiertas)
+// sin volver a montar el grafo entero.
+function refreshNodeCards(): void {
+  if (compactMode || model === null) return;
+  const active = document.activeElement;
+  const typing = active instanceof HTMLTextAreaElement && active.classList.contains('info-editor');
+  for (const view of nodeViews.values()) {
+    if (view.card === null) continue;
+    if (typing && view.card.contains(active)) continue;
+    const placed = model.layout.positions.get(view.node.id);
+    if (placed === undefined) continue;
+    const card = nodeCardModel(view.node);
+    const key = infoCardSignature(card);
+    if (key === view.cardKey) continue;
+    const built = buildNodeCard(placed);
+    if (built === null) continue;
+    view.card.replaceWith(built.root);
+    view.card = built.root;
+    view.cardKey = built.key;
+    applyNodeViewState(view);
+  }
+  syncFocusedCodeEditor();
+  correctNodeCardHeights();
+}
+
+function measureNodeCards(onlyMissing: boolean): boolean {
+  let changed = false;
+  for (const [id, view] of nodeViews) {
+    if (view.card === null || !expandedNodes.has(id)) continue;
+    if (onlyMissing && expandedHeights.has(id)) continue;
+    const height = Math.ceil(view.card.offsetHeight);
+    if (height <= 0 || expandedHeights.get(id) === height) continue;
+    expandedHeights.set(id, height);
+    changed = true;
+  }
+  return changed;
+}
+
+// El ancho no cambia al desplegar, así que la altura medida es estable: una sola pasada
+// de corrección recoloca el layout con la altura real y no vuelve a entrar.
+function correctNodeCardHeights(onlyMissing = false): void {
+  if (compactMode || cardHeightPass || model === null || !state.open) return;
+  if (!measureNodeCards(onlyMissing)) return;
+  cardHeightPass = true;
+  applyDisplayScope(scopeForView());
+  renderGraph();
+  cardHeightPass = false;
+}
+
+function clearNodeCards(): void {
+  for (const view of nodeViews.values()) unmountNodeCard(view);
+  nodeCardWorld()?.replaceChildren();
+  for (const key of [...infoProviders.keys()]) {
+    if (key.startsWith('canvas:')) infoProviders.delete(key);
+  }
+}
+
 function renderGraph(): void {
+  const focus = captureCodeFocus();
   const svg = svgById('map-svg');
   svg.replaceChildren();
+  clearNodeCards();
   nodeViews = new Map();
   edgeViews = new Map();
   edgePlans = [];
@@ -1810,9 +3271,12 @@ function renderGraph(): void {
   trunkLayer = null;
   nodeLayer = null;
   cellRouteLayer = null;
-  hoverKey = null;
-  hoverText = '';
-  hideTip();
+  if (!tipFrozen) {
+    hoverCardId = null;
+    hoverProvider = null;
+    tipSignature = '';
+    hideTipNow();
+  }
   closeNodeMenu();
   renderAxis();
   if (model === null) return;
@@ -1862,6 +3326,7 @@ function renderGraph(): void {
   planById = new Map(edgePlans.map((plan) => [plan.id, plan]));
   buildSpatialGrids();
   applyFiltersAndSelection();
+  renderMiddleware();
   if (!viewReady) {
     fitView();
   } else {
@@ -1869,6 +3334,10 @@ function renderGraph(): void {
   }
   mountCellRoutes();
   updateVisibleViews();
+  if (state.open) syncJsonRail();
+  refreshFrozenTip();
+  correctNodeCardHeights();
+  restoreCodeFocus(focus);
 }
 
 function createNodeGroup(placed: FlowPlacedNode): SVGGElement {
@@ -1878,11 +3347,11 @@ function createNodeGroup(placed: FlowPlacedNode): SVGGElement {
     transform: `translate(${String(placed.x)} ${String(placed.y)})`,
     'data-node-id': node.id,
   });
+  bindNodeInfo(group, node.id);
   if (node.type === 'element') {
     group.classList.toggle('is-hidden', node.visible === false);
     group.classList.toggle('is-disabled', node.disabled === true);
   }
-  group.classList.toggle('is-compact', compactMode);
   const width = placed.width;
   const height = placed.height;
   if (node.type === 'table') {
@@ -1920,57 +3389,63 @@ function createNodeGroup(placed: FlowPlacedNode): SVGGElement {
       height: String(height),
     }),
   );
+  if (!compactMode) {
+    group.addEventListener('click', (event) => {
+      event.stopPropagation();
+      selectNode(node.id);
+    });
+    group.addEventListener('contextmenu', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openNodeMenu(node.id, event.clientX, event.clientY);
+    });
+    return group;
+  }
   const badge = badgeText(node);
   const badgeWidth = badge === '' ? 0 : 8 + textWidth(badge, BADGE_FONT);
-  if (compactMode) {
-    const middle = height / 2 + 4;
-    const titleMax = width - CARD_TEXT_LEFT - CARD_TEXT_RIGHT - badgeWidth;
-    group.append(
-      svgText('title', CARD_TEXT_LEFT, middle, truncateToWidth(node.title, titleMax, TITLE_FONT)),
-    );
-    if (badge !== '') {
-      group.append(svgText('badge', width - CARD_TEXT_RIGHT, middle, badge));
-    }
-  } else {
-    const typeMax = width - CARD_TEXT_LEFT - CARD_TEXT_RIGHT - badgeWidth;
+  const weight = nodeWeightLabel(node);
+  const weightWidth = weight === null ? 0 : 8 + textWidth(weight, BADGE_FONT);
+  const typeMax = width - CARD_TEXT_LEFT - CARD_TEXT_RIGHT - badgeWidth - weightWidth;
+  group.append(
+    svgText(
+      'type',
+      CARD_TEXT_LEFT,
+      14,
+      truncateToWidth(nodeTypeLabel(node), typeMax, TYPE_FONT, TYPE_LETTER_SPACING),
+    ),
+  );
+  if (weight !== null) {
+    group.append(svgText('weight', width - CARD_TEXT_RIGHT - badgeWidth, 14, weight));
+  }
+  if (badge !== '') {
+    group.append(svgText('badge', width - CARD_TEXT_RIGHT, 14, badge));
+  }
+  const seen = node.firstSeen > 0 ? clock(node.firstSeen) : '';
+  const timeWidth = seen === '' ? 0 : 8 + textWidth(seen, TIME_FONT);
+  group.append(
+    svgText(
+      'title',
+      CARD_TEXT_LEFT,
+      28,
+      truncateToWidth(node.title, width - CARD_TEXT_LEFT - CARD_TEXT_RIGHT, TITLE_FONT),
+    ),
+  );
+  if (node.subtitle !== null && node.subtitle !== '') {
     group.append(
       svgText(
-        'type',
+        'sub',
         CARD_TEXT_LEFT,
-        14,
-        truncateToWidth(nodeTypeLabel(node), typeMax, TYPE_FONT, TYPE_LETTER_SPACING),
-      ),
-    );
-    if (badge !== '') {
-      group.append(svgText('badge', width - CARD_TEXT_RIGHT, 14, badge));
-    }
-    const seen = node.firstSeen > 0 ? clock(node.firstSeen) : '';
-    const timeWidth = seen === '' ? 0 : 8 + textWidth(seen, TIME_FONT);
-    group.append(
-      svgText(
-        'title',
-        CARD_TEXT_LEFT,
-        28,
-        truncateToWidth(node.title, width - CARD_TEXT_LEFT - CARD_TEXT_RIGHT, TITLE_FONT),
-      ),
-    );
-    if (node.subtitle !== null && node.subtitle !== '') {
-      group.append(
-        svgText(
-          'sub',
-          CARD_TEXT_LEFT,
-          41,
-          truncateToWidth(
-            node.subtitle,
-            width - CARD_TEXT_LEFT - CARD_TEXT_RIGHT - timeWidth,
-            SUB_FONT,
-          ),
+        41,
+        truncateToWidth(
+          node.subtitle,
+          width - CARD_TEXT_LEFT - CARD_TEXT_RIGHT - timeWidth,
+          SUB_FONT,
         ),
-      );
-    }
-    if (seen !== '') {
-      group.append(svgText('time', width - CARD_TEXT_RIGHT, 41, seen));
-    }
+      ),
+    );
+  }
+  if (seen !== '') {
+    group.append(svgText('time', width - CARD_TEXT_RIGHT, 41, seen));
   }
   group.addEventListener('click', (event) => {
     event.stopPropagation();
@@ -1999,23 +3474,6 @@ function columnUsageSummary(table: FlowTableData, columnName: string): string {
     (entry) => entry.name.toLowerCase() === columnName.toLowerCase(),
   );
   return column === undefined ? '' : usageTags(column).map(usageText).join(' · ');
-}
-
-function cellTooltip(table: FlowTableData, plan: TableGridColumnPlan, rowIndex: number): string {
-  const value = tableCellAt(table, plan.name, rowIndex) ?? '·';
-  const row = table.grid.rows[rowIndex];
-  const query = row?.query.node;
-  const tags = row?.cells[table.grid.columns.indexOf(plan)]?.tags ?? [];
-  const parts = [`${table.name}.${plan.name} · fila ${String(rowIndex + 1)}`, `Valor: ${value}`];
-  if (tags.length > 0) parts.push(tags.map(usageText).join(' · '));
-  if (query !== undefined) {
-    parts.push(
-      `${query.operation === null || query.operation === undefined ? 'SQL' : (OPERATION_LABEL[query.operation] ?? query.operation)} · ${
-        row?.query.functionNode?.title ?? 'consulta directa'
-      }`,
-    );
-  }
-  return parts.join('\n');
 }
 
 interface CellRoutePlan {
@@ -2231,6 +3689,7 @@ function selectTableCell(tableId: string, columnName: string, rowIndex: number |
   startCellFlash(table, columnName, rowIndex);
   renderDetail(node);
   renderGraph();
+  syncJsonRail();
   renderStatus();
   highlightCell(table, columnName, rowIndex);
 }
@@ -2512,9 +3971,9 @@ function createTableNodeGroup(
           width: String(plan.width),
           height: String(grid.rowHeight),
         });
-        cellHit.setAttribute('data-cell-tip', cellTooltip(table, plan, rowIndex));
         cellHit.addEventListener('click', select);
         cellHit.addEventListener('contextmenu', openMenu);
+        bindCellInfo(cellHit, table.id, plan.name, rowIndex);
         columnGroup.append(cellHit);
       });
       gridLayer.append(columnGroup);
@@ -2611,15 +4070,32 @@ function trafficScope(): Set<string> | null {
   return model.runtimeReachable;
 }
 
-function scopeForView(): Set<string> | null {
-  const base = focusScope ?? trafficScope();
-  if (!eventOnly || eventFilter === null) return base;
-  const events = eventSubgraph(eventFilter);
-  if (base === null) return events;
+function intersectScope(base: Set<string> | null, other: Set<string>): Set<string> {
+  if (base === null) return other;
   const scope = new Set<string>();
-  for (const id of events) {
+  for (const id of other) {
     if (base.has(id)) scope.add(id);
   }
+  return scope;
+}
+
+// Misma evidencia que «Ver interacciones», pero para todas las peticiones con ese estado.
+function statusScope(): Set<string> | null {
+  const key = statusFilter;
+  if (key === null || model === null) return null;
+  const scope = new Set<string>();
+  for (const node of model.snapshot.nodes) {
+    if (!statusFilterKeys(node).includes(key)) continue;
+    for (const id of involvedScope(node.id, 'both')) scope.add(id);
+  }
+  return scope;
+}
+
+function scopeForView(): Set<string> | null {
+  let scope = focusScope ?? trafficScope();
+  const statuses = statusScope();
+  if (statuses !== null) scope = intersectScope(scope, statuses);
+  if (eventOnly && eventFilter !== null) scope = intersectScope(scope, eventSubgraph(eventFilter));
   return scope;
 }
 
@@ -2795,6 +4271,51 @@ function setCompactMode(next: boolean): void {
   renderStatus();
 }
 
+function toggleNodeCard(id: string): void {
+  if (expandedNodes.has(id)) {
+    expandedNodes.delete(id);
+    expandedHeights.delete(id);
+  } else {
+    expandedNodes.add(id);
+  }
+  if (!state.open || model === null) return;
+  applyDisplayScope(scopeForView());
+  renderGraph();
+  renderStatus();
+}
+
+function sectionKey(prefixes: readonly string[]): string {
+  return [...sectionExpanded]
+    .filter((key) => prefixes.some((prefix) => key.startsWith(prefix)))
+    .sort()
+    .join(',');
+}
+
+// Una sola ruta de expansión para todas las superficies. El prefijo de la clave decide
+// qué vistas se repintan: abrir el SQL de un nodo no vuelve a montar la fila de intercambio.
+function toggleSection(key: string): void {
+  if (sectionExpanded.has(key)) {
+    sectionExpanded.delete(key);
+  } else {
+    sectionExpanded.add(key);
+  }
+  const json = key.startsWith('json:');
+  const exchange = json || key.startsWith('req:') || key.startsWith('route:');
+  const canvas =
+    json || key.startsWith('node:') || key.startsWith('sql:') || key.startsWith('code:');
+  if (json) jsonRailSignature = '';
+  if (exchange) middlewareSignature = '';
+  if (!state.open) return;
+  if (json) syncJsonRail();
+  if (exchange) renderMiddleware();
+  if (canvas) refreshNodeCards();
+  if (selectedId !== null && model !== null) {
+    const node = model.nodesById.get(selectedId);
+    if (node !== undefined) renderDetail(node);
+  }
+  refreshFrozenTip();
+}
+
 function scheduleColumnRelayout(): void {
   if (columnFrame !== 0) return;
   columnFrame = requestAnimationFrame(() => {
@@ -2868,7 +4389,18 @@ function setTrafficMode(mode: TrafficMode): void {
   renderStatus();
 }
 
-function applyNodeViewState(view: { node: FlowNode; group: SVGGElement }): void {
+function setStatusFilter(key: string | null): void {
+  if (statusFilter === key) return;
+  statusFilter = key;
+  hideSearchResults();
+  if (!state.open || model === null) {
+    renderStatus();
+    return;
+  }
+  scheduleScopeApply();
+}
+
+function applyNodeViewState(view: NodeView): void {
   const isSelected = selectedId === view.node.id;
   const inChain =
     selectionHighlight &&
@@ -2880,6 +4412,10 @@ function applyNodeViewState(view: { node: FlowNode; group: SVGGElement }): void 
   view.group.classList.toggle('is-selected', isSelected);
   view.group.classList.toggle('is-chain', inChain);
   view.group.classList.toggle('is-dimmed', !visibleNode || selectionDim);
+  if (view.card !== null) {
+    view.card.classList.toggle('is-selected', isSelected);
+    view.card.classList.toggle('is-dimmed', !visibleNode || selectionDim);
+  }
 }
 
 function applyPlanViewState(view: EdgeView): void {
@@ -2934,24 +4470,6 @@ function applyFiltersAndSelection(): void {
   }
 }
 
-function addRow(container: HTMLElement, label: string, value: string | HTMLElement | null): void {
-  if (value === null || value === '') return;
-  const row = document.createElement('div');
-  row.className = 'row';
-  const key = document.createElement('div');
-  key.className = 'label';
-  key.textContent = label;
-  const text = document.createElement('div');
-  text.className = 'value';
-  if (typeof value === 'string') {
-    text.textContent = value;
-  } else {
-    text.append(value);
-  }
-  row.append(key, text);
-  container.append(row);
-}
-
 function locationText(node: FlowNode): string | null {
   if (node.file === null) return null;
   if (node.line === null) return node.file;
@@ -2986,77 +4504,27 @@ function querySummary(node: FlowNode): string | null {
   return parts.length === 0 ? null : parts.join(' · ');
 }
 
-function jsonMovementHead(movement: FlowJsonMovement): string {
-  const where =
-    movement.method !== null && movement.path !== null
-      ? ` · ${movement.method} ${movement.path}`
-      : '';
-  const status = movement.status === null ? '' : ` · ${String(movement.status)}`;
-  const count = movement.count > 1 ? ` · ${String(movement.count)}×` : '';
-  const cut = movement.truncated ? ' · recortado' : '';
-  return `${clock(movement.at)} · ${JSON_KIND_LABEL[movement.kind]}${where}${status}${count}${cut}`;
-}
-
-const jsonExpandedBodies = new Set<string>();
-
-function jsonMovementItem(movement: FlowJsonMovement): HTMLElement {
-  const item = document.createElement('div');
-  item.className = 'json-item';
-  const head = document.createElement('div');
-  head.className = 'json-head';
-  head.textContent = jsonMovementHead(movement);
-  item.append(head);
-  if (movement.body !== null) {
-    const expanded = jsonExpandedBodies.has(movement.id);
-    const body = document.createElement('div');
-    body.className = 'json-body';
-    body.textContent = expanded
-      ? movement.body
-      : jsonPreviewBody(movement.body, JSON_DETAIL_PREVIEW_CHARS);
-    item.append(body);
-    if (!expanded && movement.body.length > JSON_DETAIL_PREVIEW_CHARS) {
-      const more = document.createElement('div');
-      more.className = 'json-more';
-      more.textContent = 'Ver cuerpo completo';
-      more.addEventListener('click', () => {
-        jsonExpandedBodies.add(movement.id);
-        body.textContent = movement.body ?? '';
-        more.remove();
-      });
-      item.append(more);
-    }
-  }
-  if (movement.file !== null) {
-    const where = movement.line > 0 ? `${movement.file}:${String(movement.line)}` : movement.file;
-    const location = document.createElement('div');
-    location.className = 'json-where';
-    location.append(codeLink(where, movement.file, movement.line, null));
-    item.append(location);
-  }
-  return item;
-}
-
 let jsonMovementsLive: readonly FlowJsonMovement[] = [];
 let jsonCaptureLive: FlowJsonCaptureState | null = null;
 let jsonCaptureLiveSet = false;
 let jsonRailSignature = '';
 const jsonMovementBodies = new Map<string, string>();
+const jsonFormattedBodies = new Map<string, { source: string; text: string | null }>();
+let jsonMovementIndex = new Map<string, FlowJsonMovement>();
+let jsonMovementIndexDirty = true;
 
 let jsonOwnerCache = new Map<string, string | null>();
 let jsonMovementOwnerIndex = new Map<string, string>();
 let jsonFunctionsByFile = new Map<string, FlowNode[]>();
 let jsonRequests: FlowNode[] = [];
 let jsonRoutes: FlowNode[] = [];
+let jsonRouteByHandler = new Map<string, string>();
+let jsonRequestByRoute = new Map<string, string>();
+let jsonRouteByRequest = new Map<string, string>();
 
-interface JsonRailEntry {
-  el: HTMLDivElement;
-  head: HTMLDivElement;
-  body: HTMLDivElement | null;
-  bodySource: string | null;
-  movement: FlowJsonMovement;
-}
-
-const jsonRailEntries = new Map<string, JsonRailEntry>();
+const requestDetails = new Map<string, FlowRequestDetail>();
+const requestBodies = new Map<string, CapturedBody>();
+let middlewareRowViews: MiddlewareRowView[] = [];
 
 function stripQuery(value: string): string {
   const index = value.indexOf('?');
@@ -3085,6 +4553,16 @@ function indexJsonOwners(snapshot: FlowSnapshot): void {
   jsonFunctionsByFile = new Map();
   jsonRequests = [];
   jsonRoutes = [];
+  jsonRouteByHandler = new Map();
+  jsonRequestByRoute = new Map();
+  jsonRouteByRequest = new Map();
+  for (const edge of snapshot.edges) {
+    if (edge.type === 'HANDLES') jsonRouteByHandler.set(edge.to, edge.from);
+    else if (edge.type === 'MATCHES') {
+      jsonRequestByRoute.set(edge.to, edge.from);
+      jsonRouteByRequest.set(edge.from, edge.to);
+    }
+  }
   for (const node of snapshot.nodes) {
     if (node.type === 'function' && node.file !== null) {
       const list = jsonFunctionsByFile.get(node.file) ?? [];
@@ -3139,25 +4617,170 @@ function jsonOwnerNode(movement: FlowJsonMovement): FlowNode | null {
   return id === null ? null : (model.nodesById.get(id) ?? null);
 }
 
-function jsonMovementsForNode(node: FlowNode): FlowJsonMovement[] {
-  const source = jsonMovementsLive.length === 0 ? (node.jsonMovements ?? []) : jsonMovementsLive;
-  const indexed = new Set((node.jsonMovements ?? []).map((movement) => movement.id));
-  const list = source.filter(
-    (movement) => indexed.has(movement.id) || jsonOwnerNode(movement)?.id === node.id,
-  );
-  return [...list].sort((left, right) => right.at - left.at);
+function allJsonMovements(): readonly FlowJsonMovement[] {
+  if (jsonMovementsLive.length > 0) return jsonMovementsLive;
+  return model?.snapshot.nodes.flatMap((node) => node.jsonMovements ?? []) ?? [];
 }
 
-function jsonPreviewBody(body: string, limit = JSON_RAIL_PREVIEW_CHARS): string {
-  if (body.length <= limit) return body;
-  return `${body.slice(0, limit)}…`;
+function findJsonMovement(id: string): FlowJsonMovement | null {
+  if (jsonMovementIndexDirty) {
+    jsonMovementIndex = new Map();
+    for (const movement of allJsonMovements()) jsonMovementIndex.set(movement.id, movement);
+    jsonMovementIndexDirty = false;
+  }
+  return jsonMovementIndex.get(id) ?? null;
+}
+
+function jsonBodyMatchesCell(movement: FlowJsonMovement, cellValue: string): boolean {
+  if (movement.body === null) return false;
+  const trimmed = movement.body.trim();
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    return formatJsonBody(movement) !== null;
+  }
+  return movement.body.includes(cellValue);
+}
+
+function jsonMovementVisible(movement: FlowJsonMovement): boolean {
+  const cellValue = pickedCellText();
+  if (cellValue !== null && !jsonBodyMatchesCell(movement, cellValue)) return false;
+  const scope = scopeForView();
+  if (scope === null) return true;
+  const owner = jsonOwnerNode(movement);
+  if (owner !== null) return scope.has(owner.id);
+  const endpoints = middlewareEndpoints(movement);
+  return (
+    (endpoints.frontend !== null && scope.has(endpoints.frontend.id)) ||
+    (endpoints.backend !== null && scope.has(endpoints.backend.id))
+  );
+}
+
+function visibleJsonMovements(kinds?: readonly FlowJsonMovement['kind'][]): FlowJsonMovement[] {
+  return allJsonMovements().filter(
+    (movement) =>
+      (kinds === undefined || kinds.includes(movement.kind)) && jsonMovementVisible(movement),
+  );
+}
+
+function jsonMovementsForNode(node: FlowNode): FlowJsonMovement[] {
+  const indexed = new Set((node.jsonMovements ?? []).map((movement) => movement.id));
+  const cellValue = pickedCellText();
+  const list = allJsonMovements().filter(
+    (movement) => indexed.has(movement.id) || jsonOwnerNode(movement)?.id === node.id,
+  );
+  return list
+    .filter((movement) => cellValue === null || jsonBodyMatchesCell(movement, cellValue))
+    .sort((left, right) => right.at - left.at);
+}
+
+function pickedCellText(): string | null {
+  if (pickedCell === null || pickedCell.rowIndex === null || tableIndex === null) return null;
+  const table = tableIndex.of(pickedCell.tableId);
+  if (table === null) return null;
+  const value = tableCellAt(table, pickedCell.column, pickedCell.rowIndex);
+  if (value === null) return null;
+  const trimmed = value.trim();
+  return trimmed === '' || trimmed === '·' ? null : trimmed;
+}
+
+const JSON_NO_MATCH = Symbol('json-no-match');
+
+function jsonScalarMatches(value: unknown, target: string): boolean {
+  if (value === null) return target.toLowerCase() === 'null';
+  if (typeof value === 'boolean') return String(value) === target.toLowerCase();
+  if (typeof value === 'number') {
+    if (String(value) === target) return true;
+    const numeric = Number(target);
+    return Number.isFinite(numeric) && value === numeric;
+  }
+  if (typeof value !== 'string') return false;
+  const text = value.trim();
+  if (text === target) return true;
+  if (text === '' || !/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(text)) return false;
+  const numeric = Number(target);
+  return Number.isFinite(numeric) && Number(text) === numeric;
+}
+
+// Conserva solo las ramas del JSON que contienen el valor de la celda; los
+// ancestros se mantienen para que la ruta siga siendo legible.
+function pruneJsonToValue(
+  value: unknown,
+  target: string,
+  depth: number,
+): unknown | typeof JSON_NO_MATCH {
+  if (depth > 64) return JSON_NO_MATCH;
+  if (Array.isArray(value)) {
+    const kept: unknown[] = [];
+    for (const item of value) {
+      const pruned = pruneJsonToValue(item, target, depth + 1);
+      if (pruned !== JSON_NO_MATCH) kept.push(pruned);
+    }
+    return kept.length === 0 ? JSON_NO_MATCH : kept;
+  }
+  if (value !== null && typeof value === 'object') {
+    const kept: Record<string, unknown> = {};
+    let count = 0;
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      const pruned = pruneJsonToValue(item, target, depth + 1);
+      if (pruned === JSON_NO_MATCH) continue;
+      kept[key] = pruned;
+      count += 1;
+    }
+    return count === 0 ? JSON_NO_MATCH : kept;
+  }
+  return jsonScalarMatches(value, target) ? value : JSON_NO_MATCH;
+}
+
+function formatJsonBody(movement: FlowJsonMovement): { text: string } | null {
+  return formatJsonText(movement.id, movement.body);
+}
+
+function formatJsonText(cacheId: string, body: string | null): { text: string } | null {
+  if (body === null) return null;
+  const cellValue = pickedCellText();
+  const cacheKey = cellValue === null ? cacheId : `${cacheId}\u0000${cellValue}`;
+  const cached = jsonFormattedBodies.get(cacheKey);
+  if (cached !== undefined && cached.source === body) {
+    return cached.text === null ? null : { text: cached.text };
+  }
+  let text: string | null = body;
+  const trimmed = body.trim();
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (cellValue === null) {
+        text = JSON.stringify(parsed, null, 2);
+      } else {
+        const pruned = pruneJsonToValue(parsed, cellValue, 0);
+        text = pruned === JSON_NO_MATCH ? null : JSON.stringify(pruned, null, 2);
+      }
+    } catch {
+      text = body;
+    }
+  }
+  jsonFormattedBodies.set(cacheKey, { source: body, text });
+  if (jsonFormattedBodies.size > 256) {
+    const oldest = jsonFormattedBodies.keys().next();
+    if (!oldest.done) jsonFormattedBodies.delete(oldest.value);
+  }
+  return text === null ? null : { text };
+}
+
+function jsonScopeKey(): string {
+  const scope = scopeForView();
+  return scope === null ? '' : [...scope].sort().join(',');
+}
+
+function jsonExpansionKey(movements: readonly FlowJsonMovement[]): string {
+  return movements
+    .map((movement) => (sectionExpanded.has(`json:${movement.id}`) ? '1' : '0'))
+    .join('');
 }
 
 function syncJsonRail(): void {
   const capture = jsonCaptureLiveSet ? jsonCaptureLive : (state.jsonCapture ?? null);
   const captureKey = capture === null ? '' : `${String(capture.ok)}|${capture.error ?? ''}`;
-  const sorted = [...jsonMovementsLive].sort((left, right) => right.at - left.at);
-  const signature = `${signatureOf(sorted)}#${captureKey}`;
+  const sorted = visibleJsonMovements().sort((left, right) => right.at - left.at);
+  const signature = `${signatureOf(sorted)}#${captureKey}#${pickedCellText() ?? ''}#${jsonScopeKey()}#${jsonExpansionKey(sorted)}`;
   if (signature === jsonRailSignature) return;
   jsonRailSignature = signature;
   renderJsonRail(sorted, capture);
@@ -3175,6 +4798,24 @@ function signatureOf(movements: readonly FlowJsonMovement[]): string {
   return parts.join('|');
 }
 
+function jsonEmptyMessage(
+  capture: FlowJsonCaptureState | null,
+  surface: 'rail' | 'middleware',
+): string {
+  if (capture !== null && !capture.ok) {
+    return capture.error ?? 'La captura JSON no está disponible.';
+  }
+  const cellValue = pickedCellText();
+  if (cellValue !== null) return `Ningún cuerpo JSON contiene «${cellValue}».`;
+  if (scopeForView() !== null) return 'No hay cuerpos JSON en el alcance actual.';
+  if (surface === 'rail') {
+    return capture === null
+      ? 'Conecta el backend con Node Inspector para capturar JSON.'
+      : 'La captura está activa; aún no hay cuerpos JSON en el backend.';
+  }
+  return 'Aún no hay cuerpos JSON de petición o respuesta en tránsito.';
+}
+
 function renderJsonRail(
   movements: readonly FlowJsonMovement[],
   capture: FlowJsonCaptureState | null,
@@ -3182,94 +4823,24 @@ function renderJsonRail(
   const title = element('map-json-title');
   const list = element('map-json-list');
   title.textContent = `Movimientos JSON · ${String(movements.length)}`;
+  list.replaceChildren();
   if (movements.length === 0) {
-    jsonRailEntries.clear();
-    list.replaceChildren();
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.textContent =
-      capture !== null
-        ? capture.ok
-          ? 'La captura está activa; aún no hay cuerpos JSON en el backend.'
-          : (capture.error ?? 'La captura JSON no está disponible.')
-        : 'Conecta el backend con Node Inspector para capturar JSON.';
+    empty.textContent = jsonEmptyMessage(capture, 'rail');
     list.append(empty);
     return;
   }
-  const empty = list.firstElementChild;
-  if (empty !== null && empty.classList.contains('empty')) empty.remove();
-
-  const seen = new Set<string>();
-  let cursor: Element | null = list.firstElementChild;
   for (const movement of movements) {
-    seen.add(movement.id);
-    let entry = jsonRailEntries.get(movement.id);
-    if (entry === undefined) {
-      entry = createJsonRailEntry(movement);
-      jsonRailEntries.set(movement.id, entry);
-    } else {
-      updateJsonRailEntry(entry, movement);
-    }
-    if (cursor !== entry.el) list.insertBefore(entry.el, cursor);
-    cursor = entry.el.nextElementSibling;
+    const card = cardForJsonMovement(movement);
+    list.append(
+      mountInfoCard(
+        card,
+        { variant: 'rail', rows: 'all', className: 'json-item' },
+        jsonCardProvider(movement.id),
+      ),
+    );
   }
-  for (const [id, entry] of jsonRailEntries) {
-    if (seen.has(id)) continue;
-    entry.el.remove();
-    jsonRailEntries.delete(id);
-  }
-}
-
-function createJsonRailEntry(movement: FlowJsonMovement): JsonRailEntry {
-  const item = document.createElement('div');
-  item.className = 'json-item is-preview';
-  const head = document.createElement('div');
-  head.className = 'json-head is-link';
-  head.setAttribute('title', 'Clic para enfocar el nodo asociado');
-  head.textContent = jsonMovementHead(movement);
-  item.append(head);
-  const entry: JsonRailEntry = {
-    el: item,
-    head,
-    body: null,
-    bodySource: null,
-    movement,
-  };
-  if (movement.body !== null) {
-    const body = document.createElement('div');
-    body.className = 'json-body is-preview';
-    body.textContent = jsonPreviewBody(movement.body);
-    entry.body = body;
-    entry.bodySource = movement.body;
-    item.append(body);
-  }
-  head.addEventListener('click', () => {
-    const owner = jsonOwnerNode(entry.movement);
-    if (owner === null) return;
-    selectNode(owner.id);
-    fitToNodes([owner.id]);
-  });
-  return entry;
-}
-
-function updateJsonRailEntry(entry: JsonRailEntry, movement: FlowJsonMovement): void {
-  entry.movement = movement;
-  const head = jsonMovementHead(movement);
-  if (entry.head.textContent !== head) entry.head.textContent = head;
-  if (movement.body === entry.bodySource) return;
-  entry.bodySource = movement.body;
-  if (movement.body === null) {
-    entry.body?.remove();
-    entry.body = null;
-    return;
-  }
-  if (entry.body === null) {
-    const body = document.createElement('div');
-    body.className = 'json-body is-preview';
-    entry.body = body;
-    entry.el.append(body);
-  }
-  entry.body.textContent = jsonPreviewBody(movement.body);
 }
 
 function applyFlowJsonState(next: FlowJsonState): void {
@@ -3290,9 +4861,1061 @@ function applyFlowJsonState(next: FlowJsonState): void {
   for (const id of jsonMovementBodies.keys()) {
     if (!alive.has(id)) jsonMovementBodies.delete(id);
   }
+  for (const key of jsonFormattedBodies.keys()) {
+    const id = key.split('\u0000')[0] ?? key;
+    if (!alive.has(id)) jsonFormattedBodies.delete(key);
+  }
   jsonMovementsLive = movements;
+  jsonMovementIndexDirty = true;
+  jsonRailSignature = '';
+  middlewareSignature = '';
   renderStatus();
-  if (state.open) syncJsonRail();
+  if (state.open) {
+    syncJsonRail();
+    renderMiddleware();
+    refreshFrozenTip();
+  }
+}
+
+function rehydrateRequestBody(
+  key: string,
+  body: CapturedBody | null,
+  omitted: boolean | undefined,
+): CapturedBody | null {
+  if (omitted === true) return requestBodies.get(key) ?? null;
+  if (body !== null) requestBodies.set(key, body);
+  return body;
+}
+
+function applyFlowRequestState(next: FlowRequestState): void {
+  const alive = new Set<string>();
+  requestDetails.clear();
+  for (const request of next.requests) {
+    alive.add(request.id);
+    requestDetails.set(request.id, {
+      ...request,
+      requestBody: rehydrateRequestBody(
+        `${request.id}:request`,
+        request.requestBody,
+        request.requestBodyOmitted,
+      ),
+      responseBody: rehydrateRequestBody(
+        `${request.id}:response`,
+        request.responseBody,
+        request.responseBodyOmitted,
+      ),
+      requestBodyOmitted: false,
+      responseBodyOmitted: false,
+    });
+  }
+  for (const key of requestBodies.keys()) {
+    const id = key.slice(0, key.lastIndexOf(':'));
+    if (!alive.has(id)) requestBodies.delete(key);
+  }
+  for (const key of jsonFormattedBodies.keys()) {
+    const base = key.split('\u0000')[0] ?? key;
+    if (!base.startsWith('body:')) continue;
+    const rest = base.slice(5);
+    if (!alive.has(rest.slice(0, rest.lastIndexOf(':')))) jsonFormattedBodies.delete(key);
+  }
+  middlewareSignature = '';
+  if (!state.open) return;
+  renderMiddleware();
+  refreshNodeCards();
+  if (selectedId !== null && model !== null) {
+    const node = model.nodesById.get(selectedId);
+    if (node !== undefined && node.type === 'request') renderDetail(node);
+  }
+  refreshFrozenTip();
+}
+
+function headersText(headers: Record<string, string>): string | null {
+  const entries = Object.entries(headers);
+  if (entries.length === 0) return null;
+  return entries.map(([name, value]) => `${name}: ${value}`).join('\n');
+}
+
+function initiatorText(initiator: FlowRequestDetail['initiator']): string | null {
+  if (initiator === null) return null;
+  const head = `${initiator.type}${initiator.async ? ' · asíncrona' : ''}${
+    initiator.mapped ? '' : ' · sin mapa de origen'
+  }`;
+  const frames = initiator.frames.map(
+    (frame) =>
+      `${frame.functionName ?? '(anónima)'} · ${frame.url}:${String(frame.line)}:${String(
+        frame.column,
+      )}`,
+  );
+  return [head, ...frames].join('\n');
+}
+
+function requestBodyText(detail: FlowRequestDetail, side: 'request' | 'response'): string | null {
+  const body = side === 'request' ? detail.requestBody : detail.responseBody;
+  if (body === null) return null;
+  const formatted = formatJsonText(`body:${detail.id}:${side}`, body.text);
+  return formatted === null ? null : formatted.text;
+}
+
+function requestDetailSections(detail: FlowRequestDetail, cardId: string): InfoSection[] {
+  const sections: InfoSection[] = [];
+  const add = (key: string, label: string, text: string | null): void => {
+    if (text === null || text === '') return;
+    const id = `${cardId}:${key}`;
+    sections.push({
+      id,
+      label,
+      text,
+      expanded: sectionExpanded.has(id),
+      onToggle: () => {
+        toggleSection(id);
+      },
+    });
+  };
+  const sentHeaders = headersText(detail.headers);
+  const receivedHeaders = headersText(detail.responseHeaders);
+  add('headers', `Cabeceras enviadas · ${String(Object.keys(detail.headers).length)}`, sentHeaders);
+  add(
+    'response-headers',
+    `Cabeceras recibidas · ${String(Object.keys(detail.responseHeaders).length)}`,
+    receivedHeaders,
+  );
+  const hidden = pickedCellText() !== null ? 'Oculto para la celda elegida.' : null;
+  add(
+    'request-body',
+    'Cuerpo enviado',
+    requestBodyText(detail, 'request') ?? (detail.requestBody === null ? null : hidden),
+  );
+  add(
+    'response-body',
+    'Cuerpo recibido',
+    requestBodyText(detail, 'response') ?? (detail.responseBody === null ? null : hidden),
+  );
+  add('initiator', 'Pila del iniciador', initiatorText(detail.initiator));
+  return sections;
+}
+
+function requestDetailRows(detail: FlowRequestDetail): InfoRow[] {
+  const rows: InfoRow[] = [];
+  const status = requestStatusView({
+    statusCode: detail.statusCode,
+    outcome: detail.outcome,
+    error: detail.error,
+  });
+  pushInfoRow(rows, 'Método', detail.method);
+  pushInfoRow(rows, 'Camino', detail.path);
+  pushInfoRow(rows, 'URL', detail.url);
+  pushInfoRow(rows, 'Estado', status.label);
+  pushInfoRow(rows, 'Ciclo', status.phase);
+  pushInfoRow(
+    rows,
+    'Duración',
+    detail.durationMs === null ? null : `${String(Math.round(detail.durationMs))} ms`,
+  );
+  pushInfoRow(rows, 'Origen', ORIGIN_LABEL[detail.origin] ?? detail.origin);
+  pushInfoRow(rows, 'Tipo', detail.resourceType);
+  pushInfoRow(rows, 'MIME', detail.mimeType);
+  pushInfoRow(rows, 'Hora', clock(detail.wallStartedAt));
+  pushInfoRow(rows, 'Iniciador', initiatorSummary(detail));
+  pushInfoRow(rows, 'Error', detail.error);
+  pushInfoRow(
+    rows,
+    'Cuerpo enviado',
+    detail.requestBody === null
+      ? 'sin cuerpo JSON capturado'
+      : jsonBodySummary(detail.requestBody.text),
+  );
+  pushInfoRow(
+    rows,
+    'Cuerpo recibido',
+    detail.responseBody === null
+      ? 'sin cuerpo JSON capturado'
+      : jsonBodySummary(detail.responseBody.text),
+  );
+  if (detail.requestBody?.truncated === true || detail.responseBody?.truncated === true) {
+    pushInfoRow(rows, 'Aviso', 'El capturador recortó un cuerpo; se muestra el fragmento válido.');
+  }
+  return rows;
+}
+
+function initiatorSummary(detail: FlowRequestDetail): string | null {
+  const initiator = detail.initiator;
+  if (initiator === null) return null;
+  const first = initiator.frames[0];
+  if (first === undefined) return initiator.type;
+  return `${first.functionName ?? '(anónima)'} · ${first.url}:${String(first.line)}`;
+}
+
+interface RequestPick {
+  detail: FlowRequestDetail | null;
+  count: number;
+  heuristic: boolean;
+}
+
+function requestCandidates(
+  node: FlowNode | null,
+  method: string | null,
+  path: string | null,
+): FlowRequestDetail[] {
+  const byId: FlowRequestDetail[] = [];
+  for (const id of node?.requestIds ?? []) {
+    const detail = requestDetails.get(id);
+    if (detail !== undefined) byId.push(detail);
+  }
+  if (byId.length > 0) return byId;
+  if (method === null || path === null) return [];
+  const target = method.toUpperCase();
+  const matched: FlowRequestDetail[] = [];
+  for (const detail of requestDetails.values()) {
+    if (detail.method.toUpperCase() !== target) continue;
+    if (!jsonPathMatches(path, detail.path) && !jsonPathMatches(detail.path, path)) continue;
+    matched.push(detail);
+  }
+  return matched;
+}
+
+// El nodo puede agrupar varias peticiones: se muestra la más cercana al movimiento
+// y se rotula como elección heurística, nunca como linaje demostrado.
+function pickRequestDetail(node: FlowNode | null, movement: FlowJsonMovement | null): RequestPick {
+  const method = movement?.method ?? node?.method ?? null;
+  const path = movement?.path ?? node?.path ?? null;
+  const candidates = requestCandidates(node, method, path);
+  const at = movement?.at ?? null;
+  let best: FlowRequestDetail | null = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+  for (const candidate of candidates) {
+    const score = at === null ? -candidate.wallStartedAt : Math.abs(candidate.wallStartedAt - at);
+    if (score < bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  if (best === null) return { detail: null, count: 0, heuristic: false };
+  const byId = node !== null && node.requestIds.includes(best.id);
+  return { detail: best, count: candidates.length, heuristic: !byId || candidates.length > 1 };
+}
+
+function middlewareSignatureOf(rows: readonly MiddlewareRow[]): string {
+  const capture = jsonCaptureLiveSet ? jsonCaptureLive : (state.jsonCapture ?? null);
+  const captureKey = capture === null ? '' : `${String(capture.ok)}:${capture.error ?? ''}`;
+  const band = model?.middleware;
+  const parts = rows.map((row) => {
+    const movement = row.movement;
+    const detail = row.detail;
+    const movementKey =
+      movement === null
+        ? 'none'
+        : `${movement.id}:${movement.kind}:${String(movement.at)}:${String(
+            movement.count,
+          )}:${movement.body === null ? '0' : String(movement.body.length)}:${
+            movement.truncated ? '1' : '0'
+          }:${sectionExpanded.has(`json:${movement.id}`) ? '1' : '0'}`;
+    const detailKey =
+      detail === null
+        ? 'none'
+        : `${detail.id}:${detail.outcome}:${String(detail.statusCode ?? '')}:${String(
+            detail.durationMs ?? '',
+          )}:${String(detail.requestBody?.text.length ?? 0)}:${String(
+            detail.responseBody?.text.length ?? 0,
+          )}:${String(Object.keys(detail.headers).length)}:${String(
+            Object.keys(detail.responseHeaders).length,
+          )}`;
+    return `${row.key}~${movementKey}~${detailKey}~${row.frontend?.id ?? ''}~${
+      row.frontend?.evidence.join('+') ?? ''
+    }~${row.backend?.id ?? ''}~${row.backend?.evidence.join('+') ?? ''}~${String(row.detailCount)}`;
+  });
+  return [
+    compactMode ? 'compact' : 'full',
+    captureKey,
+    pickedCellText() ?? '',
+    band === null || band === undefined
+      ? ''
+      : `${String(band.x)}:${String(band.width)}:${String(band.sideWidth)}:${String(
+          band.gapStart,
+        )}:${String(band.gapEnd)}`,
+    sectionKey(['json:', 'req:', 'route:']),
+    parts.join('|'),
+  ].join('#');
+}
+
+let overlayRasterTimer: ReturnType<typeof setTimeout> | null = null;
+
+const OVERLAY_WORLDS = ['map-middleware-world', 'map-cards-world'];
+
+function scheduleOverlayRaster(): void {
+  if (overlayRasterTimer !== null) clearTimeout(overlayRasterTimer);
+  overlayRasterTimer = setTimeout(() => {
+    overlayRasterTimer = null;
+    for (const id of OVERLAY_WORLDS) {
+      const world = document.getElementById(id);
+      if (world === null || world.firstElementChild === null) continue;
+      // Fuerza un repintado del texto a la escala actual: si no, el navegador reutiliza el raster anterior y se ve borroso.
+      world.style.textShadow = '0 0 0 transparent';
+      void world.offsetWidth;
+      world.style.textShadow = '';
+    }
+  }, 140);
+}
+
+function syncOverlayTransforms(): void {
+  const transform = `translate(${String(view.x)}px, ${String(view.y)}px) scale(${String(view.k)})`;
+  for (const id of OVERLAY_WORLDS) {
+    const world = document.getElementById(id);
+    if (world !== null) world.style.transform = transform;
+  }
+  scheduleOverlayRaster();
+}
+
+function hideMiddleware(): void {
+  if (overlayRasterTimer !== null) {
+    clearTimeout(overlayRasterTimer);
+    overlayRasterTimer = null;
+  }
+  if (middlewareLinkLayer !== null) {
+    middlewareLinkLayer.remove();
+    middlewareLinkLayer = null;
+  }
+  const host = document.getElementById('map-middleware');
+  if (host !== null) host.hidden = true;
+  middlewareRowViews = [];
+  middlewareSignature = '';
+}
+
+const utf8Encoder = new TextEncoder();
+
+function textBytes(text: string): number {
+  return utf8Encoder.encode(text).length;
+}
+
+function byteSizeLabel(bytes: number): string {
+  if (bytes < 1024) return `${String(bytes)} B`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+const WEIGHT_BASIS_LABEL: Record<FlowNodeWeight['basis'], string> = {
+  file: 'archivo completo',
+  range: 'rango de líneas',
+  rows: 'muestra observada',
+  bodies: 'cuerpos capturados',
+};
+
+function nodeWeight(node: FlowNode): FlowNodeWeight | null {
+  return node.weight ?? null;
+}
+
+function nodeWeightLabel(node: FlowNode): string | null {
+  const weight = nodeWeight(node);
+  return weight === null || weight.bytes === null ? null : byteSizeLabel(weight.bytes);
+}
+
+function nodeWeightText(node: FlowNode): string | null {
+  const weight = nodeWeight(node);
+  if (weight === null) return null;
+  if (weight.bytes === null) return weight.note ?? 'No medible.';
+  const note = weight.note === null ? '' : ` · ${weight.note}`;
+  return `${byteSizeLabel(weight.bytes)} · ${WEIGHT_BASIS_LABEL[weight.basis]}${note}`;
+}
+
+function jsonBodySummary(body: string, bytes: number = textBytes(body)): string {
+  const trimmed = body.trim();
+  if (trimmed === '') return 'Cuerpo vacío';
+  const size = byteSizeLabel(bytes);
+  let value: unknown;
+  try {
+    value = JSON.parse(trimmed);
+  } catch {
+    return truncate(trimmed, 140);
+  }
+  if (Array.isArray(value)) return `Lista · ${String(value.length)} elementos · ${size}`;
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    const shown = keys.slice(0, 8).map((key) => {
+      const entry = record[key];
+      return Array.isArray(entry) ? `${key}[${String(entry.length)}]` : key;
+    });
+    const suffix = keys.length > shown.length ? ', …' : '';
+    return `{ ${shown.join(', ')}${suffix} } · ${size}`;
+  }
+  const type = typeof value === 'string' ? 'Texto' : typeof value;
+  return `${type} · ${size}`;
+}
+
+function middlewareCard(movement: FlowJsonMovement): HTMLElement {
+  const card = cardForJsonMovement(movement);
+  const root = mountInfoCard(
+    card,
+    { variant: 'middleware', rows: 'body', className: 'mw-card' },
+    jsonCardProvider(movement.id),
+  );
+  root.classList.toggle('is-response', movement.kind === 'response');
+  root.classList.toggle('is-request', movement.kind === 'request');
+  return root;
+}
+
+function cardForRequestSide(
+  rowKey: string,
+  node: FlowNode | null,
+  movement: FlowJsonMovement | null,
+  pick: RequestPick,
+): InfoCardModel {
+  const detail = pick.detail;
+  const cardId = `req:${rowKey}`;
+  const method = detail?.method ?? node?.method ?? movement?.method ?? null;
+  const path = detail?.path ?? node?.path ?? movement?.path ?? null;
+  const status =
+    detail === null
+      ? node === null
+        ? null
+        : requestStatus(node)
+      : requestStatusView({
+          statusCode: detail.statusCode,
+          outcome: detail.outcome,
+          error: detail.error,
+        });
+  const rows: InfoRow[] = [];
+  if (detail !== null) {
+    rows.push(...requestDetailRows(detail));
+  } else {
+    pushInfoRow(rows, 'Método', method);
+    pushInfoRow(rows, 'Camino', path);
+    pushInfoRow(rows, 'URL', node?.url ?? null);
+    pushInfoRow(rows, 'Estado', status?.label ?? null);
+    pushInfoRow(rows, 'Ciclo', status?.phase ?? null);
+    pushInfoRow(
+      rows,
+      'Duración',
+      node?.durationMs === null || node?.durationMs === undefined
+        ? null
+        : `${String(Math.round(node.durationMs))} ms`,
+    );
+    pushInfoRow(
+      rows,
+      'Origen',
+      node?.origin === null || node?.origin === undefined
+        ? null
+        : (ORIGIN_LABEL[node.origin] ?? node.origin),
+    );
+    pushInfoRow(rows, 'Iniciador', node?.initiatorFunction ?? null);
+    pushInfoRow(rows, 'Cuerpo', 'sin cuerpo JSON capturado');
+  }
+  if (node === null) pushInfoRow(rows, 'Nodo', 'sin nodo asociado en el grafo');
+  if (pick.count > 1) {
+    pushInfoRow(
+      rows,
+      'Peticiones',
+      `${String(pick.count)} · mostrando ${movement === null ? 'la última' : 'la más cercana al movimiento'}`,
+    );
+  }
+  if (pick.heuristic && detail !== null) {
+    pushInfoRow(rows, 'Asociación', 'heurística por método y camino');
+  }
+  const location = node === null ? null : locationText(node);
+  return infoCard({
+    id: cardId,
+    eyebrow: 'PETICIÓN FRONTEND',
+    title:
+      method !== null && path !== null
+        ? `${method} ${path}`
+        : (node?.title ?? 'Petición sin camino'),
+    subtitle:
+      detail === null
+        ? (node?.subtitle ?? '')
+        : `${ORIGIN_LABEL[detail.origin] ?? detail.origin} · ${detail.resourceType}`,
+    status: status?.label ?? '',
+    tone: status === null ? 'request' : toneFromStatus(status.tone),
+    chips: pick.heuristic && detail !== null ? ['HEURÍSTICO'] : [],
+    rows,
+    sections: detail === null ? [] : requestDetailSections(detail, cardId),
+    location:
+      location === null || node?.file === null || node === null
+        ? null
+        : {
+            label: 'Ubicación',
+            value: location,
+            file: node.file,
+            line: node.line,
+            endLine: node.endLine,
+          },
+    footer:
+      node === null
+        ? null
+        : {
+            label: `Enfocar ${nodeTypeLabel(node)} · ${truncate(node.title, 40)}`,
+            onClick: () => {
+              selectNode(node.id);
+              fitToNodes([node.id]);
+            },
+          },
+  });
+}
+
+function routeQueryNodes(node: FlowNode): FlowNode[] {
+  if (model === null) return [];
+  const sources = [node.id];
+  for (const edge of model.snapshot.edges) {
+    if (edge.type === 'HANDLES' && edge.from === node.id) sources.push(edge.to);
+  }
+  const queries: FlowNode[] = [];
+  const seen = new Set<string>();
+  for (const edge of model.snapshot.edges) {
+    if (edge.type !== 'QUERIES' || !sources.includes(edge.from)) continue;
+    if (seen.has(edge.to)) continue;
+    const query = model.nodesById.get(edge.to);
+    if (query === undefined || query.type !== 'query') continue;
+    seen.add(edge.to);
+    queries.push(query);
+  }
+  return queries;
+}
+
+function cardForRouteSide(
+  rowKey: string,
+  node: FlowNode | null,
+  movement: FlowJsonMovement | null,
+  pick: RequestPick,
+): InfoCardModel {
+  const detail = pick.detail;
+  const cardId = `route:${rowKey}`;
+  const method = node?.method ?? movement?.method ?? detail?.method ?? null;
+  const path = node?.path ?? movement?.path ?? detail?.path ?? null;
+  const rows: InfoRow[] = [];
+  pushInfoRow(rows, 'Ruta', method !== null && path !== null ? `${method} ${path}` : null);
+  pushInfoRow(rows, 'Manejador', node?.subtitle ?? null);
+  pushInfoRow(rows, 'Evidencia', node === null ? null : node.evidence.join(' · '));
+  if (node?.backendObserved === true) {
+    pushInfoRow(rows, 'Ejecución', 'capturada con Node Inspector');
+  } else if (node?.backendObserved === false) {
+    pushInfoRow(rows, 'Ejecución', 'sin evidencia de ejecución');
+  }
+  if (detail !== null) {
+    const status = requestStatusView({
+      statusCode: detail.statusCode,
+      outcome: detail.outcome,
+      error: detail.error,
+    });
+    pushInfoRow(rows, 'Estado', status.label);
+    pushInfoRow(
+      rows,
+      'Duración',
+      detail.durationMs === null ? null : `${String(Math.round(detail.durationMs))} ms`,
+    );
+    pushInfoRow(
+      rows,
+      'Cuerpo devuelto',
+      detail.responseBody === null
+        ? 'sin cuerpo JSON capturado'
+        : jsonBodySummary(detail.responseBody.text),
+    );
+  } else {
+    pushInfoRow(rows, 'Cuerpo devuelto', 'sin cuerpo JSON capturado');
+  }
+  const queries = node === null ? [] : routeQueryNodes(node);
+  pushInfoRow(rows, 'Consultas', queries.length === 0 ? null : String(queries.length));
+  if (detail !== null && pick.count > 1) {
+    pushInfoRow(
+      rows,
+      'Peticiones',
+      `${String(pick.count)} · mostrando ${movement === null ? 'la última' : 'la más cercana al movimiento'}`,
+    );
+  }
+  if (detail !== null && pick.heuristic) {
+    pushInfoRow(rows, 'Asociación', 'heurística por método y camino');
+  }
+  pushInfoRow(rows, 'Nota', node?.note ?? null);
+  if (node === null) pushInfoRow(rows, 'Nodo', 'sin ruta asociada en el grafo');
+
+  const sections: InfoSection[] = [];
+  for (const query of queries) {
+    const sql = query.sql;
+    if (sql === null || sql === undefined || sql === '') continue;
+    const id = `${cardId}:sql:${query.id}`;
+    sections.push({
+      id,
+      label: `SQL · ${querySummary(query) ?? query.title}`,
+      text: sql,
+      expanded: sectionExpanded.has(id),
+      onToggle: () => {
+        toggleSection(id);
+      },
+    });
+  }
+  if (detail !== null) {
+    const headers = headersText(detail.responseHeaders);
+    if (headers !== null) {
+      const id = `${cardId}:response-headers`;
+      sections.push({
+        id,
+        label: `Cabeceras recibidas · ${String(Object.keys(detail.responseHeaders).length)}`,
+        text: headers,
+        expanded: sectionExpanded.has(id),
+        onToggle: () => {
+          toggleSection(id);
+        },
+      });
+    }
+    const text =
+      requestBodyText(detail, 'response') ??
+      (detail.responseBody === null || pickedCellText() === null
+        ? null
+        : 'Oculto para la celda elegida.');
+    if (text !== null) {
+      const id = `${cardId}:response-body`;
+      sections.push({
+        id,
+        label: 'Cuerpo devuelto',
+        text,
+        expanded: sectionExpanded.has(id),
+        onToggle: () => {
+          toggleSection(id);
+        },
+      });
+    }
+  }
+  const location = node === null ? null : locationText(node);
+  const status = node === null ? null : requestStatus(node);
+  return infoCard({
+    id: cardId,
+    eyebrow: 'PETICIÓN BACKEND',
+    title:
+      node?.title ?? (method !== null && path !== null ? `${method} ${path}` : 'Ruta sin resolver'),
+    subtitle: node === null ? '' : nodeTypeLabel(node),
+    status: status?.label ?? '',
+    tone: node === null ? 'response' : toneFromStatus(status?.tone ?? 'ok'),
+    chips:
+      detail !== null && pick.heuristic
+        ? [...(node?.evidence ?? []), 'HEURÍSTICO']
+        : (node?.evidence ?? []),
+    rows,
+    sections,
+    location:
+      location === null || node === null || node.file === null
+        ? null
+        : {
+            label: 'Ubicación',
+            value: location,
+            file: node.file,
+            line: node.line,
+            endLine: node.endLine,
+          },
+    footer:
+      node === null
+        ? null
+        : {
+            label: `Enfocar ${nodeTypeLabel(node)} · ${truncate(node.title, 40)}`,
+            onClick: () => {
+              selectNode(node.id);
+              fitToNodes([node.id]);
+            },
+          },
+  });
+}
+
+function requestSideProvider(
+  rowKey: string,
+  nodeId: string | null,
+  movementId: string | null,
+): () => InfoCardModel | null {
+  return () => {
+    const node = nodeId === null ? null : (model?.nodesById.get(nodeId) ?? null);
+    const movement = movementId === null ? null : findJsonMovement(movementId);
+    if (node === null && movement === null) return null;
+    return cardForRequestSide(rowKey, node, movement, pickRequestDetail(node, movement));
+  };
+}
+
+function routeSideProvider(
+  rowKey: string,
+  nodeId: string | null,
+  movementId: string | null,
+): () => InfoCardModel | null {
+  return () => {
+    const node = nodeId === null ? null : (model?.nodesById.get(nodeId) ?? null);
+    const movement = movementId === null ? null : findJsonMovement(movementId);
+    if (node === null && movement === null) return null;
+    return cardForRouteSide(rowKey, node, movement, pickRequestDetail(node, movement));
+  };
+}
+
+function middlewareRequestNodes(): FlowNode[] {
+  if (model === null) return [];
+  const scope = scopeForView();
+  const shown = new Set(model.viewNodes.map((node) => node.id));
+  return model.snapshot.nodes.filter(
+    (node) =>
+      node.type === 'request' &&
+      shown.has(node.id) &&
+      (filterVisibility.get(node.id) ?? true) &&
+      (scope === null || scope.has(node.id)),
+  );
+}
+
+function movementMatchesNode(movement: FlowJsonMovement, node: FlowNode): boolean {
+  if (node.method === null || node.path === null) return false;
+  if (movement.method === null || movement.path === null) return false;
+  if (movement.method.toUpperCase() !== node.method.toUpperCase()) return false;
+  return jsonPathMatches(node.path, movement.path) || jsonPathMatches(movement.path, node.path);
+}
+
+function middlewareRowTime(row: MiddlewareRow): number {
+  if (row.movement !== null) return row.movement.at;
+  if (row.detail !== null) return row.detail.wallStartedAt;
+  return row.frontend?.lastSeen ?? 0;
+}
+
+function buildMiddlewareRows(): MiddlewareRow[] {
+  const movements = visibleJsonMovements(['request', 'response']);
+  const rows: MiddlewareRow[] = [];
+  for (const movement of movements) {
+    const endpoints = middlewareEndpoints(movement);
+    const pick = pickRequestDetail(endpoints.frontend, movement);
+    rows.push({
+      key: `m:${movement.id}`,
+      movement,
+      frontend: endpoints.frontend,
+      backend: endpoints.backend,
+      detail: pick.detail,
+      detailCount: pick.count,
+      detailHeuristic: pick.heuristic,
+    });
+  }
+  // Sin cuerpo JSON también se ve el intercambio: la petición y la ruta existen en el grafo.
+  if (pickedCellText() === null) {
+    for (const node of middlewareRequestNodes()) {
+      if (movements.some((movement) => movementMatchesNode(movement, node))) continue;
+      const pick = pickRequestDetail(node, null);
+      const routeId = jsonRouteByRequest.get(node.id);
+      rows.push({
+        key: `n:${node.id}`,
+        movement: null,
+        frontend: node,
+        backend: routeId === undefined ? null : (model?.nodesById.get(routeId) ?? null),
+        detail: pick.detail,
+        detailCount: pick.count,
+        detailHeuristic: pick.heuristic,
+      });
+    }
+  }
+  return rows.sort(
+    (left, right) =>
+      middlewareRowTime(left) - middlewareRowTime(right) || left.key.localeCompare(right.key),
+  );
+}
+
+function matchingJsonNode(
+  nodes: readonly FlowNode[],
+  method: string | null,
+  path: string | null,
+): FlowNode | null {
+  if (method === null || path === null) return null;
+  const target = method.toUpperCase();
+  for (const node of nodes) {
+    if (node.method === null || node.path === null) continue;
+    if (node.method.toUpperCase() !== target) continue;
+    if (!jsonPathMatches(node.path, path)) continue;
+    return node;
+  }
+  return null;
+}
+
+function middlewareEndpoints(movement: FlowJsonMovement): {
+  frontend: FlowNode | null;
+  backend: FlowNode | null;
+} {
+  const owner = jsonOwnerNode(movement);
+  const matchedRequest = matchingJsonNode(jsonRequests, movement.method, movement.path);
+  const matchedRoute = matchingJsonNode(jsonRoutes, movement.method, movement.path);
+  const ownerRoute =
+    owner === null
+      ? null
+      : owner.type === 'route'
+        ? owner
+        : (model?.nodesById.get(jsonRouteByHandler.get(owner.id) ?? '') ?? null);
+  const frontendOwner = owner !== null && isFrontendLayerType(owner.type) ? owner : null;
+  const backendOwner = owner !== null && !isFrontendLayerType(owner.type) ? owner : null;
+  // El endpoint (ruta) es el destino real del JSON; la función que lo atiende
+  // solo se usa como último recurso cuando no hay ruta en el snapshot.
+  const backend = matchedRoute ?? ownerRoute ?? backendOwner;
+  const requestFromRoute =
+    backend === null
+      ? null
+      : (model?.nodesById.get(jsonRequestByRoute.get(backend.id) ?? '') ?? null);
+  return {
+    frontend: matchedRequest ?? frontendOwner ?? requestFromRoute,
+    backend,
+  };
+}
+
+function middlewareGridLeft(band: MiddlewareBand): number {
+  return band.sideWidth > 0 ? band.gapStart + MIDDLEWARE_INSET : band.x;
+}
+
+function middlewareCardAnchor(
+  el: HTMLElement,
+  band: MiddlewareBand,
+  edge: 'left' | 'right',
+): { x: number; y: number } {
+  const left = middlewareGridLeft(band) + el.offsetLeft;
+  return {
+    x: edge === 'left' ? left : left + el.offsetWidth,
+    y: FLOW_MARGIN + el.offsetTop + el.offsetHeight / 2,
+  };
+}
+
+function middlewareNodeAnchor(
+  node: FlowNode,
+  edge: 'left' | 'right',
+): { x: number; y: number } | null {
+  const placed = model?.layout.positions.get(node.id);
+  if (placed === undefined) return null;
+  return {
+    x: edge === 'left' ? placed.x : placed.x + placed.width,
+    y: placed.y + placed.height / 2,
+  };
+}
+
+function middlewareLink(
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  direction: 1 | -1,
+  className: string,
+  cardId: string,
+): SVGPathElement {
+  const span = Math.abs(to.x - from.x);
+  const first = from.x + direction * clamp(span * 0.45, 8, 320);
+  const second = to.x - direction * clamp(span * 0.2, 6, 160);
+  const path = svgElement('path', {
+    class: className,
+    d: `M ${String(from.x)} ${String(from.y)} C ${String(first)} ${String(from.y)}, ${String(
+      second,
+    )} ${String(to.y)}, ${String(to.x)} ${String(to.y)}`,
+  });
+  path.setAttribute('data-card-id', cardId);
+  return path;
+}
+
+function renderMiddlewareLinks(band: MiddlewareBand): void {
+  if (middlewareLinkLayer !== null) {
+    middlewareLinkLayer.remove();
+    middlewareLinkLayer = null;
+  }
+  if (viewport === null || middlewareRowViews.length === 0) return;
+  const layer = svgElement('g', { class: 'mw-links' });
+  let drawn = 0;
+  for (const view of middlewareRowViews) {
+    const row = view.row;
+    const kind = row.movement?.kind === 'response' ? 'is-response' : 'is-request';
+    const left = view.left;
+    const center = view.center;
+    const right = view.right;
+    const segments: Array<
+      [{ x: number; y: number } | null, { x: number; y: number } | null, 1 | -1, string, string]
+    > = [];
+    if (left !== null) {
+      const cardId = `req:${row.key}`;
+      const nodeAnchor = row.frontend === null ? null : middlewareNodeAnchor(row.frontend, 'right');
+      segments.push([
+        middlewareCardAnchor(left, band, 'left'),
+        nodeAnchor,
+        -1,
+        `mw-link-line ${kind}`,
+        cardId,
+      ]);
+      if (center !== null) {
+        segments.push([
+          middlewareCardAnchor(left, band, 'right'),
+          middlewareCardAnchor(center, band, 'left'),
+          1,
+          `mw-link-line ${kind}`,
+          cardId,
+        ]);
+      }
+    }
+    if (right !== null) {
+      const cardId = `route:${row.key}`;
+      if (center !== null) {
+        segments.push([
+          middlewareCardAnchor(center, band, 'right'),
+          middlewareCardAnchor(right, band, 'left'),
+          1,
+          `mw-link-line ${kind}`,
+          cardId,
+        ]);
+      }
+      const nodeAnchor = row.backend === null ? null : middlewareNodeAnchor(row.backend, 'left');
+      segments.push([
+        middlewareCardAnchor(right, band, 'right'),
+        nodeAnchor,
+        1,
+        `mw-link-line ${kind}`,
+        cardId,
+      ]);
+    }
+    for (const [from, to, direction, className, cardId] of segments) {
+      if (from === null || to === null) continue;
+      layer.append(middlewareLink(from, to, direction, className, cardId));
+      drawn += 1;
+    }
+  }
+  if (drawn === 0) return;
+  middlewareLinkLayer = layer;
+  if (nodeLayer !== null) {
+    viewport.insertBefore(layer, nodeLayer);
+  } else {
+    viewport.append(layer);
+  }
+}
+
+function middlewareTitle(label: string, count: number, noun: string, glyph: string): HTMLElement {
+  const title = document.createElement('div');
+  title.className = 'mw-title';
+  const mark = document.createElement('span');
+  mark.className = 'mw-title-glyph';
+  mark.textContent = glyph;
+  const name = document.createElement('span');
+  name.className = 'mw-title-label';
+  name.textContent = label;
+  const total = document.createElement('span');
+  total.className = 'mw-title-count';
+  total.textContent = `${String(count)} ${noun}`;
+  title.append(mark, name, total);
+  return title;
+}
+
+function middlewareNote(text: string): HTMLElement {
+  const note = document.createElement('div');
+  note.className = 'mw-empty';
+  note.textContent = text;
+  return note;
+}
+
+function rowPick(row: MiddlewareRow): RequestPick {
+  return { detail: row.detail, count: row.detailCount, heuristic: row.detailHeuristic };
+}
+
+function updateMiddlewareAxis(rows: readonly MiddlewareRow[]): void {
+  const requests = rows.filter((row) => row.frontend !== null || row.detail !== null).length;
+  const messages = rows.filter((row) => row.movement !== null).length;
+  const routes = rows.filter((row) => row.backend !== null).length;
+  const set = (selector: string, text: string, title: string): void => {
+    const label = document.querySelector(`#map-axis ${selector}`);
+    if (!(label instanceof HTMLElement)) return;
+    label.textContent = text;
+    label.title = title;
+  };
+  set(
+    '.is-mw-requests',
+    `PETICIONES · ${String(requests)}`,
+    `Peticiones del frontend · ${String(requests)} en el intercambio`,
+  );
+  set(
+    '.is-mw-json',
+    `⇄ JSON · ${String(messages)}`,
+    `Middleware JSON · ${String(messages)} mensajes entre el frontend y el backend`,
+  );
+  set(
+    '.is-mw-routes',
+    `RUTAS · ${String(routes)}`,
+    `Rutas del backend · ${String(routes)} atienden el intercambio`,
+  );
+}
+
+function renderMiddleware(): void {
+  const host = document.getElementById('map-middleware');
+  if (host === null) return;
+  if (!state.open || model === null || model.middleware === null) {
+    hideMiddleware();
+    return;
+  }
+  const band = model.middleware;
+  const world = element('map-middleware-world');
+  const all = buildMiddlewareRows();
+  const rows = band.sideWidth > 0 ? all : all.filter((row) => row.movement !== null);
+  const sides = band.sideWidth > 0;
+  updateMiddlewareAxis(rows);
+  const signature = middlewareSignatureOf(rows);
+  host.hidden = false;
+  if (signature !== middlewareSignature || world.firstElementChild === null) {
+    middlewareSignature = signature;
+    for (const id of infoProviders.keys()) {
+      if (id.startsWith('req:') || id.startsWith('route:')) infoProviders.delete(id);
+    }
+    world.replaceChildren();
+    middlewareRowViews = [];
+    const grid = document.createElement('div');
+    grid.className = 'mw-grid';
+    grid.style.left = `${String(middlewareGridLeft(band))}px`;
+    grid.style.top = `${String(FLOW_MARGIN)}px`;
+    grid.style.width = `${String(
+      sides ? band.sideWidth * 2 + band.width + MIDDLEWARE_SIDE_GAP * 2 : band.width,
+    )}px`;
+    grid.style.columnGap = `${String(sides ? MIDDLEWARE_SIDE_GAP : 0)}px`;
+    grid.style.gridTemplateColumns = sides
+      ? `${String(band.sideWidth)}px ${String(band.width)}px ${String(band.sideWidth)}px`
+      : `${String(band.width)}px`;
+    const messages = rows.filter((row) => row.movement !== null).length;
+    if (sides) {
+      grid.append(
+        middlewareTitle(
+          'PETICIÓN FRONTEND',
+          rows.filter((row) => row.frontend !== null || row.detail !== null).length,
+          'peticiones',
+          '→',
+        ),
+      );
+    }
+    grid.append(middlewareTitle('MIDDLEWARE JSON', messages, 'mensajes', '⇄'));
+    if (sides) {
+      grid.append(
+        middlewareTitle(
+          'PETICIÓN BACKEND',
+          rows.filter((row) => row.backend !== null).length,
+          'rutas',
+          '←',
+        ),
+      );
+    }
+    if (rows.length === 0) {
+      const capture = jsonCaptureLiveSet ? jsonCaptureLive : (state.jsonCapture ?? null);
+      if (sides) grid.append(document.createElement('div'));
+      grid.append(middlewareNote(jsonEmptyMessage(capture, 'middleware')));
+      if (sides) grid.append(document.createElement('div'));
+    }
+    for (const row of rows) {
+      const pick = rowPick(row);
+      const movementId = row.movement?.id ?? null;
+      const left =
+        sides && (row.frontend !== null || row.movement !== null || row.detail !== null)
+          ? mountInfoCard(
+              cardForRequestSide(row.key, row.frontend, row.movement, pick),
+              { variant: 'middleware', rows: 'all', className: 'mw-card is-frontend' },
+              requestSideProvider(row.key, row.frontend?.id ?? null, movementId),
+            )
+          : null;
+      const center =
+        row.movement === null
+          ? middlewareNote('Sin cuerpo JSON capturado para este intercambio.')
+          : middlewareCard(row.movement);
+      const right =
+        sides && (row.backend !== null || row.movement !== null || row.detail !== null)
+          ? mountInfoCard(
+              cardForRouteSide(row.key, row.backend, row.movement, pick),
+              { variant: 'middleware', rows: 'all', className: 'mw-card is-backend' },
+              routeSideProvider(row.key, row.backend?.id ?? null, movementId),
+            )
+          : null;
+      if (sides) grid.append(left ?? document.createElement('div'));
+      grid.append(center);
+      if (sides) grid.append(right ?? document.createElement('div'));
+      middlewareRowViews.push({ row, left, center, right });
+    }
+    world.append(grid);
+  }
+  syncOverlayTransforms();
+  const gridEl = world.firstElementChild;
+  if (gridEl instanceof HTMLElement) {
+    model.layout.height = Math.max(model.baseHeight, gridEl.offsetHeight + FLOW_MARGIN * 2);
+    renderMiddlewareLinks(band);
+  }
 }
 
 function connectionSummary(node: FlowNode): string | null {
@@ -3367,25 +5990,6 @@ function reachableNodeList(id: string): FlowNode[] {
   return nodes;
 }
 
-function routeLine(node: FlowNode): HTMLElement {
-  const method = node.method ?? 'GET';
-  const path = node.path ?? node.title;
-  const time = node.firstSeen > 0 ? `${clock(node.firstSeen)} · ` : '';
-  const evidence = node.evidence.includes('RUNTIME') ? 'RUNTIME' : 'STATIC';
-  const row = document.createElement('span');
-  if (node.file === null) {
-    row.textContent = `${time}${method} ${path} · ${evidence}`;
-    return row;
-  }
-  const label = node.line === null ? node.file : `${node.file}:${String(node.line)}`;
-  row.append(
-    document.createTextNode(`${time}${method} ${path} · `),
-    codeLink(label, node.file, node.line, node.endLine),
-    document.createTextNode(` · ${evidence}`),
-  );
-  return row;
-}
-
 function requestLine(node: FlowNode): string {
   const base = `${node.method ?? ''} ${node.path ?? node.title}`.trim();
   const summary = requestSummary(node);
@@ -3400,83 +6004,11 @@ function chronologicalNodes(left: FlowNode, right: FlowNode): number {
   return `${left.title}`.localeCompare(`${right.title}`, 'es') || left.id.localeCompare(right.id);
 }
 
-function reachableRoutes(node: FlowNode): HTMLElement[] {
-  return reachableNodeList(node.id)
-    .filter((item) => item.type === 'route')
-    .sort(chronologicalNodes)
-    .map(routeLine);
-}
-
 function reachableRequests(node: FlowNode): string[] {
   return reachableNodeList(node.id)
     .filter((item) => item.type === 'request')
     .sort(chronologicalNodes)
     .map(requestLine);
-}
-
-type ListEntry = string | HTMLElement;
-
-function pagedList(items: readonly ListEntry[]): HTMLElement {
-  const wrap = document.createElement('div');
-  wrap.className = 'list';
-  let shown = 0;
-  let foot: HTMLDivElement | null = null;
-  const append = (): void => {
-    if (shown >= items.length) return;
-    if (foot !== null) {
-      foot.remove();
-      foot = null;
-    }
-    const end = Math.min(items.length, shown + PAGE_SIZE);
-    for (let index = shown; index < end; index += 1) {
-      const item = items[index];
-      if (item === undefined) continue;
-      const row = document.createElement('div');
-      row.className = 'list-item';
-      if (typeof item === 'string') {
-        row.textContent = item;
-      } else {
-        row.append(item);
-      }
-      wrap.append(row);
-    }
-    shown = end;
-    if (shown < items.length) {
-      foot = document.createElement('div');
-      foot.className = 'list-foot';
-      foot.textContent = `${String(shown)} de ${String(items.length)} · desplázate para cargar más`;
-      wrap.append(foot);
-    }
-  };
-  wrap.addEventListener('scroll', () => {
-    if (wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 24) append();
-  });
-  append();
-  return wrap;
-}
-
-function addListRow(
-  container: HTMLElement,
-  label: string,
-  items: readonly ListEntry[],
-  emptyText: string | null,
-): void {
-  if (items.length === 0 && emptyText === null) return;
-  const row = document.createElement('div');
-  row.className = 'row';
-  const key = document.createElement('div');
-  key.className = 'label';
-  key.textContent = label;
-  row.append(key);
-  if (items.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'list-empty';
-    empty.textContent = emptyText ?? '';
-    row.append(empty);
-  } else {
-    row.append(pagedList(items));
-  }
-  container.append(row);
 }
 
 function tableQueryLine(query: TableQueryData): string {
@@ -3490,288 +6022,29 @@ function tableQueryLine(query: TableQueryData): string {
   }`;
 }
 
-function renderTableDetail(detail: HTMLElement, table: FlowTableData): void {
-  const picked = pickedCell !== null && pickedCell.tableId === table.id ? pickedCell : null;
-  if (picked !== null) {
-    const row = picked.rowIndex === null ? null : (table.grid.rows[picked.rowIndex] ?? null);
-    const column = table.grid.columns.find((entry) => entry.name.toLowerCase() === picked.column);
-    const value =
-      picked.rowIndex === null ? null : tableCellAt(table, picked.column, picked.rowIndex);
-    addRow(
-      detail,
-      'Celda',
-      `${table.name}.${picked.column}${
-        picked.rowIndex === null ? ' · columna completa' : ` · fila ${String(picked.rowIndex + 1)}`
-      }`,
-    );
-    if (value !== null) addRow(detail, 'Valor', value);
-    if (column !== undefined) {
-      addRow(
-        detail,
-        'Uso',
-        column.tags.length === 0 ? null : column.tags.map(usageText).join(' · '),
-      );
-    }
-    if (row !== null) {
-      const query = row.query;
-      addRow(detail, 'Consulta', tableQueryLine(query));
-      if (query.functionNode !== null) {
-        const fn = query.functionNode;
-        addRow(detail, 'Función', codeLink(fn.title, fn.file, fn.line, fn.endLine));
-      }
-      const result = query.node.result;
-      if (result !== null && result !== undefined) {
-        addRow(
-          detail,
-          'Ejecución',
-          `${result.driver} · ${clock(result.observedAt)} · ${String(
-            result.rows.length,
-          )} ${result.rows.length === 1 ? 'fila' : 'filas'}${result.truncated ? ' · truncada' : ''}`,
-        );
-      }
-      if (query.node.sql !== null && query.node.sql !== undefined && query.node.sql !== '') {
-        const label = document.createElement('div');
-        label.className = 'label';
-        label.textContent = 'SQL de la celda';
-        const sql = document.createElement('div');
-        sql.className = 'sql';
-        sql.textContent = query.node.sql;
-        const rowNode = document.createElement('div');
-        rowNode.className = 'row';
-        rowNode.append(label, sql);
-        detail.append(rowNode);
-      }
-    } else {
-      const queries = table.queries.filter((query) =>
-        query.columns.some(
-          (column) => column.tableId === table.id && column.name.toLowerCase() === picked.column,
-        ),
-      );
-      addListRow(
-        detail,
-        'Consultas que la usan',
-        queries.map(tableQueryLine),
-        'Sin consultas registradas para esta columna.',
-      );
-    }
-  }
-
-  addRow(detail, 'Base de datos', table.databaseTitle);
-  const ways = [table.read ? 'lecturas' : '', table.write ? 'escrituras' : '']
-    .filter((part) => part !== '')
-    .join(' y ');
-  addRow(
-    detail,
-    'Resumen',
-    `${String(table.columns.length)} columnas · ${String(table.queries.length)} SQL${
-      ways === '' ? '' : ` · ${ways}`
-    }${table.grid.rows.length === 0 ? '' : ` · ${String(table.grid.rows.length)} filas observadas`}`,
-  );
-  addListRow(
-    detail,
-    'Columnas',
-    table.columns.map((column) => {
-      const tags = usageTags(column).map(usageText).join(' · ');
-      return `${column.name}${tags === '' ? '' : ` · ${tags}`}${column.runtime ? ' · RUNTIME' : ''}`;
-    }),
-    'Sin columnas declaradas.',
-  );
-  addListRow(
-    detail,
-    'Consultas',
-    table.queries.map((query) => {
-      const sql =
-        query.node.sql === null || query.node.sql === undefined
-          ? ''
-          : ` · ${truncate(query.node.sql.replace(/\s+/g, ' '), 90)}`;
-      return `${tableQueryLine(query)}${sql}`;
-    }),
-    'Sin SQL asociado.',
-  );
-  table.notes.forEach((note) => {
-    const text = document.createElement('div');
-    text.className = 'note';
-    text.textContent = note;
-    detail.append(text);
-  });
-}
-
 function renderDetail(node: FlowNode): void {
   const detail = element('map-detail');
-  detail.replaceChildren();
-  const type = document.createElement('div');
-  type.className = 'type';
-  type.textContent = nodeTypeLabel(node);
-  const title = document.createElement('h2');
-  title.textContent = node.title;
-  detail.append(type, title);
-
-  const chips = document.createElement('div');
-  chips.className = 'chips';
-  for (const item of node.evidence) {
-    const chip = document.createElement('span');
-    chip.className = `chip ${item.toLowerCase()}`;
-    chip.textContent = item === 'RUNTIME' ? 'RUNTIME' : 'STATIC';
-    chips.append(chip);
-  }
-  detail.append(chips);
-
+  const children: HTMLElement[] = [
+    mountInfoCard(cardForNode(node), { variant: 'detail', rows: 'all' }, nodeInfoProvider(node.id)),
+  ];
   if (node.type === 'table') {
     const table = tableDataOf(node);
-    if (table !== null) renderTableDetail(detail, table);
-  }
-
-  if (node.type === 'structure' || node.type === 'asset') {
-    addRow(detail, 'Selector', node.selector ?? null);
-    if (node.type === 'asset') addRow(detail, 'Archivo', node.href ?? null);
-  }
-
-  if (node.type === 'element') {
-    addRow(detail, 'Selector', node.selector ?? null);
-    addRow(detail, 'Destino del enlace', node.href ?? null);
-    if (node.formAction !== null && node.formAction !== undefined) {
-      addRow(detail, 'Formulario', `${node.formMethod ?? 'GET'} ${node.formAction}`);
-    } else if (node.formKey !== null && node.formKey !== undefined) {
-      addRow(detail, 'Formulario', 'sin action declarada');
-    }
-    if (node.disabled === true) addRow(detail, 'Estado', 'deshabilitado');
-    if (node.visible === false) addRow(detail, 'Estado', 'oculto en el DOM');
-    const handlers = (node.handlers ?? []).map((hint) => {
-      const tags = handlerProfileTags(hint.profile ?? null);
-      const suffix = tags.length === 0 ? '' : ` · ${tags.join(' · ')}`;
-      return `${eventLabel(hint.event)} → ${handlerLabel(hint.name, hint.profile ?? null)}${suffix} (${hint.source})`;
-    });
-    addListRow(detail, 'Manejadores', handlers, null);
-    addRow(detail, 'Eventos', eventSummary(node));
-    addListRow(
-      detail,
-      'Rutas alcanzables',
-      reachableRoutes(node),
-      'Sin rutas alcanzables: no hay petición observada ni destino declarado que coincida con el índice.',
-    );
-    addListRow(detail, 'Peticiones alcanzables', reachableRequests(node), null);
-  }
-
-  addRow(detail, 'Detalle', node.subtitle);
-  if (node.file !== null) {
-    const label = locationText(node);
-    addRow(
-      detail,
-      'Ubicación',
-      label === null ? null : codeLink(label, node.file, node.line, node.endLine),
-    );
-  }
-  if (node.method !== null && node.path !== null) {
-    addRow(detail, 'Camino', `${node.method} ${node.path}`);
-  }
-  addRow(detail, 'URL', node.url);
-  addRow(detail, 'Petición', requestSummary(node));
-  const status = requestStatus(node);
-  if (status !== null) {
-    addRow(detail, 'Estado', status.label);
-    addRow(detail, 'Ciclo', status.phase);
-    if (node.backendObserved === true) {
-      addRow(detail, 'Backend', 'ejecución capturada con Node Inspector');
-    } else if (node.backendObserved === false) {
-      addRow(detail, 'Backend', 'sin evidencia de ejecución');
+    const picked =
+      table !== null && pickedCell !== null && pickedCell.tableId === table.id ? pickedCell : null;
+    if (table !== null && picked !== null) {
+      const card = cardForCell(table.id, picked.column, picked.rowIndex);
+      if (card !== null) {
+        children.push(
+          mountInfoCard(
+            card,
+            { variant: 'detail', rows: 'all' },
+            cellInfoProvider(table.id, picked.column, picked.rowIndex),
+          ),
+        );
+      }
     }
   }
-  addRow(detail, 'Iniciador', node.initiatorFunction ?? null);
-  addRow(detail, 'SQL', querySummary(node));
-  addRow(detail, 'Conexiones', connectionSummary(node));
-  addListRow(detail, 'Sale hacia', connectionItems(node, 'out'), null);
-  addListRow(detail, 'Llega desde', connectionItems(node, 'in'), null);
-
-  if (node.sql !== null && node.sql !== undefined && node.sql !== '') {
-    const row = document.createElement('div');
-    row.className = 'row';
-    const label = document.createElement('div');
-    label.className = 'label';
-    label.textContent = 'Consulta';
-    const sql = document.createElement('div');
-    sql.className = 'sql';
-    sql.textContent = node.sql;
-    row.append(label, sql);
-    detail.append(row);
-  }
-
-  const jsonMovements = jsonMovementsForNode(node);
-  if (jsonMovements.length > 0) {
-    const row = document.createElement('div');
-    row.className = 'row';
-    const label = document.createElement('div');
-    label.className = 'label';
-    label.textContent = `Movimientos JSON · ${String(jsonMovements.length)}`;
-    const list = document.createElement('div');
-    list.className = 'json-list';
-    for (const movement of jsonMovements) {
-      list.append(jsonMovementItem(movement));
-    }
-    row.append(label, list);
-    detail.append(row);
-  }
-
-  if ((node.tablesRead ?? []).length > 0) {
-    addListRow(detail, 'Lee', node.tablesRead ?? [], null);
-  }
-  if ((node.tablesWritten ?? []).length > 0) {
-    addListRow(detail, 'Escribe', node.tablesWritten ?? [], null);
-  }
-  if (node.engine !== null && node.engine !== undefined) {
-    addRow(detail, 'Motor', node.engine);
-  }
-  if (node.database !== null && node.database !== undefined) {
-    addRow(detail, 'Base de datos', node.database);
-  }
-
-  if (node.type === 'element') {
-    addRow(detail, 'Interacciones', String(Math.max(node.occurrences, eventTotal(node))));
-  } else if (node.countLabel !== null && node.countLabel !== undefined && node.occurrences > 0) {
-    addRow(detail, node.countLabel, String(node.occurrences));
-  } else if (node.occurrences > 1) {
-    addRow(detail, 'Repeticiones', String(node.occurrences));
-  }
-  if (node.requestIds.length > 0) {
-    addRow(detail, 'Peticiones', String(node.requestIds.length));
-  }
-  if (node.traceIds.length > 0) {
-    addRow(detail, 'Trazas', String(node.traceIds.length));
-  }
-  if (node.firstSeen > 0) {
-    addRow(
-      detail,
-      'Visto',
-      node.firstSeen === node.lastSeen
-        ? clock(node.firstSeen)
-        : `${clock(node.firstSeen)} → ${clock(node.lastSeen)}`,
-    );
-  }
-  if (node.note !== null && node.note !== '') {
-    const note = document.createElement('div');
-    note.className = 'note';
-    note.textContent = node.note;
-    detail.append(note);
-  }
-
-  if (node.type === 'request') {
-    const requestId = node.requestIds.find((id) => currentCardRequests.has(id));
-    if (requestId !== undefined) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.textContent = 'Ver petición';
-      button.addEventListener('click', () => {
-        ipcRenderer.send(BROWSER_PANEL_CHANNELS.selectRequest, requestId);
-      });
-      detail.append(button);
-    } else {
-      const note = document.createElement('div');
-      note.className = 'note';
-      note.textContent =
-        'Esta petición no está en la tarjeta actual; vuelve a hacer clic en la página para abrirla.';
-      detail.append(note);
-    }
-  }
-
+  detail.replaceChildren(...children);
   detail.hidden = false;
 }
 
@@ -3836,7 +6109,9 @@ function selectNode(id: string): void {
   } else {
     applyFiltersAndSelection();
     mountCellRoutes();
+    renderMiddleware();
   }
+  syncJsonRail();
   hideSearchResults();
   renderStatus();
   highlightInPage(node);
@@ -3846,6 +6121,7 @@ function selectNode(id: string): void {
 function clearSelection(): void {
   if (selectedId === null && focusScope === null && pickedCell === null) return;
   const hadFocus = focusScope !== null;
+  const hadCell = pickedCell !== null;
   selectedId = null;
   selectionHighlight = false;
   highlightScope = null;
@@ -3861,38 +6137,154 @@ function clearSelection(): void {
     focusOriginId = null;
     focusDirection = 'both';
     applyScopeView();
-    return;
+  } else {
+    applyFiltersAndSelection();
+    mountCellRoutes();
+    renderStatus();
   }
-  applyFiltersAndSelection();
-  mountCellRoutes();
-  renderStatus();
+  if (hadCell) {
+    renderMiddleware();
+    syncJsonRail();
+  }
 }
 
-function hideTip(): void {
-  tipKey = null;
+function syncTipBlock(): void {
+  const tip = document.getElementById('map-tip');
+  if (tip !== null) tip.classList.toggle('is-frozen', tipFrozen);
+  const block = document.getElementById('map-tip-block');
+  if (block === null) return;
+  block.hidden = !tipFrozen;
+  block.textContent = 'bloquear';
+}
+
+function hideTipNow(): void {
+  hoverCardId = null;
+  tipSignature = '';
   const tip = document.getElementById('map-tip');
   if (tip === null) return;
   tip.hidden = true;
-  tip.textContent = '';
+  document.getElementById('map-tip-card')?.replaceChildren();
+  syncTipBlock();
 }
 
-function tooltipEnabled(): boolean {
-  return tooltipsPinned || shiftHeld;
+function hideTip(): void {
+  if (tipFrozen) return;
+  hoverCardId = null;
+  hoverProvider = null;
+  hideTipNow();
 }
 
-function syncTipToggle(): void {
-  const button = document.getElementById('map-tip-toggle');
-  if (button === null) return;
-  button.classList.toggle('is-on', tooltipsPinned);
-  button.classList.toggle('is-held', shiftHeld);
-  button.setAttribute('aria-pressed', tooltipsPinned ? 'true' : 'false');
+function closeTip(): void {
+  tipFrozen = false;
+  hoverCardId = null;
+  hoverProvider = null;
+  hideTipNow();
+}
+
+function textFingerprint(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function infoCardSignature(card: InfoCardModel): string {
+  return [
+    card.id,
+    card.eyebrow,
+    card.title,
+    card.subtitle,
+    card.status,
+    card.tone,
+    card.meta,
+    card.expansion === null ? '' : card.expansion.expanded ? '1' : '0',
+    card.chips.join(','),
+    card.rows
+      .map(
+        (row) =>
+          `${row.label}\u0000${row.value}\u0000${row.file ?? ''}\u0000${String(row.line ?? '')}\u0000${String(row.endLine ?? '')}`,
+      )
+      .join('\u0001'),
+    card.sections
+      .map(
+        (section) =>
+          `${section.id}\u0000${section.expanded ? '1' : '0'}\u0000${textFingerprint(section.text)}`,
+      )
+      .join('\u0001'),
+    card.location === null
+      ? ''
+      : `${card.location.label}\u0000${card.location.value}\u0000${String(card.location.line ?? '')}`,
+    card.footer?.label ?? '',
+  ].join('\u0002');
+}
+
+function showTip(force = false): void {
+  const tip = document.getElementById('map-tip');
+  if (tip === null) return;
+  if (!tipFrozen && !shiftHeld) {
+    hideTipNow();
+    return;
+  }
+  const card = hoverProvider?.() ?? null;
+  if (card === null) {
+    if (tipFrozen) {
+      closeTip();
+    } else {
+      hideTipNow();
+    }
+    return;
+  }
+  const signature = infoCardSignature(card);
+  if (force || signature !== tipSignature) {
+    tipSignature = signature;
+    const host = document.getElementById('map-tip-card');
+    if (host !== null) {
+      host.replaceChildren(renderInfoCard(card, { variant: 'tip', rows: 'all' }));
+    }
+  }
+  tip.hidden = false;
+  syncTipBlock();
+  if (!tipFrozen) placeTip(tipPointerX, tipPointerY);
+}
+
+function refreshFrozenTip(): void {
+  if (!tipFrozen) return;
+  showTip();
 }
 
 function setMapShiftHeld(held: boolean): void {
   if (shiftHeld === held) return;
   shiftHeld = held;
-  syncTipToggle();
-  showTipAtPointer();
+  if (tipFrozen) return;
+  if (held) {
+    showTip();
+  } else {
+    hideTipNow();
+  }
+}
+
+function toggleMapTipFreeze(): void {
+  if (!state.open) return;
+  if (tipFrozen) {
+    tipFrozen = false;
+    syncTipBlock();
+    if (shiftHeld) {
+      showTip();
+    } else {
+      hoverCardId = null;
+      hoverProvider = null;
+      hideTipNow();
+    }
+    return;
+  }
+  const provider = hoverProvider;
+  if (hoverCardId === null || provider === null || provider() === null) return;
+  tipFrozen = true;
+  tipSignature = '';
+  syncTipBlock();
+  showTip(true);
 }
 
 function placeTip(clientX: number, clientY: number): void {
@@ -3905,74 +6297,58 @@ function placeTip(clientX: number, clientY: number): void {
   let left = clientX - rect.left + 14;
   let top = clientY - rect.top + 16;
   if (left + width > canvas.clientWidth - 8) {
-    left = Math.max(8, clientX - rect.left - width - 14);
+    left = clientX - rect.left - width - 14;
   }
   if (top + height > canvas.clientHeight - 8) {
-    top = Math.max(8, clientY - rect.top - height - 12);
+    top = clientY - rect.top - height - 12;
   }
-  tip.style.left = `${String(Math.round(left))}px`;
-  tip.style.top = `${String(Math.round(top))}px`;
+  const maxLeft = Math.max(8, canvas.clientWidth - width - 8);
+  const maxTop = Math.max(8, canvas.clientHeight - height - 8);
+  tip.style.left = `${String(Math.round(clamp(left, 8, maxLeft)))}px`;
+  tip.style.top = `${String(Math.round(clamp(top, 8, maxTop)))}px`;
 }
 
-function showTipAtPointer(): void {
-  const tip = document.getElementById('map-tip');
-  if (tip === null) return;
-  if (!tooltipEnabled() || hoverKey === null) {
-    hideTip();
-    return;
-  }
-  if (tipKey !== hoverKey) {
-    tip.textContent = hoverText;
-    tipKey = hoverKey;
-  }
-  tip.hidden = false;
-  placeTip(tipPointerX, tipPointerY);
-}
-
-function tooltipForTarget(target: EventTarget | null): { key: string; text: string } | null {
+function infoTargetAt(
+  target: EventTarget | null,
+): { id: string; provider: () => InfoCardModel | null } | null {
   if (!(target instanceof Element)) return null;
-  const cellElement = target.closest('[data-cell-tip]');
-  if (cellElement !== null) {
-    const text = cellElement.getAttribute('data-cell-tip');
-    if (text !== null && text !== '') {
-      const owner = cellElement.closest('[data-node-id]');
-      const nodeId = owner?.getAttribute('data-node-id') ?? '';
-      return { key: `cell:${nodeId}:${text}`, text };
-    }
-  }
-  const edgeElement = target.closest('[data-plan-id]');
-  if (edgeElement !== null) {
-    const id = edgeElement.getAttribute('data-plan-id');
-    const plan = id === null ? undefined : planById.get(id);
-    if (plan !== undefined && plan.tooltip !== '') {
-      return { key: `plan:${plan.id}`, text: plan.tooltip };
-    }
-  }
-  const nodeElement = target.closest('[data-node-id]');
-  if (nodeElement !== null) {
-    const id = nodeElement.getAttribute('data-node-id');
-    const node = id === null ? undefined : model?.nodesById.get(id);
-    if (node !== undefined) return { key: `node:${node.id}`, text: nodeTooltip(node) };
-  }
-  return null;
+  const holder = target.closest('[data-card-id]');
+  if (holder === null) return null;
+  const id = holder.getAttribute('data-card-id');
+  if (id === null || id === '') return null;
+  const provider = infoProviders.get(id);
+  return provider === undefined ? null : { id, provider };
 }
 
 function trackHover(event: PointerEvent): void {
   tipPointerX = event.clientX;
   tipPointerY = event.clientY;
-  const target = tooltipForTarget(event.target);
-  if (target === null) {
-    hoverKey = null;
-    hoverText = '';
-    hideTip();
+  // El estado físico de Shift llega en el propio evento: así el tooltip funciona
+  // aunque la ventana del mapa no tenga el foco del teclado.
+  if (event.shiftKey !== shiftHeld) {
+    shiftHeld = event.shiftKey;
+    if (!shiftHeld && !tipFrozen) hideTipNow();
+  }
+  if (tipFrozen) return;
+  const target = infoTargetAt(event.target);
+  if ((target?.id ?? null) !== hoverCardId) {
+    hoverCardId = target?.id ?? null;
+    hoverProvider = target?.provider ?? null;
+    tipSignature = '';
+    if (shiftHeld) showTip();
     return;
   }
-  if (hoverKey !== target.key) {
-    hoverKey = target.key;
-    hoverText = target.text;
-    tipKey = null;
+  if (!shiftHeld) {
+    if (hoverCardId !== null) hideTipNow();
+    return;
   }
-  showTipAtPointer();
+  const tip = document.getElementById('map-tip');
+  if (tip === null) return;
+  if (tip.hidden) {
+    showTip();
+  } else {
+    placeTip(tipPointerX, tipPointerY);
+  }
 }
 
 function closeNodeMenu(): void {
@@ -4124,6 +6500,7 @@ function applyDisplayScope(scope: Set<string> | null): void {
   model.viewNodes = nodes;
   model.viewEdges = edges;
   model.layout = layoutFlow({ ...model.snapshot, nodes, edges }, layoutMode, layoutOptions());
+  applyMiddlewareGeometry();
 }
 
 function hideSearchResults(): void {
@@ -4143,16 +6520,11 @@ function focusFromNode(id: string, direction: FocusDirection = 'both'): void {
   focusOriginId = id;
   selectedId = id;
   selectionHighlight = false;
-  eventFilter = null;
-  eventOnly = false;
-  syncEventOnly();
-  element<HTMLSelectElement>('map-event').value = '';
   renderDetail(node);
-  applyDisplayScope(focusScope);
-  renderGraph();
-  fitToNodes([...focusScope]);
+  // «Solo esos» sigue mandando: el enfoque se cruza con el subgrafo del evento
+  // en vez de saltar a las peticiones generales de la sesión.
+  applyScopeView();
   hideSearchResults();
-  renderStatus();
   highlightInPage(node);
 }
 
@@ -4176,6 +6548,7 @@ function computeSearchResults(): FlowNode[] {
 function searchResultButton(node: FlowNode): HTMLDivElement {
   const button = document.createElement('div');
   button.className = 'map-result';
+  bindNodeInfo(button, node.id);
   button.setAttribute('role', 'button');
   button.tabIndex = 0;
   button.classList.toggle('is-selected', selectedId === node.id);
@@ -4255,6 +6628,7 @@ function traceButton(node: FlowNode): HTMLButtonElement {
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'map-trace';
+  bindNodeInfo(button, node.id);
   button.classList.toggle('is-selected', selectedId === node.id);
   const tag = document.createElement('span');
   tag.className = 'tag';
@@ -4380,6 +6754,61 @@ function renderEventFilter(): void {
   syncEventOnly();
 }
 
+function statusOption(key: string, count: number): HTMLOptionElement {
+  const option = document.createElement('option');
+  option.value = key;
+  option.textContent = `${statusKeyLabel(key)} (${String(count)})`;
+  return option;
+}
+
+function compareStatusKeys(left: string, right: string): number {
+  const leftCode = left.startsWith('code:') ? Number(left.slice(5)) : -1;
+  const rightCode = right.startsWith('code:') ? Number(right.slice(5)) : -1;
+  return leftCode - rightCode;
+}
+
+function renderStatusFilter(): void {
+  const select = element<HTMLSelectElement>('map-status-filter');
+  const counts = new Map<string, number>();
+  if (model !== null) {
+    for (const node of model.snapshot.nodes) {
+      for (const key of statusFilterKeys(node)) {
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+    }
+  }
+  // El estado llega tarde: la clave elegida se conserva aunque todavía no haya coincidencias.
+  const keys = new Set(counts.keys());
+  if (statusFilter !== null) keys.add(statusFilter);
+  select.replaceChildren();
+  const all = document.createElement('option');
+  all.value = '';
+  all.textContent = 'Todos los estados';
+  select.append(all);
+  let available = 0;
+  for (const category of STATUS_CATEGORY_ORDER) {
+    const members = [...keys]
+      .filter((key) => statusKeyCategory(key) === category)
+      .sort(compareStatusKeys);
+    if (members.length === 0) continue;
+    const group = document.createElement('optgroup');
+    group.label = STATUS_CATEGORY_LABEL[category];
+    for (const key of members) group.append(statusOption(key, counts.get(key) ?? 0));
+    select.append(group);
+    available += members.length;
+  }
+  const special = [...keys].filter((key) => statusKeyCategory(key) === 'special').sort();
+  if (special.length > 0) {
+    const group = document.createElement('optgroup');
+    group.label = 'Sin estado HTTP';
+    for (const key of special) group.append(statusOption(key, counts.get(key) ?? 0));
+    select.append(group);
+    available += special.length;
+  }
+  select.value = statusFilter ?? '';
+  select.disabled = available === 0;
+}
+
 function addStatusBox(text: string, className: string): void {
   const box = document.createElement('div');
   box.className = className === '' ? 'box' : `box ${className}`;
@@ -4387,10 +6816,54 @@ function addStatusBox(text: string, className: string): void {
   element('map-status').append(box);
 }
 
+function closeGuardOpen(): boolean {
+  const guard = document.getElementById('map-close-guard');
+  return guard !== null && !guard.hidden;
+}
+
+function hideCloseGuard(): void {
+  const guard = document.getElementById('map-close-guard');
+  if (guard !== null) guard.hidden = true;
+}
+
+function handleMapCloseBlocked(paths: readonly string[]): void {
+  const guard = document.getElementById('map-close-guard');
+  const text = document.getElementById('map-close-guard-text');
+  if (guard === null || text === null) return;
+  const dirty = dirtyCodePaths();
+  const list = dirty.length > 0 ? dirty : paths;
+  text.textContent = list.length === 0 ? 'Hay cambios sin guardar.' : list.join('\n');
+  guard.hidden = false;
+}
+
+async function saveAndCloseMap(): Promise<void> {
+  const saved = await saveAllCodeBuffers();
+  if (!saved) return;
+  hideCloseGuard();
+  ipcRenderer.send(BROWSER_PANEL_CHANNELS.map, false);
+}
+
+function discardAndCloseMap(): void {
+  codeBuffers.clear();
+  codeReveal.clear();
+  pushCodeDirty();
+  hideCloseGuard();
+  ipcRenderer.send(BROWSER_PANEL_CHANNELS.map, false);
+}
+
 function renderStatus(): void {
   const status = element('map-status');
   status.replaceChildren();
   if (!state.open) return;
+  const dirty = dirtyCodePaths();
+  if (dirty.length > 0) {
+    addStatusBox(
+      `${String(dirty.length)} ${
+        dirty.length === 1 ? 'archivo sin guardar' : 'archivos sin guardar'
+      } · Ctrl+S para guardar`,
+      'is-warn',
+    );
+  }
   if (state.error !== null) {
     addStatusBox(`Error al construir el mapa: ${state.error}`, 'is-error');
   }
@@ -4476,6 +6949,29 @@ function renderStatus(): void {
       'is-empty',
     );
   }
+  if (statusFilter !== null && model !== null) {
+    const key = statusFilter;
+    const matches = statusMatchCount(key);
+    const box = document.createElement('div');
+    box.className = matches === 0 ? 'box is-empty' : 'box';
+    const text = document.createElement('span');
+    text.textContent =
+      matches === 0
+        ? `Sin peticiones con estado ${statusKeyLabel(key)}.`
+        : `Estado ${statusKeyLabel(key)}: ${String(matches)} ${
+            matches === 1 ? 'petición' : 'peticiones'
+          } · ${String(model.viewNodes.length)} nodos visibles`;
+    const action = document.createElement('button');
+    action.type = 'button';
+    action.className = 'action';
+    action.textContent = 'Quitar filtro';
+    action.addEventListener('click', () => {
+      setStatusFilter(null);
+      renderStatusFilter();
+    });
+    box.append(text, action);
+    status.append(box);
+  }
   if (focusScope !== null && focusOriginId !== null && model !== null) {
     const origin = model.nodesById.get(focusOriginId);
     const box = document.createElement('div');
@@ -4511,16 +7007,16 @@ function setOpenUi(open: boolean): void {
 }
 
 function resetViewOnOpen(): void {
-  hideTip();
+  closeTip();
   closeNodeMenu();
-  tooltipsPinned = false;
+  hideCloseGuard();
   shiftHeld = false;
-  syncTipToggle();
   selectedId = null;
   selectionHighlight = false;
   highlightScope = null;
   eventFilter = null;
   eventOnly = false;
+  statusFilter = null;
   syncEventOnly();
   focusScope = null;
   focusOriginId = null;
@@ -4531,6 +7027,9 @@ function resetViewOnOpen(): void {
   syncKindButtons();
   pickedCell = null;
   clearCellFlash();
+  expandedNodes.clear();
+  expandedHeights.clear();
+  sectionExpanded.clear();
   searchTerm = '';
   element<HTMLInputElement>('map-search').value = '';
   hideSearchResults();
@@ -4541,12 +7040,51 @@ function resetViewOnOpen(): void {
 }
 
 interface StackStage {
+  id: 'html' | 'frontend' | 'backend' | 'database';
   tech: string;
   meta: string;
   title: string;
   types: FlowNodeType[];
   missing: boolean;
   runtime: boolean;
+}
+
+function cardForStage(stage: StackStage, snapshot: FlowSnapshot): InfoCardModel {
+  const rows: InfoRow[] = [];
+  const counts = new Map<FlowNodeType, number>();
+  for (const node of snapshot.nodes) counts.set(node.type, (counts.get(node.type) ?? 0) + 1);
+  pushInfoRow(rows, 'Capa', stage.types.map((type) => TYPE_LABEL[type]).join(' · '));
+  pushInfoRow(
+    rows,
+    'Nodos',
+    stage.types.map((type) => `${TYPE_LABEL[type]}: ${String(counts.get(type) ?? 0)}`).join(' · '),
+  );
+  pushInfoRow(rows, 'Resumen', stage.meta);
+  pushInfoRow(rows, 'Descripción', stage.title);
+  pushInfoRow(rows, 'Estado', stage.missing ? 'sin detectar' : 'detectado');
+  pushInfoRow(rows, 'Evidencia', stage.runtime ? 'RUNTIME' : 'STATIC');
+  const ids = snapshot.nodes
+    .filter((node) => stage.types.includes(node.type))
+    .map((node) => node.id);
+  return infoCard({
+    id: `stage:${stage.id}`,
+    eyebrow: 'Etapa de la cadena',
+    title: stage.tech,
+    subtitle: stage.meta,
+    status: stage.missing ? 'sin detectar' : '',
+    tone: stage.missing ? 'warn' : stage.runtime ? 'ok' : 'neutral',
+    chips: [stage.runtime ? 'RUNTIME' : 'STATIC'],
+    rows,
+    footer:
+      ids.length === 0
+        ? null
+        : {
+            label: 'Enfocar etapa',
+            onClick: () => {
+              focusStage(stage.types);
+            },
+          },
+  });
 }
 
 function stackStages(snapshot: FlowSnapshot): StackStage[] {
@@ -4576,6 +7114,7 @@ function stackStages(snapshot: FlowSnapshot): StackStage[] {
   )} formularios${interactions === 0 ? '' : ` · ${String(interactions)} interacciones`}`;
   return [
     {
+      id: 'html',
       tech: 'HTML',
       meta: pageMeta,
       title: 'Página HTML inspeccionada',
@@ -4584,6 +7123,7 @@ function stackStages(snapshot: FlowSnapshot): StackStage[] {
       runtime: interactions > 0,
     },
     {
+      id: 'frontend',
       tech: stack.frontend?.label ?? 'Frontend',
       meta:
         stack.frontend === null
@@ -4600,6 +7140,7 @@ function stackStages(snapshot: FlowSnapshot): StackStage[] {
       runtime: counts.handler > 0,
     },
     {
+      id: 'backend',
       tech: stack.backend?.label ?? 'Backend',
       meta:
         stack.backend === null
@@ -4618,6 +7159,7 @@ function stackStages(snapshot: FlowSnapshot): StackStage[] {
       runtime: counts.request > 0,
     },
     {
+      id: 'database',
       tech: stack.database?.label ?? 'Base de datos',
       meta:
         stack.database === null
@@ -4684,7 +7226,7 @@ function renderStack(): void {
     button.classList.toggle('is-missing', stage.missing);
     button.classList.toggle('is-runtime', stage.runtime && !stage.missing);
     button.disabled = !actionable;
-    button.title = stage.title;
+    bindStageInfo(button, stage.id);
     const tech = document.createElement('span');
     tech.className = 'tech';
     tech.textContent = stage.tech;
@@ -4726,6 +7268,9 @@ function applyFlowMapState(next: FlowMapState): void {
     endColumnResize();
     hideTip();
     closeNodeMenu();
+    hideCloseGuard();
+    hideMiddleware();
+    clearNodeCards();
     renderStats();
     renderStatus();
     return;
@@ -4741,6 +7286,10 @@ function applyFlowMapState(next: FlowMapState): void {
     jsonFunctionsByFile = new Map();
     jsonRequests = [];
     jsonRoutes = [];
+    jsonRouteByHandler = new Map();
+    jsonRequestByRoute = new Map();
+    jsonRouteByRequest = new Map();
+    clearNodeCards();
     nodeViews = new Map();
     edgeViews = new Map();
     edgePlans = [];
@@ -4763,6 +7312,7 @@ function applyFlowMapState(next: FlowMapState): void {
     }
     hideTip();
     closeNodeMenu();
+    hideMiddleware();
     svgById('map-svg').replaceChildren();
     renderAxis();
     if (selectedId !== null || focusScope !== null) {
@@ -4777,6 +7327,7 @@ function applyFlowMapState(next: FlowMapState): void {
       detail.replaceChildren();
     }
     renderEventFilter();
+    renderStatusFilter();
     renderSearchResults();
     renderTraces();
     renderStack();
@@ -4804,11 +7355,12 @@ function applyFlowMapState(next: FlowMapState): void {
         }
       }
       renderEventFilter();
+      renderStatusFilter();
       const viewScope = scopeForView();
       applyDisplayScope(viewScope);
       renderSearchResults();
       renderGraph();
-      if (focusScope !== null || eventOnly) {
+      if (focusScope !== null || eventOnly || statusFilter !== null) {
         const fitScope = scopeForView();
         if (fitScope === null) {
           fitView();
@@ -4841,6 +7393,7 @@ function initFlowMap(): void {
   const results = element('map-results');
   const traces = element('map-traces');
   const eventSelect = element<HTMLSelectElement>('map-event');
+  const statusSelect = element<HTMLSelectElement>('map-status-filter');
 
   const toggle = document.getElementById('map-toggle');
   if (toggle !== null) {
@@ -4879,15 +7432,6 @@ function initFlowMap(): void {
     const rect = svg.getBoundingClientRect();
     zoomAt(rect.width / 2, rect.height / 2, 1 / 1.2);
   });
-  const tipToggle = document.getElementById('map-tip-toggle');
-  if (tipToggle !== null) {
-    tipToggle.addEventListener('click', () => {
-      tooltipsPinned = !tooltipsPinned;
-      syncTipToggle();
-      showTipAtPointer();
-    });
-  }
-  syncTipToggle();
   element<HTMLButtonElement>('map-scope-all').addEventListener('click', () => {
     setTrafficMode('all');
   });
@@ -4919,6 +7463,16 @@ function initFlowMap(): void {
     setCompactMode(compactBox.checked);
   });
   syncCompact();
+
+  element<HTMLButtonElement>('map-guard-save').addEventListener('click', () => {
+    void saveAndCloseMap();
+  });
+  element<HTMLButtonElement>('map-guard-discard').addEventListener('click', () => {
+    discardAndCloseMap();
+  });
+  element<HTMLButtonElement>('map-guard-cancel').addEventListener('click', () => {
+    hideCloseGuard();
+  });
 
   search.addEventListener('input', () => {
     searchTerm = normalizeSearchText(search.value.trim());
@@ -4989,28 +7543,40 @@ function initFlowMap(): void {
       renderStatus();
     });
   }
+  statusSelect.addEventListener('change', () => {
+    setStatusFilter(statusSelect.value === '' ? null : statusSelect.value);
+  });
 
-  svg.addEventListener(
-    'wheel',
-    (event) => {
-      if (!state.open) return;
-      event.preventDefault();
-      closeNodeMenu();
-      hideTip();
-      const rect = svg.getBoundingClientRect();
-      const px = event.clientX - rect.left;
-      const py = event.clientY - rect.top;
-      zoomAt(px, py, Math.exp(-event.deltaY * 0.0015));
-    },
-    { passive: false },
-  );
-  svg.addEventListener('pointermove', (event) => {
+  const onMapWheel = (event: WheelEvent): void => {
+    if (!state.open) return;
+    const target = event.target;
+    if (target instanceof Element) {
+      const body = target.closest('.info-body');
+      if (body instanceof HTMLElement && body.scrollHeight > body.clientHeight) return;
+    }
+    event.preventDefault();
+    closeNodeMenu();
+    hideTip();
+    const rect = svg.getBoundingClientRect();
+    const px = event.clientX - rect.left;
+    const py = event.clientY - rect.top;
+    zoomAt(px, py, Math.exp(-event.deltaY * 0.0015));
+  };
+  svg.addEventListener('wheel', onMapWheel, { passive: false });
+  const middlewareHost = document.getElementById('map-middleware');
+  if (middlewareHost !== null) {
+    middlewareHost.addEventListener('wheel', onMapWheel, { passive: false });
+  }
+  const cardsHost = document.getElementById('map-cards');
+  if (cardsHost !== null) {
+    cardsHost.addEventListener('wheel', onMapWheel, { passive: false });
+  }
+  const mapRoot = element('map');
+  mapRoot.addEventListener('pointermove', (event) => {
     if (!state.open || pan !== null || columnResize !== null) return;
     trackHover(event);
   });
-  svg.addEventListener('pointerleave', () => {
-    hoverKey = null;
-    hoverText = '';
+  mapRoot.addEventListener('pointerleave', () => {
     hideTip();
   });
   svg.addEventListener('contextmenu', (event) => {
@@ -5071,11 +7637,39 @@ function initFlowMap(): void {
 
   window.addEventListener('keydown', (event) => {
     if (!state.open) return;
-    if (event.key === 'Shift') {
-      setMapShiftHeld(true);
+    const target = event.target;
+    const editing =
+      target instanceof HTMLTextAreaElement && target.classList.contains('info-editor');
+    if ((event.ctrlKey || event.metaKey) && (event.key === 's' || event.key === 'S')) {
+      event.preventDefault();
+      ctrlPending = false;
+      saveCodeFromKeyboard();
       return;
     }
+    if (event.key === 'Shift') {
+      if (!editing) setMapShiftHeld(true);
+      return;
+    }
+    // Ctrl alterna el bloqueo solo en pulsación corta: Ctrl+S es un acorde y no debe bloquear.
+    if (event.key === 'Control') {
+      if (event.repeat) return;
+      ctrlPending = !editing;
+      return;
+    }
+    ctrlPending = false;
     if (event.key !== 'Escape') return;
+    if (editing) {
+      target.blur();
+      return;
+    }
+    if (closeGuardOpen()) {
+      hideCloseGuard();
+      return;
+    }
+    if (tipFrozen) {
+      closeTip();
+      return;
+    }
     if (menuNodeId !== null) {
       closeNodeMenu();
       return;
@@ -5087,13 +7681,26 @@ function initFlowMap(): void {
     ipcRenderer.send(BROWSER_PANEL_CHANNELS.map, false);
   });
   window.addEventListener('keyup', (event) => {
-    if (event.key !== 'Shift') return;
-    setMapShiftHeld(false);
+    if (event.key === 'Shift') {
+      setMapShiftHeld(false);
+      return;
+    }
+    if (event.key !== 'Control' || !ctrlPending) return;
+    ctrlPending = false;
+    toggleMapTipFreeze();
   });
   window.addEventListener('blur', () => {
     setMapShiftHeld(false);
+    ctrlPending = false;
     closeNodeMenu();
   });
 }
 
-export { applyFlowJsonState, applyFlowMapState, initFlowMap, setFlowCardRequests, setMapShiftHeld };
+export {
+  applyFlowJsonState,
+  applyFlowMapState,
+  applyFlowRequestState,
+  handleMapCloseBlocked,
+  initFlowMap,
+  setMapShiftHeld,
+};

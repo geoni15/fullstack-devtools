@@ -1776,3 +1776,413 @@ grafo y una celda se sigue hasta la consulta que la produjo sin cambiar de venta
 contrapartida es que un snapshot con muchas tablas y filas hace más pesado el layout y el dibujo; se
 acepta a cambio de la continuidad, con la optimización prevista pendiente.
 
+## ADR-065 — Cuerpos JSON completos para auditar el dato real
+
+**Contexto:** ADR-016 y ADR-063 enmascaraban las claves sensibles de los cuerpos JSON en el proceso
+principal. Al auditar peticiones reales, el usuario comprobó que la contraseña enviada por el
+frontend aparecía como `[enmascarado]` y rechazó ese comportamiento: necesita ver el valor exacto
+que viaja en el cuerpo, igual que ya ve las filas devueltas por SQL.
+
+**Decisión:** (1) `sanitizeJsonBody` deja de sustituir claves sensibles: valida que el cuerpo sea un
+objeto o array JSON, copia los valores tal cual y conserva únicamente el presupuesto de 16 000
+caracteres y el límite de profundidad. (2) El enmascarado de cabeceras y query sensibles
+(`authorization`, `cookie`, `set-cookie`, `x-api-key`, `password`, `token`, `secret`, `jwt`,
+`session`) sigue intacto, igual que el de los secretos de la auditoría de seguridad. (3) Los cuerpos
+siguen viviendo solo en memoria, no se escriben en disco y no se exportan; la interfaz lo declara en
+lugar de prometer anonimización.
+
+**Consecuencia:** el mapa y el panel muestran el cuerpo JSON íntegro, incluidas contraseñas y
+tokens, que es lo que el usuario necesita para reproducir y auditar el tráfico. La contrapartida es
+explícita: quien mire la pantalla o el detalle de una petición verá datos sensibles reales. Las
+cabeceras y la URL siguen saneadas, y la captura no persiste nada.
+
+## ADR-066 — Foco, conectores y tooltips del mapa con la evidencia visible
+
+**Contexto:** cuatro comportamientos del mapa contradecían la evidencia que el usuario estaba
+mirando. (a) El tooltip con Shift dependía del foco de teclado de la ventana del mapa y no cubría
+las superficies HTML del JSON. (b) Los conectores del middleware preferían la función de backend
+resuelta por la pila y no la ruta que realmente atiende el endpoint. (c) «Ver interacciones»
+borraba el filtro «Solo esos» y devolvía al grafo general. (d) Al trazar una celda SQL, los cuerpos
+JSON seguían mostrando toda su estructura.
+
+**Decisión:** (a) El estado de Shift se toma también de `event.shiftKey` en cada `pointermove` y el
+seguimiento de hover se enlaza a la raíz `#map`, no solo al SVG; las tarjetas del middleware, el
+rail de movimientos JSON y la lista de interacciones llevan `data-map-tip` con el mismo detalle del
+nodo. (b) Los conectores resuelven primero la ruta por método y camino; si el movimiento no trae
+método, usan la arista `HANDLES` ruta → función y, como último recurso, la función. El lado del
+frontend prefiere la petición que coincide y, si no, la que llega a la ruta por `MATCHES`. (c) El
+enfoque ya no toca el filtro por evento: `applyScopeView` cruza el alcance del nodo con el subgrafo
+del evento, de modo que «Solo esos» sigue gobernando la vista. (d) Mientras hay una celda SQL
+seleccionada, `formattedJson` poda recursivamente cada cuerpo JSON y conserva solo las ramas que
+contienen el valor de la celda, con sus ancestros; si no hay coincidencia lo declara. La poda es una
+heurística por valor, no una prueba de linaje, y así se mantiene en el texto.
+
+**Consecuencia:** el tooltip responde al gesto físico aunque la ventana no tenga el foco; los
+mensajes JSON llegan a la ruta que los atiende; los filtros no se pierden al enfocar; y la celda
+elegida deja a la vista solo el dato que le corresponde. La contrapartida es que dos valores
+idénticos en el mismo cuerpo conservan ambas ramas y que un valor formateado de forma distinta en el
+JSON y en la rejilla no se reconoce: se muestra «sin coincidencias» en lugar de inventar una
+relación. ADR-067 sustituye `data-map-tip` por `data-card-id` y elimina esas tarjetas de «sin
+coincidencias»: los movimientos sin el valor se descartan y solo queda el mensaje de vacío.
+
+## ADR-067 — Ficha única de propiedades fijas y tooltip congelable con Ctrl
+
+**Contexto:** el tooltip del mapa se rellenaba con texto suelto y se quedaba pegado al pasar el
+cursor; cada superficie repetida —nodo, celda, JSON, corredor, etapa, detalle— construía su propio
+HTML, así que los filtros de alcance solo se aplicaban a algunas. Al enfocar desde una celda SQL,
+los movimientos JSON ajenos seguían presentes como tarjetas con el texto «Sin coincidencias para
+… en este cuerpo JSON.».
+
+**Decisión:** (1) **Una sola ficha.** `infoCard` normaliza un `InfoCardModel` con propiedades
+fijas —id, ceja, título, subtítulo, estado, tono, chips, filas, secciones, ubicación y pie—;
+`renderInfoCard` la dibuja y `mountInfoCard` registra su proveedor en `infoProviders` con un id
+estable expuesto en `data-card-id`. Nodos, corredores, celdas, movimientos JSON, etapas de la
+cadena, detalle, tooltip, raíl, banda middleware, resultados del buscador e interacciones pasan por
+esa ficha; el detalle de tabla monta la ficha del nodo y, si hay celda elegida, la de la celda, y
+se eliminan `renderTableDetail` y las listas paginadas propias del detalle. Las secciones de código
+—SQL por consulta y cuerpos JSON— nacen plegadas y alternan en el propio DOM además de actualizar
+su set de expansión. (2) **Tooltip.** Shift lo muestra de forma transitoria; Ctrl lo fija o lo
+suelta. Fijo acepta puntero, sobrevive a `pointerleave` y a los re-render, y su esquina superior
+derecha muestra un div con el texto exacto `bloquear`. El gesto se lee en la ventana del mapa; no
+hay un segundo canal IPC para congelar. (3) **Alcance JSON.** `jsonScopeForView` cruza `focusScope`
+con el subgrafo del evento y `jsonMovementVisible` exige que el dueño o un extremo esté dentro;
+además, con una celda elegida, los movimientos cuyo cuerpo no contiene el valor se eliminan de
+raíl y middleware en lugar de mostrarse como tarjetas vacías.
+
+**Consecuencia:** una superficie nueva solo declara su modelo y su proveedor; hereda tooltip,
+secciones plegadas, evidencia, ubicación y acción sin HTML paralelo. Congelar conserva scroll y
+enlaces de la ficha, y el usuario puede recorrerla sin que el hover la cierre. El coste es que el
+tooltip fijo queda fuera de la actualización de hover hasta que se suelta Ctrl, y que un cuerpo
+descartado por no contener el valor solo se anuncia en el mensaje de vacío de la superficie.
+
+**Nota editorial (2026-11-16):** `jsonScopeForView` era idéntico a `scopeForView` y se unificó en
+una sola función (`scopeForView`); el alcance JSON y el del grafo comparten ya el mismo cálculo.
+
+## ADR-068 — El inspector de Node solo se conecta con la inspección activada
+
+**Contexto:** la conexión CDP al backend (`NodeInspector`) se abría en `configure` en cuanto había
+puerto de inspector, con independencia del interruptor de inspección. Con la inspección apagada la
+app debía quedar inerte —sin escaneos automáticos ni dominios CDP fuera del toggle—, pero el socket
+al backend y los drenajes de SQL y JSON cada 400 ms seguían vivos. Eso mantenía trabajo periódico
+y captura de datos del backend aunque el usuario hubiera desactivado la inspección.
+
+**Decisión:** la captura del backend (N2, SQL y JSON) queda ligada **solo al interruptor de
+inspección**, no al cierre del mapa por separado. (1) `NodeInspector.disconnect()` es público y
+calcado de `dispose()` salvo que no marca `disposed` ni vacía `routes`: sube la generación, cierra
+el socket —lo que ya detiene los temporizadores de SQL y JSON—, limpia `recent`/`recentSql`/
+`breakpoints`/`scripts` y publica `runtime` en `off` con un mensaje en español. Las rutas se
+conservan para que una reconexión vuelva a aplicar los puntos de parada. (2) `configure` conecta
+únicamente si `inspectionEnabled` y hay puerto, mediante `connectRuntimeIfEnabled()`, que no
+reconecta si el runtime ya está `connected` o `connecting`; al final de `configure` se reconcilia
+el estado por si el interruptor cambió durante los `await` (carrera con `setInspection(true)` o con
+el fallo de `installInspector`, que fuerza la inspección a apagada). (3) `setInspection(false)`
+llama a `disconnect()`; `setInspection(true)` reconecta si hay puerto y el runtime no está activo.
+`onSqlCaptured` sigue alimentando también el panel, así que no se ata la captura al mapa.
+
+**Consecuencia:** con la inspección apagada no hay socket al puerto del inspector ni drenajes de
+400 ms: el backend no aporta SQL, JSON ni ejecuciones N2 y el proceso queda inerte. Al reactivar,
+la conexión es nueva y no recupera el historial observado antes de apagar (los búferes en memoria
+del controlador conservan lo ya capturado, pero el inspector no reenvía lo anterior). El análisis
+estático sigue disponible siempre. El coste es que apagar y encender la inspección reinicia la
+conexión CDP del backend en lugar de reutilizarla.
+
+## ADR-069 — Evidencia directa por coincidencia de ubicación archivo:línea(:columna)
+
+**Contexto:** varias correlaciones se etiquetaban `direct` con solo coincidir el nombre de la
+función iniciadora o el texto SQL normalizado. Un nombre no prueba que ese manejador concreto
+iniciara la petición —puede haber funciones homónimas ejecutadas en otro momento— y el mismo SQL
+puede aparecer en varios sitios. Eso presentaba como demostrada una asociación que era heurística.
+
+**Decisión:** una correlación solo es `direct` cuando la ubicación del iniciador coincide
+exactamente con la del manejador o del sitio estático; la nota cita `archivo:línea`. El nombre
+suelto o la ventana temporal quedan `heuristic`, incluso si antes se etiquetaban `direct`. Tres
+sitios independientes: (1) **SENDS** (`projectHandlerInitiators`): se indexan todas las pilas de
+`initiator.frames` por `url:línea` y se cruzan con `url:línea` del `RuntimeHandlerLink`; si coincide,
+arista `direct` con nota de ubicación; si solo coincide el nombre de `frames[0]`, arista `heuristic`
+como antes. Un enlace con ubicación pero sin nombre también puede generar arista directa. (2)
+**Clic ↔ petición** (`requestCorrelation`): la sesión conserva el `RequestInitiator` de cada
+petición y el manejador resuelto vive en `card.handler`; la correlación es `direct` si algún frame
+igualda `url`, `line` y `column` del `InspectionHandler`, y `heuristic` en otro caso. Se elimina
+`session.handlerName`: el nombre ya no concede `direct`. (3) **SQL ↔ estática** (`applyCapturedSql`):
+primera pasada por sitio de llamada —`execution.frames` convertido a ruta relativa del workspace
+frente al prefijo `archivo:línea:columna:` del id de sitio de la consulta estática— → `direct`;
+respaldo por `normalizeSqlText` → `heuristic`. La base de la coincidencia se añade a la nota de la
+consulta con `joinNotes`. No se fuerzan normalizaciones agresivas de URL: lo que no casa por
+sourcemaps o transpilación sigue heurístico, que es lo correcto. No se tocan MATCHES, PROVENANCE,
+las ventanas de 3 s, la poda JSON por valor ni el respaldo numérico.
+
+**Consecuencia:** las etiquetas son honestas: `direct` exige una ubicación compartida verificable.
+El coste es una bajada de etiqueta en los casos que antes parecían directos por nombre o por texto
+—sobre todo clic ↔ petición, donde la línea del sitio de llamada del manejador rara vez coincide
+con la línea del frame iniciador— y que la evidencia directa depende de que el código servido
+conserve las líneas del fuente (build de desarrollo con source maps inline). Las consultas SQL
+compartidas entre rutas ya no se marcan ejecutadas en ambas por el mero texto: solo casa el sitio
+real, y el resto queda rotulado como heurístico.
+
+## ADR-070 — Cada modo enseña solo su categoría, en el tooltip y en el panel
+
+**Contexto:** los cinco modos prometían «solo la información del modo activo», pero los builders
+del tooltip anteponían las mismas filas de cadena frontend (`runtimeChainRows` /
+`runtimeOriginRows`) en Backend, JSON y SQL, y el modo Frontend añadía SQL y base de datos. El
+panel acoplado ni siquiera miraba el modo: pintaba siempre todas las secciones. El modo SQL solo
+consultaba el índice estático —todo `possible`— y nunca el SQL observado que ya vivía en
+`runtimeSql`, así que sin ruta estática no se veía ninguna consulta. El resultado era ruido: quien
+va a la pestaña SQL recibe la cadena de render, y quien va a Frontend recibe consultas que no pidió.
+
+**Decisión:** una sola política de categorías para las dos superficies. `html` = selector, tamaño,
+estilos calculados agrupados, atributos y texto; `frontend` = texto/form/enlace, React/Vue, cadena
+de render, dato, manejador y código, eventos, pila del iniciador e identidad de la petición;
+`backend` = ruta, código del manejador, petición que atiende y evidencia de ejecución; `request` =
+coincidencia JSON, objeto contenedor, petición observada y cuerpo; `database` = SQL estático **y
+observado** asociado, operación, tablas, columnas, dialecto, driver, sitio y una fila de asociación.
+Se elimina `runtimeChainRows`: `runtimeOriginRows` queda solo para Frontend y una nueva
+`runtimeRouteRows` sirve la ruta a Backend y de base de asociación a SQL. El SQL asociado sale de
+`associatedSql([route])`, que comparten el tooltip y la tarjeta de clic, con una regla única: sin
+ruta resuelta no hay SQL y se dice; la sentencia estática que casa por `normalizeSqlText` con
+`runtimeSql` es `OBSERVADA` + `direct`; una observación con breakpoint de la ruta también es
+`direct`; una observación sin sitio estático solo se acepta si su `archivo:línea` cae dentro del
+rango del manejador, y entonces es `heuristic`. `applyCapturedSql` deja de añadir cualquier
+ejecución dentro de la ventana de 3 s: exige sitio coincidente, SQL de la ruta, rango del manejador
+o breakpoint. En el panel, `MODE_SECTIONS` oculta las secciones que no son del modo —no las atenúa—
+y una nueva sección HTML/CSS pinta `InspectionCard.elementInfo`, leído por `resolveClick` con la
+misma pasada CDP que ya resolvía el manejador (`nodesAt` → `elementInfo` → `findHandler`); las
+consultas muestran por fin la rejilla de columnas y filas reales de `query.result`. Los helpers de
+presentación del elemento (`elementSelectorLabel`, `elementStyleGroups`, `elementSizeLabel`,
+`ELEMENT_STYLE_GROUPS`) viven en `@bdt/protocol` para que tooltip y panel no puedan divergir; los
+locales del main se eliminan.
+
+**Consecuencia:** cada pestaña y cada tooltip responden solo a su categoría, y el modo SQL enseña
+sentencias ejecutadas de verdad cuando el inspector de Node está conectado. El coste es que la
+cadena completa ya no se ve de un vistazo en un solo modo: hay que cambiar de pestaña, que es
+justo lo que el usuario pedía. La lectura CDP del elemento añade una ida al navegador por clic,
+siempre bajo inspección activada y acción del usuario.
+
+## ADR-071 — El tooltip de la página no intercepta el puntero y se bloquea con Ctrl
+
+**Contexto:** el host `bdt-hover-tip` nacía con `pointer-events: auto` y el listener de `mousemove`
+retornaba cuando el target era el propio host: un movimiento rápido metía el cursor dentro de la
+tarjeta y el hover se congelaba. En la página no existía el bloqueo con Ctrl que sí tiene el mapa
+(ADR-067), y el código mostrado no era clicable, así que no se podía saltar a la línea que lo generó.
+
+**Decisión:** el host lleva `pointer-events: none` por defecto y `auto` solo cuando está fijado; la
+caja de resaltado sigue sin aceptar puntero. El bloqueo es un estado `tipFrozen` del mundo aislado
+con `globalThis.__bdtSetTipFrozen`: fijado, la tarjeta sobrevive a soltar Shift, a `endHover`, al
+scroll, al blur, al cambio de modo y a `__bdtHideTip`, conserva contenido y scroll, y muestra en la
+esquina superior derecha un div con el texto exacto `bloquear` que suelta el bloqueo al hacer clic;
+`Escape` suelta y oculta. **Una sola autoridad por pulsación:** el mundo de la página lee Ctrl en su
+propio `keydown` y el main lo lee en el `before-input-event` existente solo para los contents que no
+son la vista inspeccionada ni la ventana del mapa —el mapa tiene su propio Ctrl—, de modo que cada
+pulsación la procesa exactamente un lado. La señal `tip-frozen` mantiene `hoverTipFrozen` en
+sincronía; con la tarjeta fijada `inspectHover` retorna sin resolver (ahorra CDP y no pisa la
+tarjeta) y al soltar se llama a `refreshHover`. El estado se reinicia en cada navegación porque el
+mundo aislado se recrea. Una línea `.hint` fija en la raíz del shadow explica los atajos en los
+cinco modos. `HoverTipCode` gana `path` y `endLine` —`file` pasa a ser solo etiqueta visible— y, con
+la tarjeta fijada, la cabecera y cada línea del código son botones que envían la señal `reveal`; el
+main la despacha al `CODE_LOCATION_REQUEST_SCHEMA` y a `revealCode`, que ya normaliza contra la raíz
+del workspace. No se abre ningún canal nuevo ni se expone `ipcRenderer` a la página: el binding
+sigue añadido con el `executionContextId` del mundo aislado.
+
+**Consecuencia:** el hover ya no se congela al pasar por encima de la tarjeta y el código se puede
+abrir en la línea exacta. El coste es que la tarjeta fijada deja de seguir al puntero hasta que se
+suelta, y que el salto al código depende de que la ruta servida se resuelva dentro del proyecto
+abierto; fuera de él se rechaza, como cualquier otro enlace al código.
+
+## ADR-072 — Fila de intercambio: las dos peticiones a la altura del JSON
+
+**Contexto:** en el mapa solo se leían los cuerpos JSON. Los nodos `request` y `route` son cajas de
+30/48 px en sus columnas, a otra altura, y su tarjeta no llevaba cabeceras ni cuerpos porque
+`FlowNode` no los transporta y el mapa nunca recibía `CapturedRequest`. Las cabeceras de respuesta
+ni siquiera se capturaban: `RequestBuffer.setHeaders` no se llamaba en producción.
+
+**Decisión:** el mapa recibe el detalle real de cada petición por un push calcado del de JSON:
+`FlowRequestDetail` (`CapturedRequest` con `requestBodyOmitted`/`responseBodyOmitted`) y
+`FlowRequestState` por el canal `browser-panel:request-data`, emitido en el mismo temporizador
+(`scheduleDataPush`) y con los cuerpos enviados una sola vez (`requestBodySent` + caché en el
+preload). Los ids casan directamente: `FlowNode.requestIds` contiene el `storeId` de CDP.
+`CapturedRequest` gana `responseHeaders` y `setResponseHeaders` se llama desde `onResponseReceived`;
+las cabeceras siguen enmascaradas en el main y los cuerpos JSON crudos por la excepción deliberada
+de AGENTS §3. La banda middleware pasa a ser una rejilla de tres columnas `.mw-grid` dentro del
+hueco actual: `justify-content: space-between` con laterales de 400 px y la banda central de 500 px
+deja la columna del JSON **exactamente** en la x que ya tenía, y `align-items: start` alinea las
+tres tarjetas de cada fila. El contenedor es `position: absolute` —sigue siendo el `offsetParent`
+de las tarjetas— y `pointer-events: none`, con solo las tarjetas en `auto`, para que arrastrar en
+el hueco entre tarjetas siga desplazando el mapa. Una fila por intercambio: los movimientos
+`request`/`response` visibles más los nodos `request` que no tienen ningún movimiento que case por
+método y camino, de modo que las peticiones se ven aunque no haya inspector de Node; con una celda
+SQL elegida esas filas sin cuerpo se eliminan. Las tarjetas laterales se construyen con el mismo
+`infoCard` → `mountInfoCard` y proveedores registrados (`req:{fila}`, `route:{fila}`), con filas de
+la petición o de la ruta y secciones plegadas de cabeceras, cuerpos, pila del iniciador y SQL de
+los nodos `query` enlazados por `QUERIES`. La petición concreta se elige por id exacto y, si no,
+por método y camino con la más cercana al movimiento: esa elección es heurística y se rotula. Cada
+fila dibuja cuatro bézier —nodo frontend → tarjeta izquierda → JSON → tarjeta derecha → nodo
+backend— con `data-card-id` de la tarjeta, y la altura de la rejilla se suma al layout antes de
+`fitView`. El eje gana dos etiquetas sin grip (`PETICIONES · n`, `RUTAS · n`) y el LOD pasa a
+`.mw-grid *`. Si el hueco no da para tres columnas queda la banda central sola; en jerárquico no hay
+rejilla. Se elimina la ruta muerta `setFlowCardRequests`/`currentCardRequests`: el pie «Ver petición»
+nunca aparecía y, de haber aparecido, `selectPanelRequest` no hace nada cuando el id no está en la
+tarjeta de clic actual; en su lugar la tarjeta del nodo `request` enseña el contenido capturado real
+desde la caché nueva.
+
+**Consecuencia:** cada intercambio se lee completo en una fila a la altura del JSON, con las dos
+peticiones expandibles y sin perder la separación entre columnas. El coste es altura de lienzo
+—las tarjetas laterales son más altas que la del JSON— y que la asociación petición ↔ ruta sigue
+siendo por método y camino, no un linaje demostrado. Las cabeceras de respuesta solo existen para
+las peticiones capturadas después de este cambio.
+
+## ADR-073 — Compacta de tres líneas y tarjetas desplegables en todos los nodos
+
+**Contexto:** la vista compacta dibujaba una sola línea de 30 px y solo los nodos `query` con SQL
+tenían chevrón de expansión. Se pidió que la compacta enseñara las mismas tres líneas que la no
+compacta y que, al desmarcarla, **cualquier** tipo de nodo se desplegara como las tarjetas de
+peticiones y JSON, no solo esas dos.
+
+**Decisión:** `FLOW_NODE_COMPACT_HEIGHT` pasa a 48, el mismo valor que `FLOW_NODE_HEIGHT`, y
+`createNodeGroup` y `naturalNodeWidth` tienen una sola rama de dibujo: tipo + badge, título y
+subtítulo + hora. La compacta sigue activada por defecto y sigue empaquetando más denso
+(`COMPACT_ROW_GAP` 12, `COMPACT_HIERARCHY_V_GAP` 96); lo que cambia es la caja, no la densidad. En
+compacta no hay chevrons ni capa HTML: el detalle completo sigue disponible con Shift y con clic.
+En no compacta se añade la capa HTML `#map-cards` / `#map-cards-world`, hermana de `#map-middleware`
+y bajo el eje, que aplica el mismo `translate(x, y) scale(k)` del viewport
+(`syncOverlayTransforms`); el contenedor es `pointer-events: none` y solo las tarjetas son `auto`,
+con `user-select: text`. El SVG conserva geometría, fondo, contorno de selección e interacción: en
+no compacta dibuja `rect.box` y `rect.bar` sin textos y la tarjeta se monta exactamente en
+`placed.x/y` con `placed.width`. Solo los nodos visibles tienen tarjeta —se monta y desmonta en el
+mismo punto que el culling— y por debajo de `TEXT_MIN_ZOOM` la capa queda `visibility: hidden`, no
+`display: none`, para no romper la medición. `InfoCardOptions` gana la variante `'node'` y el flag
+`collapsed`: plegada es la proyección de tres líneas del mismo `InfoCardModel`, desplegada es
+`cardForNode` completo con sus filas y secciones. Cada tarjeta registra el proveedor
+`canvas:<nodeId>` para no pisar el `node:` del SVG. La expansión se unifica en `expandedNodes` y
+`sectionExpanded` con claves prefijadas (`json:`, `sql:`, `code:`, `req:`, `route:`), que sustituyen
+a `sqlExpandedNodes`, `jsonExpandedBodies` y `middlewareExpanded`; las firmas filtran por prefijo
+para no repintar una superficie cuando se abre una sección de otra. Se eliminan
+`appendSqlChevron`, `toggleSqlNode`, `sqlExpandedHeight`, `sqlStartY`, `SQL_LINE_HEIGHT` y
+`SQL_EXPANDED_MIN_WIDTH`: el SQL de un `query` vuelve a ser una sección plegable. La altura plegada
+es fija por CSS explícito; la desplegada se mide (`offsetHeight` → `expandedHeights`) y, como el
+ancho no cambia al desplegar, basta una pasada de corrección protegida por `cardHeightPass`. Las
+tablas son la excepción deliberada: no montan tarjeta y su despliegue sigue siendo la rejilla SQL
+del SVG con interacción por celda. La tarjeta que contiene el editor con foco no se reconstruye:
+`syncFocusedCodeEditor` la sincroniza en sitio y `captureCodeFocus`/`restoreCodeFocus` conservan el
+`scrollTop` del textarea.
+
+**Consecuencia:** una sola ruta de expansión y una sola ficha para todas las superficies, con texto
+seleccionable en no compacta. El coste es una capa HTML más que sigue el pan/zoom y una medición de
+alturas tras cada despliegue; en compacta el detalle sigue viviendo en el tooltip y el panel de
+detalle, no en el nodo.
+
+## ADR-074 — Márgenes por grupo: 40 px al hueco, 32 px internos, 176 px dentro de cada grupo
+
+**Contexto:** el hueco frontend→backend era `LAYER_GAP * 15` (2640 px) y la rejilla de intercambio
+repartía con `justify-content: space-between`, lo que dejaba unos 630 px entre las tres tarjetas.
+Se pidió separar los tres grupos —frontend, intercambio, backend— por el mismo margen y quitar el
+hueco interno, manteniendo intacta la separación entre columnas dentro de cada grupo.
+
+**Decisión:** se elimina `FRONTEND_BACKEND_GAP`. `FlowLayoutOptions` gana `boundaryGap` y
+`layerGap(left, right, boundaryGap)` solo lo aplica en la frontera frontend→backend; el resto de
+huecos sigue en `LAYER_GAP` (176 px). `exchangeGapWidth()` devuelve
+`INSET*2 + SIDE_WIDTH*2 + MAX_WIDTH + SIDE_GAP*2` = 1444 px y `exchangeActive()` se decide **antes**
+de `layoutFlow` con la misma lista filtrada que alimenta `buildMiddlewareRows` —movimientos JSON
+visibles más nodos `request` del subgrafo—, nunca con posiciones colocadas, para no crear una
+dependencia circular. Sin datos de intercambio el hueco vuelve a 176 px y `computeMiddlewareBand`
+devuelve `null`, como antes. `MIDDLEWARE_SIDE_GAP` baja de 48 a 32 y la rejilla pasa a
+`justify-content: start` con `column-gap: 32px` y ancho igual a la suma de columnas más huecos, de
+modo que la separación interna es siempre 32 px también cuando las laterales se degradan.
+`computeMiddlewareBand` conserva su fórmula: con 1444 px e inset 40 salen `sideWidth` 400 y
+`width` 500 exactos. Los suelos de las curvas de `middlewareLink` se acotan
+(`clamp(span*0.45, 8, 320)` y `clamp(span*0.2, 6, 160)`) porque con 32 px de hueco los puntos de
+control sobresaldrían.
+
+**Consecuencia:** los tres grupos quedan separados por 40 px a cada lado del hueco y las tarjetas
+por 32 px, sin tocar la separación entre columnas. El mapa pierde unos 1200 px de ancho y `fitView`
+se recalcula solo; el modo jerárquico no tiene zona de intercambio y no se ve afectado.
+
+## ADR-075 — Peso real en bytes para todos los nodos
+
+**Contexto:** el peso solo existía en las peticiones y `bodySizeLabel` contaba caracteres JS, no
+bytes. Se pidió mantenerlo y extenderlo a todos los nodos con bytes reales del código.
+
+**Decisión:** el protocolo añade `FlowNodeWeight { bytes: number | null; basis: 'file' | 'range' |
+'rows' | 'bodies'; note: string | null }` y `FlowNode.weight`. `NodeWeightMeter.apply` es un
+post-paso de `refreshFlow`, después de `buildFlowSnapshot`, y solo se ejecuta con el mapa o la
+inspección activos. `range` mide los bytes UTF-8 de las líneas `line..endLine`; `file` usa
+`stat.size` cuando el nodo no tiene rango; `rows` suma las celdas observadas de las consultas
+enlazadas a cada tabla o base —cada consulta una sola vez por destino aunque tenga aristas de
+lectura y escritura— y lo rotula como muestra observada, no como tamaño en disco; `bodies` suma el
+cuerpo enviado y el recibido de los `requestIds`. La lectura pasa por `createRootScope` y
+`scope.resolve`, con caché acotada a 4000 entradas por `rutaReal:mtimeMs:línea:fin`. Un archivo
+binario, mayor de 2 MiB o ilegible degrada al peso del archivo completo con nota; sin carpeta
+abierta, fuera de la raíz o archivo inexistente el peso es `null` con nota honesta: nunca se inventa
+«0 B». En la UI, `byteSizeLabel` sustituye a `bodySizeLabel`, los cuerpos JSON se miden con
+`TextEncoder`, `cardForNode` añade la fila «Peso» y el nodo compacto lo pinta en la primera línea
+junto al badge, incluido su ancho en `naturalNodeWidth`.
+
+**Consecuencia:** el peso es medible y verificable, con el origen declarado. El coste son lecturas
+de archivo para los nodos con rango, cacheadas por `mtimeMs` y limitadas a la raíz abierta; el peso
+de tablas y bases sigue siendo el de la muestra capturada, no el del almacén.
+
+## ADR-076 — Una sola ruta de escritura y código editable en mapa, IDE y panel
+
+**Contexto:** no existía ningún canal de escritura, Monaco era de solo lectura y el código del mapa
+y del panel salía de `readCodeBlock`, que recorta a 80 líneas y 320 caracteres: editar ese bloque
+perdería contenido. Se pidió que todo el código visible al desplegar fuera editable y se guardara
+con Ctrl+S, avisando de los cambios sin guardar.
+
+**Decisión:** `FileContent` gana `mtimeMs` y el protocolo añade `file:save` con
+`SAVE_FILE_REQUEST_SCHEMA` (`path` ≤ 4096, `content` ≤ 2 MiB, `baseMtimeMs`) y resultado
+`IpcResult<FileSaveResult>`. El handler exige main frame y `canAccessProjectFiles` —
+`isTrustedSender(event, window) || isInspectorUiSender(browser, event)`, helper que se exporta de
+`chrome-ipc.ts`—, de modo que el mapa y el panel acoplado pueden guardar y la página inspeccionada
+no alcanza el canal. `fs/atomic-write.ts` concentra la escritura: `writeTextAtomic` escribe un
+temporal con nombre aleatorio, conserva el modo del original y renombra, limpiando el temporal si
+algo falla; `saveTextFile` resuelve con root-guard, **exige que el archivo exista** (no se crean
+archivos nuevos), compara `mtimeMs` con tolerancia de 1 ms y lanza `FILE_CONFLICT`, `WRITE_FAILED`
+o `FILE_TOO_LARGE`. `launch-settings.persist` se refactoriza para usar el mismo helper: una única
+ruta de escritura en el main. Mapa y panel reutilizan `file:read` y `file:save` por `invoke` desde
+su preload, sin `contextBridge` nuevo ni canales `browser-panel:*` para leer o guardar. El código se
+edita sobre el **archivo completo** (`codeBuffers` por ruta con `baseMtimeMs`, `dirty`, `loading`,
+`error` y `conflict`), nunca sobre el bloque recortado; la sección «Código · archivo (líneas X–Y)»
+está plegada siempre, incluso con la compacta desmarcada, y encuadra el rango del nodo. Ctrl+S
+guarda el editor con foco, o el único buffer sucio, o todos en secuencia; Ctrl alterna el bloqueo
+del tooltip solo en **pulsación corta** (`ctrlPending` se marca en keydown, cualquier otra tecla lo
+cancela y el keyup de Control lo confirma), así Ctrl+S no bloquea. El aviso es doble: «Sin guardar»
+en la sección y caja de estado «N archivos sin guardar · Ctrl+S para guardar». Al cerrar el mapa,
+`browser-panel:map-dirty` lleva la lista de rutas sucias al main y `unified-window` no cierra:
+emite `map-close-blocked` y el mapa ofrece «Guardar y cerrar» —guarda todos en secuencia y solo
+cierra si todos salen bien—, «Descartar y cerrar» y «Cancelar». Un conflicto en disco nunca se
+sobrescribe en silencio: se ofrecen «Recargar» y «Guardar encima», que relee el `mtimeMs`. En el
+IDE, Monaco pasa a editable y se crea una vez por pestaña (deps `[language]`); el `setValue` externo
+solo se aplica con la pestaña limpia, `onDidChangeModelContent` marca `dirty` y
+`addCommand(Ctrl/Cmd+S)` guarda. `OpenTab` gana `buffer`, `dirty`, `mtimeMs` y `externalChange`; el
+aviso del watcher no dice qué archivo cambió, así que se relee solo lo que ya está abierto y se
+compara por `mtimeMs`: pestaña limpia → recarga, pestaña sucia → `externalChange` sin pisar lo
+editado. El cierre de una pestaña sucia pide confirmación. En el panel acoplado, `renderCode` pasa
+a sección plegada con textarea de texto plano, buffers por ruta y editores por contenedor, con su
+propio Ctrl+S; el resaltado de sintaxis sigue en Monaco.
+
+**Consecuencia:** el código es fiel y editable en las tres superficies con una sola ruta de
+escritura, atómica, dentro de la raíz y con conflicto detectado. El coste es que el editor del mapa
+y del panel es texto plano sin resaltado, que no se pueden crear archivos nuevos y que el cierre de
+la aplicación no comprueba las pestañas sucias del IDE: solo se confirma el cierre de cada pestaña.
+
+## ADR-077 — Filtro por estado HTTP que aísla como «Ver interacciones»
+
+**Contexto:** el estado de una petición solo se podía buscar, y «Ver interacciones» aísla la cadena
+de un único nodo. Se pidió elegir un estado —por ejemplo un error— y ver en el mapa todas las
+cadenas con ese estado, como si se hubiera pulsado «Ver interacciones» en cada una.
+
+**Decisión:** el mapa añade `statusFilter` con claves `code:<código>`, `cat:2xx`/`3xx`/`4xx`/`5xx`/
+`other`, `pending`, `err` y `none`, derivadas de `requestStatusView` sobre el nodo. `FlowNode` no
+transporta el error de red, así que la clasificación sale de `outcome` y `statusCode`: no se inventa
+un estado que el snapshot no trae. El `select#map-status-filter` va junto a `#map-event` y lo puebla
+`renderStatusFilter` con «Todos los estados», un `optgroup` por categoría y contadores vivos.
+`statusScope()` es la unión de `involvedScope(id, 'both')` de todas las peticiones que casan con la
+clave: exactamente la misma evidencia que «Ver interacciones». `scopeForView()` la intersecta con
+la base (`focusScope ?? trafficScope()`) y con el subgrafo del evento, y `setStatusFilter` pasa por
+`scheduleScopeApply` → `applyDisplayScope`, que **oculta y re-dispone** el layout, y `fitToNodes`.
+La clave sobrevive a las revisiones del snapshot —los estados llegan tarde—: si no hay
+coincidencias se mantiene con contador 0 y caja de estado «Sin peticiones con estado X» con acción
+«Quitar filtro». Se limpia en `resetViewOnOpen`.
+
+**Consecuencia:** un estado aísla un conjunto de cadenas con el mismo mecanismo que el enfoque por
+nodo y se combina con alcance, evento y «Solo esos». Como el resto de filtros del mapa, es una vista
+sobre el grafo: no demuestra que esas rutas se ejecutaran ni que el error lo causara el nodo
+mostrado.

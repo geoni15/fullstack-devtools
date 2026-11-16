@@ -256,7 +256,7 @@ describe('búfer de peticiones', () => {
   it('devuelve null al actualizar peticiones desconocidas y no duplica al reiniciar', () => {
     expect(buffer.finish('nope', { statusCode: 200, mimeType: null, durationMs: 1 })).toBeNull();
     expect(buffer.fail('nope', 'x', 1)).toBeNull();
-    expect(buffer.setHeaders('nope', {})).toBeNull();
+    expect(buffer.setResponseHeaders('nope', {})).toBeNull();
     const first = start('r1');
     const second = start('r1', 'http://127.0.0.1:8080/otra');
     expect(second).toBe(first);

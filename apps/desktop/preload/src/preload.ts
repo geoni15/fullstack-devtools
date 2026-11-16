@@ -10,6 +10,8 @@ import {
   type CodeLocation,
   type CodeLocationRequest,
   type FileContent,
+  type FileSaveRequest,
+  type FileSaveResult,
   type IpcResult,
   type ProjectSetupDetection,
   type SecurityScanReport,
@@ -26,6 +28,8 @@ const api: BdtApi = {
     ipcRenderer.invoke(IPC_CHANNELS.readFile, { path: filePath }) as Promise<
       IpcResult<FileContent>
     >,
+  saveFile: (request: FileSaveRequest) =>
+    ipcRenderer.invoke(IPC_CHANNELS.saveFile, request) as Promise<IpcResult<FileSaveResult>>,
   revealCode: (location: CodeLocationRequest) =>
     ipcRenderer.invoke(IPC_CHANNELS.revealCode, location) as Promise<
       IpcResult<CodeLocation | null>

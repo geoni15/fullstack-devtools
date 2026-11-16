@@ -9,6 +9,7 @@ import {
   IPC_CHANNELS,
   NO_PAYLOAD_SCHEMA,
   READ_FILE_REQUEST_SCHEMA,
+  SAVE_FILE_REQUEST_SCHEMA,
   STORED_LAUNCH_SETUP_SCHEMA,
   toIpcError,
   type BrowserSnapshot,
@@ -16,12 +17,14 @@ import {
   type CodeLocation,
   type CodeLocationRequest,
   type FileContent,
+  type FileSaveResult,
   type IpcResult,
   type ProjectSetupDetection,
   type SecurityScanReport,
   type StoredLaunchSetup,
   type WorkspaceSnapshot,
 } from '@bdt/protocol';
+import { isInspectorUiSender } from './browser/chrome-ipc';
 import type { BrowserController } from './browser/controller';
 import type { LaunchSettingsStore } from './launch-settings';
 import type { Logger } from './logger';
@@ -59,6 +62,16 @@ function unauthorized<T>(): IpcResult<T> {
       message: 'Petición IPC no autorizada.',
     },
   };
+}
+
+// El IDE, el panel acoplado y el mapa son superficies propias de la app: las tres editan el proyecto
+// abierto. La página inspeccionada no tiene preload ni IPC y nunca alcanza estos canales.
+function canAccessProjectFiles(
+  event: IpcMainInvokeEvent,
+  mainWindow: BrowserWindow | null,
+  browser: BrowserController,
+): boolean {
+  return isTrustedSender(event, mainWindow) || isInspectorUiSender(browser, event);
 }
 
 const NO_WORKSPACE_KEY = 'global';
@@ -137,8 +150,7 @@ export function registerIpcHandlers(dependencies: IpcDependencies): void {
   });
 
   ipcMain.handle(IPC_CHANNELS.readFile, (event, payload): IpcResult<FileContent> => {
-    const window = getMainWindow();
-    if (!isTrustedSender(event, window)) {
+    if (!canAccessProjectFiles(event, getMainWindow(), browser)) {
       return unauthorized();
     }
     const parsed = READ_FILE_REQUEST_SCHEMA.safeParse(payload);
@@ -152,6 +164,25 @@ export function registerIpcHandlers(dependencies: IpcDependencies): void {
       return reportFailure(error, logger, IPC_CHANNELS.readFile);
     }
   });
+
+  ipcMain.handle(
+    IPC_CHANNELS.saveFile,
+    async (event, payload): Promise<IpcResult<FileSaveResult>> => {
+      if (!canAccessProjectFiles(event, getMainWindow(), browser)) {
+        return unauthorized();
+      }
+      const parsed = SAVE_FILE_REQUEST_SCHEMA.safeParse(payload);
+      if (!parsed.success) {
+        return invalidPayload();
+      }
+
+      try {
+        return { ok: true, value: await workspace.saveFile(parsed.data) };
+      } catch (error) {
+        return reportFailure(error, logger, IPC_CHANNELS.saveFile);
+      }
+    },
+  );
 
   ipcMain.handle(IPC_CHANNELS.revealCode, (event, payload): IpcResult<CodeLocation | null> => {
     if (!isTrustedSender(event, getMainWindow())) {

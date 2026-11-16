@@ -32,6 +32,7 @@ const COMMAND_TIMEOUT_MS = 5000;
 const SQL_POLL_MS = 400;
 const JSON_POLL_MS = 400;
 const MAX_BREAKPOINTS = 200;
+const MAX_RECENT = 2000;
 const EXECUTION_CONTEXT_BEFORE = 2;
 const EXECUTION_CONTEXT_AFTER = 6;
 const JAVASCRIPT_SOURCE = /\.(?:js|mjs|cjs|jsx|ts|mts|cts|tsx)$/i;
@@ -256,6 +257,23 @@ export class NodeInspector {
     this.stopJsonPolling();
     this.closeSocket();
     this.setRuntime({ status: 'off', port: null, message: null });
+  }
+
+  disconnect(): void {
+    this.generation += 1;
+    this.connected = false;
+    this.recent.length = 0;
+    this.recentSql.length = 0;
+    this.breakpoints.clear();
+    this.scripts.clear();
+    this.stopSqlPolling();
+    this.stopJsonPolling();
+    this.closeSocket();
+    this.setRuntime({
+      status: 'off',
+      port: null,
+      message: 'Inspección desactivada: el inspector de Node está desconectado.',
+    });
   }
 
   private isCurrent(generation: number): boolean {
@@ -504,6 +522,7 @@ export class NodeInspector {
       };
 
       this.recent.push(execution);
+      if (this.recent.length > MAX_RECENT) this.recent.splice(0, this.recent.length - MAX_RECENT);
       this.options.log.info('Ejecución del backend observada', {
         file: execution.file,
         line,
@@ -526,6 +545,9 @@ export class NodeInspector {
         observedAt: Date.now(),
       };
       this.recentSql.push(observation);
+      if (this.recentSql.length > MAX_RECENT) {
+        this.recentSql.splice(0, this.recentSql.length - MAX_RECENT);
+      }
       this.options.log.info('Ejecución de consulta SQL observada', {
         file: observation.file,
         line: observation.line,

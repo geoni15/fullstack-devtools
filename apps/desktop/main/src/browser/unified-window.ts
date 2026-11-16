@@ -1,5 +1,10 @@
 import { BrowserWindow, type WebContents } from 'electron';
-import { BROWSER_PANEL_CHANNELS, type FlowJsonState, type FlowMapState } from '@bdt/protocol';
+import {
+  BROWSER_PANEL_CHANNELS,
+  type FlowJsonState,
+  type FlowMapState,
+  type FlowRequestState,
+} from '@bdt/protocol';
 import type { Logger } from '../logger';
 import { hardenSession } from '../security';
 import { UNIFIED_HTML } from './ui-html';
@@ -12,7 +17,9 @@ export class UnifiedWindow {
   private ready = false;
   private state: FlowMapState | null = null;
   private jsonState: FlowJsonState | null = null;
+  private requestState: FlowRequestState | null = null;
   private shiftHeld = false;
+  private dirtyPaths: string[] = [];
 
   constructor(
     private readonly preloadPath: string,
@@ -69,7 +76,15 @@ export class UnifiedWindow {
       this.ready = false;
       this.state = null;
       this.jsonState = null;
+      this.requestState = null;
+      this.dirtyPaths = [];
       this.onClosed();
+    });
+    // El mapa avisa de los archivos editados sin guardar: cerrar perdería esos cambios.
+    window.on('close', (event) => {
+      if (this.dirtyPaths.length === 0) return;
+      event.preventDefault();
+      this.sendCloseBlocked();
     });
     this.window = window;
     this.ready = false;
@@ -88,13 +103,33 @@ export class UnifiedWindow {
     window.focus();
   }
 
+  setDirtyPaths(paths: readonly string[]): void {
+    this.dirtyPaths = [...paths];
+  }
+
+  hasDirtyFiles(): boolean {
+    return this.dirtyPaths.length > 0;
+  }
+
+  private sendCloseBlocked(): void {
+    const window = this.window;
+    if (window === null || window.isDestroyed() || window.webContents.isDestroyed()) return;
+    window.webContents.send(BROWSER_PANEL_CHANNELS.mapCloseBlocked, this.dirtyPaths);
+  }
+
   close(): void {
     const window = this.window;
+    if (this.dirtyPaths.length > 0 && window !== null && !window.isDestroyed()) {
+      this.sendCloseBlocked();
+      return;
+    }
     this.window = null;
     this.ready = false;
     this.state = null;
     this.jsonState = null;
+    this.requestState = null;
     this.shiftHeld = false;
+    this.dirtyPaths = [];
     if (window !== null && !window.isDestroyed()) {
       window.close();
     }
@@ -115,6 +150,7 @@ export class UnifiedWindow {
     this.ready = true;
     this.send();
     this.sendJson();
+    this.sendRequests();
     this.sendShift();
     return true;
   }
@@ -140,6 +176,18 @@ export class UnifiedWindow {
     if (!this.ready || this.jsonState === null || window === null) return;
     if (window.isDestroyed() || window.webContents.isDestroyed()) return;
     window.webContents.send(BROWSER_PANEL_CHANNELS.jsonData, this.jsonState);
+  }
+
+  updateRequestState(state: FlowRequestState): void {
+    this.requestState = state;
+    this.sendRequests();
+  }
+
+  private sendRequests(): void {
+    const window = this.window;
+    if (!this.ready || this.requestState === null || window === null) return;
+    if (window.isDestroyed() || window.webContents.isDestroyed()) return;
+    window.webContents.send(BROWSER_PANEL_CHANNELS.requestData, this.requestState);
   }
 
   private sendShift(): void {

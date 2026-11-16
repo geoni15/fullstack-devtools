@@ -151,20 +151,6 @@ export function tableCellKey(tableId: string, columnName: string, rowIndex: numb
   return `${tableId}::${columnName.toLowerCase()}::${String(rowIndex)}`;
 }
 
-export function tableColumnCellKeys(table: FlowTableData, columnName: string): string[] {
-  return table.grid.rows.map((_row, rowIndex) => tableCellKey(table.id, columnName, rowIndex));
-}
-
-export function tableAllCellKeys(table: FlowTableData): string[] {
-  const keys: string[] = [];
-  for (let rowIndex = 0; rowIndex < table.grid.rows.length; rowIndex += 1) {
-    for (const column of table.grid.columns) {
-      keys.push(tableCellKey(table.id, column.name, rowIndex));
-    }
-  }
-  return keys;
-}
-
 export function tableCellAt(
   table: FlowTableData,
   columnName: string,

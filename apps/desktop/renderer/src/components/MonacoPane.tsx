@@ -9,15 +9,20 @@ export interface MonacoReveal {
 }
 
 interface MonacoPaneProps {
-  content: string;
+  value: string;
+  dirty: boolean;
   language: string;
   reveal: MonacoReveal | null;
+  onChange(value: string): void;
+  onSave(): void;
 }
 
-export function MonacoPane({ content, language, reveal }: MonacoPaneProps) {
+export function MonacoPane({ value, dirty, language, reveal, onChange, onSave }: MonacoPaneProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const decorationsRef = useRef<MonacoEditor.IEditorDecorationsCollection | null>(null);
+  const liveRef = useRef({ value, onChange, onSave });
+  liveRef.current = { value, onChange, onSave };
 
   useEffect(() => {
     const host = hostRef.current;
@@ -26,11 +31,9 @@ export function MonacoPane({ content, language, reveal }: MonacoPaneProps) {
     }
 
     const editor = monaco.editor.create(host, {
-      value: content,
+      value: liveRef.current.value,
       language,
       theme: 'bdt-dark',
-      readOnly: true,
-      domReadOnly: true,
       automaticLayout: true,
       minimap: { enabled: false },
       fontSize: 13,
@@ -61,13 +64,31 @@ export function MonacoPane({ content, language, reveal }: MonacoPaneProps) {
     });
     editorRef.current = editor;
     decorationsRef.current = editor.createDecorationsCollection([]);
+    const changes = editor.onDidChangeModelContent(() => {
+      const next = editor.getValue();
+      if (next === liveRef.current.value) return;
+      liveRef.current.onChange(next);
+    });
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+      liveRef.current.onSave();
+    });
 
     return () => {
+      changes.dispose();
       decorationsRef.current = null;
       editorRef.current = null;
       editor.dispose();
     };
-  }, [content, language]);
+  }, [language]);
+
+  // El editor se crea una vez por pestaña: el texto externo solo entra cuando no hay edición,
+  // para no perder lo que el usuario está escribiendo.
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (editor === null || dirty) return;
+    if (editor.getValue() === value) return;
+    editor.setValue(value);
+  }, [value, dirty]);
 
   const revealLine = reveal?.line ?? null;
   const revealEndLine = reveal?.endLine ?? null;
@@ -99,7 +120,7 @@ export function MonacoPane({ content, language, reveal }: MonacoPaneProps) {
       },
     ]);
     editor.revealLinesInCenter(start, end, monaco.editor.ScrollType.Immediate);
-  }, [revealLine, revealEndLine, revealNonce, content, language]);
+  }, [revealLine, revealEndLine, revealNonce, language]);
 
   return <div className="monaco-host" ref={hostRef} data-testid="monaco-host" />;
 }

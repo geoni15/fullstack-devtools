@@ -4,6 +4,7 @@ export const IPC_CHANNELS = {
   openWorkspace: 'workspace:open',
   getState: 'workspace:state',
   readFile: 'file:read',
+  saveFile: 'file:save',
   revealCode: 'code:reveal',
   revealLocation: 'code:reveal-location',
   workspaceChanged: 'workspace:changed',
@@ -30,7 +31,11 @@ export const READ_FILE_REQUEST_SCHEMA = z.strictObject({
   path: z.string().min(1).max(4096),
 });
 
-export type ParsedReadFileRequest = z.infer<typeof READ_FILE_REQUEST_SCHEMA>;
+export const SAVE_FILE_REQUEST_SCHEMA = z.strictObject({
+  path: z.string().min(1).max(4096),
+  content: z.string().max(2_097_152),
+  baseMtimeMs: z.number().finite().nonnegative(),
+});
 
 export const CODE_LOCATION_REQUEST_SCHEMA = z.strictObject({
   path: z.string().min(1).max(4096),
@@ -38,9 +43,9 @@ export const CODE_LOCATION_REQUEST_SCHEMA = z.strictObject({
   endLine: z.number().int().min(1).max(10_000_000).nullable().optional(),
 });
 
-export type ParsedCodeLocationRequest = z.infer<typeof CODE_LOCATION_REQUEST_SCHEMA>;
-
-export const WORKSPACE_CHANGED_PAYLOAD_SCHEMA = z.strictObject({});
+export const MAP_DIRTY_SCHEMA = z.strictObject({
+  paths: z.array(z.string().min(1).max(4096)).max(200),
+});
 
 export const BROWSER_TARGETS_REQUEST_SCHEMA = z.strictObject({
   frontendUrl: z.string().min(1).max(2048),
@@ -62,13 +67,9 @@ export const BROWSER_TARGETS_REQUEST_SCHEMA = z.strictObject({
     .nullable(),
 });
 
-export type ParsedBrowserTargetsRequest = z.infer<typeof BROWSER_TARGETS_REQUEST_SCHEMA>;
-
 export const BROWSER_SET_INSPECTION_SCHEMA = z.strictObject({
   enabled: z.boolean(),
 });
-
-export type ParsedBrowserSetInspection = z.infer<typeof BROWSER_SET_INSPECTION_SCHEMA>;
 
 export const BROWSER_BOUNDS_SCHEMA = z.strictObject({
   x: z.number().int().min(-10000).max(20000),
@@ -77,8 +78,6 @@ export const BROWSER_BOUNDS_SCHEMA = z.strictObject({
   height: z.number().int().min(0).max(20000),
   visible: z.boolean(),
 });
-
-export type ParsedBrowserBounds = z.infer<typeof BROWSER_BOUNDS_SCHEMA>;
 
 export const STORED_LAUNCH_SETUP_SCHEMA = z.strictObject({
   frontendBase: z.string().max(2048),
@@ -92,5 +91,3 @@ export const STORED_LAUNCH_SETUP_SCHEMA = z.strictObject({
   inspectorPort: z.string().max(16),
   mode: z.enum(['window', 'embedded']),
 });
-
-export type ParsedStoredLaunchSetup = z.infer<typeof STORED_LAUNCH_SETUP_SCHEMA>;

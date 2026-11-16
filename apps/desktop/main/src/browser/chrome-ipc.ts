@@ -6,6 +6,7 @@ import {
   CODE_LOCATION_REQUEST_SCHEMA,
   ERROR_CODES,
   INSPECTION_MODES,
+  MAP_DIRTY_SCHEMA,
   toIpcError,
   type CodeLocation,
   type CodeLocationRequest,
@@ -52,7 +53,7 @@ function isMainFrame(event: SenderEvent): boolean {
   return event.senderFrame !== null && event.senderFrame === event.sender.mainFrame;
 }
 
-function isInspectorUiSender(browser: BrowserController, event: SenderEvent): boolean {
+export function isInspectorUiSender(browser: BrowserController, event: SenderEvent): boolean {
   return (
     (browser.isPanelSender(event.sender) || browser.isMapSender(event.sender)) && isMainFrame(event)
   );
@@ -218,6 +219,14 @@ export function registerBrowserWindowIpc(
         message: error instanceof Error ? error.message : String(error),
       });
     }
+  });
+
+  ipcMain.on(BROWSER_PANEL_CHANNELS.mapDirty, (event, payload: unknown) => {
+    if (!browser.isMapSender(event.sender)) return;
+    if (!isMainFrame(event)) return;
+    const parsed = MAP_DIRTY_SCHEMA.safeParse(payload);
+    if (!parsed.success) return;
+    browser.setMapDirtyPaths(parsed.data.paths);
   });
 
   ipcMain.on(BROWSER_PANEL_CHANNELS.revealLocation, (event, payload: unknown) => {

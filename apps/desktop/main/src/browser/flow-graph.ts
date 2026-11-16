@@ -21,6 +21,7 @@ import type {
 import { handlerLabel, handlerProfileTags, requestStatusView } from '@bdt/protocol';
 import { matchRoute, type StaticRoute } from '@bdt/routes-index';
 import { pickDatabaseHint } from './database-hints';
+import { hashText } from './hash-text';
 import type { FlowTrace, FlowTraceHandler, FlowTraceQuery } from './flow-ledger';
 import type { FlowInteractionOccurrence, FlowInteractionSummary } from './interaction-ledger';
 import type { PageControl, PageElementRef, PageHandlerHint } from './page-inventory';
@@ -171,18 +172,18 @@ function queriesFor(route: StaticRoute): InspectionSqlQuery[] {
   return queries;
 }
 
-function hashText(value: string): string {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16).padStart(8, '0');
-}
-
 function mergeStrings(target: string[], incoming: readonly string[]): void {
+  if (incoming.length === 0) return;
+  if (incoming.length === 1) {
+    const value = incoming[0];
+    if (value !== undefined && !target.includes(value)) target.push(value);
+    return;
+  }
+  const seen = new Set(target);
   for (const value of incoming) {
-    if (!target.includes(value)) target.push(value);
+    if (seen.has(value)) continue;
+    seen.add(value);
+    target.push(value);
   }
 }
 
@@ -1068,24 +1069,52 @@ class FlowGraphBuilder {
   private projectHandlerInitiators(): void {
     if (this.input.requests.length === 0) return;
     const requestsByInitiator = new Map<string, CapturedRequest[]>();
+    const requestsByLocation = new Map<string, CapturedRequest[]>();
     for (const request of this.input.requests) {
       if (isPreflight(request) || request.origin === 'external') continue;
-      const initiator = request.initiator?.frames[0]?.functionName ?? null;
-      if (initiator === null || initiator === '') continue;
-      const group = requestsByInitiator.get(initiator);
-      if (group === undefined) {
-        requestsByInitiator.set(initiator, [request]);
-      } else {
-        group.push(request);
+      const frames = request.initiator?.frames ?? [];
+      const initiator = frames[0]?.functionName ?? null;
+      if (initiator !== null && initiator !== '') {
+        const group = requestsByInitiator.get(initiator);
+        if (group === undefined) {
+          requestsByInitiator.set(initiator, [request]);
+        } else {
+          group.push(request);
+        }
+      }
+      for (const frame of frames) {
+        const key = `${frame.url}\u0000${String(frame.line)}`;
+        const group = requestsByLocation.get(key);
+        if (group === undefined) {
+          requestsByLocation.set(key, [request]);
+        } else {
+          group.push(request);
+        }
       }
     }
-    if (requestsByInitiator.size === 0) return;
+    if (requestsByInitiator.size === 0 && requestsByLocation.size === 0) return;
     for (const link of this.input.runtimeHandlers) {
+      const handlerId = handlerNodeIdFor(link, `runtime:${link.element.key}`);
+      if (!this.nodes.has(handlerId)) continue;
+      const direct =
+        link.url !== null && link.line !== null
+          ? requestsByLocation.get(`${link.url}\u0000${String(link.line)}`)
+          : undefined;
+      if (direct !== undefined) {
+        for (const request of direct) {
+          const requestId = `request:${request.id}`;
+          if (!this.nodes.has(requestId)) continue;
+          const edgeId = `SENDS|${handlerId}|${requestId}`;
+          if (this.edges.has(edgeId)) continue;
+          this.addEdge('SENDS', handlerId, requestId, ['RUNTIME'], 'direct', {
+            lastSeen: request.wallStartedAt,
+            note: `La petición se inició en ${link.url}:${String(link.line)}, la misma ubicación del manejador resuelto en el DOM; evidencia directa por ubicación.`,
+          });
+        }
+      }
       if (link.name === null || link.name === '') continue;
       const matching = requestsByInitiator.get(link.name);
       if (matching === undefined) continue;
-      const handlerId = handlerNodeIdFor(link, `runtime:${link.element.key}`);
-      if (!this.nodes.has(handlerId)) continue;
       for (const request of matching) {
         const requestId = `request:${request.id}`;
         if (!this.nodes.has(requestId)) continue;
@@ -2091,10 +2120,13 @@ class FlowGraphBuilder {
     }
     if (node.events !== undefined) {
       const events = existing.events ?? [];
+      const byEvent = new Map(events.map((entry) => [entry.event, entry]));
       for (const event of node.events) {
-        const current = events.find((entry) => entry.event === event.event);
+        const current = byEvent.get(event.event);
         if (current === undefined) {
-          events.push({ ...event });
+          const copy = { ...event };
+          events.push(copy);
+          byEvent.set(event.event, copy);
         } else {
           current.count += event.count;
           current.firstSeen = earliest(current.firstSeen, event.firstSeen);

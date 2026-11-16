@@ -1,4 +1,5 @@
 import type {
+  CapturedRequest,
   HandlerProfile,
   InspectionSqlColumn,
   InspectionSqlOperation,
@@ -105,6 +106,12 @@ export interface FlowJsonMovement {
   truncated: boolean;
 }
 
+export interface FlowNodeWeight {
+  bytes: number | null;
+  basis: 'file' | 'range' | 'rows' | 'bodies';
+  note: string | null;
+}
+
 export interface FlowNode {
   id: string;
   type: FlowNodeType;
@@ -153,6 +160,7 @@ export interface FlowNode {
   handlers?: FlowHandlerHint[];
   events?: FlowNodeEvent[];
   jsonMovements?: FlowJsonMovement[];
+  weight?: FlowNodeWeight | null;
 }
 
 export interface FlowEdge {
@@ -237,6 +245,15 @@ export interface FlowMapState {
 export interface FlowJsonState {
   capture: FlowJsonCaptureState | null;
   movements: FlowJsonMovement[];
+}
+
+export interface FlowRequestDetail extends CapturedRequest {
+  requestBodyOmitted?: boolean;
+  responseBodyOmitted?: boolean;
+}
+
+export interface FlowRequestState {
+  requests: FlowRequestDetail[];
 }
 
 export interface FlowHighlightTarget {

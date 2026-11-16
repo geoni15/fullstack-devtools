@@ -259,7 +259,3 @@ export function requestStatusView(input: RequestStatusInput): RequestStatusView 
     search,
   };
 }
-
-export function requestStatusSearch(input: RequestStatusInput): string {
-  return requestStatusView(input).search;
-}

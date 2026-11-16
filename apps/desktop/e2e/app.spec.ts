@@ -335,6 +335,7 @@ test('el renderer no expone Node, require ni canales IPC en bruto', async () => 
     'readFile',
     'reloadBrowser',
     'revealCode',
+    'saveFile',
     'saveStoredSetup',
     'scanBrowserSecurity',
     'setBrowserBounds',
@@ -354,7 +355,7 @@ test('abre una carpeta, muestra el árbol e ignora node_modules y .git', async (
   await expect(page.getByText('Observando cambios')).toBeVisible();
 });
 
-test('abre un archivo en Monaco en modo solo lectura', async () => {
+test('abre un archivo en Monaco y permite editarlo sin guardar hasta Ctrl+S', async () => {
   await page.getByTestId('tree-dir-src').click();
   await page.getByTestId('tree-file-src/main.js').click();
 
@@ -366,9 +367,8 @@ test('abre un archivo en Monaco en modo solo lectura', async () => {
   await page.keyboard.press('x');
   await page.waitForTimeout(300);
 
-  const textAfterTyping = await page.locator('.view-lines').innerText();
-  expect(textAfterTyping).toContain(MARKER);
-  expect(textAfterTyping).not.toContain(`${MARKER}xx`);
+  await expect(page.locator('.view-lines')).toContainText(`${MARKER}xx`);
+  await expect(page.locator('.editor-dirty')).toHaveText('Sin guardar');
 });
 
 test('rechaza lecturas fuera de la raíz a través del IPC real', async () => {
@@ -690,8 +690,12 @@ test('F2: el clic abre el panel fijo con la función, sus líneas y la ejecució
   await expect
     .poll(() => panelText('#handler-code-file'), { timeout: 15_000 })
     .toContain('/app.js');
+  await panelEval('document.getElementById("handler-code-toggle")?.click()');
   await expect
-    .poll(() => panelText('#handler-code'), { timeout: 15_000 })
+    .poll(
+      () => panelEval<string>('document.querySelector("#handler-code textarea")?.value ?? ""'),
+      { timeout: 15_000 },
+    )
     .toContain('cargarClientes');
   await expect.poll(() => panelText('#endpoint'), { timeout: 15_000 }).toBe('GET /api/clientes');
   const requestTime = await panelEval<string | null>(
@@ -704,8 +708,12 @@ test('F2: el clic abre el panel fijo con la función, sus líneas y la ejecució
   await expect
     .poll(() => panelText('#backend-loc'), { timeout: 15_000 })
     .toContain('backend/server.js:4–14');
+  await panelEval('document.getElementById("backend-code-toggle")?.click()');
   await expect
-    .poll(() => panelText('#backend-code'), { timeout: 15_000 })
+    .poll(
+      () => panelEval<string>('document.querySelector("#backend-code textarea")?.value ?? ""'),
+      { timeout: 15_000 },
+    )
     .toContain('function listarClientes');
   await expect.poll(() => panelText('#evidence'), { timeout: 15_000 }).toContain('STATIC');
   await expect
@@ -721,17 +729,18 @@ test('F2: el clic abre el panel fijo con la función, sus líneas y la ejecució
     .toContain('GET /api/clientes');
   await expect.poll(() => panelText('#evidence'), { timeout: 15_000 }).toContain('RUNTIME');
 
-  const backendNumbers = await panelEval<string[]>(
-    'Array.from(document.querySelectorAll("#backend-code .code-number")).map((node) => node.textContent)',
+  const backendCode = await panelEval<string>(
+    'document.querySelector("#backend-code textarea")?.value ?? ""',
   );
-  expect(backendNumbers).toContain('4');
-  expect(backendNumbers).toContain('14');
+  expect(backendCode ?? '').toContain('function listarClientes');
 
-  const executed = await panelEval<{ number: string | null; text: string | null } | null>(
-    '(() => { const row = document.querySelector("#execution-code .code-line.is-executed"); if (!row) return null; return { number: row.querySelector(".code-number")?.textContent ?? null, text: row.querySelector(".code-text")?.textContent ?? null }; })()',
-  );
-  expect(['4', '5']).toContain(executed?.number ?? '');
-  expect(executed?.text ?? '').toMatch(/listarClientes|respuesta\.writeHead/);
+  await panelEval('document.getElementById("execution-code-toggle")?.click()');
+  await expect
+    .poll(
+      () => panelEval<string>('document.querySelector("#execution-code textarea")?.value ?? ""'),
+      { timeout: 25_000 },
+    )
+    .toMatch(/listarClientes|respuesta\.writeHead/);
 
   expect(await windowTitles()).not.toContain('Inspección');
   expect(await browserWindowCount()).toBe(2);

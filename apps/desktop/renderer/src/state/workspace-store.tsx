@@ -8,11 +8,22 @@ import {
   useRef,
   type ReactNode,
 } from 'react';
-import type { CodeLocation, FileNode, WorkspaceSnapshot } from '@bdt/protocol';
+import type { CodeLocation, FileContent, FileNode, WorkspaceSnapshot } from '@bdt/protocol';
+import { ERROR_CODES } from '@bdt/protocol';
 import { bdt } from '../api';
 
 export type OpenTab =
-  | { path: string; name: string; status: 'ready'; content: string; size: number }
+  | {
+      path: string;
+      name: string;
+      status: 'ready';
+      content: string;
+      buffer: string;
+      dirty: boolean;
+      size: number;
+      mtimeMs: number;
+      externalChange: boolean;
+    }
   | { path: string; name: string; status: 'error'; message: string };
 
 export interface CodeRevealTarget {
@@ -38,6 +49,9 @@ type Action =
   | { type: 'error'; message: string }
   | { type: 'activate'; path: string }
   | { type: 'add-tab'; tab: OpenTab }
+  | { type: 'edit-tab'; path: string; buffer: string }
+  | { type: 'write-tab'; path: string; file: FileContent }
+  | { type: 'external-tab'; path: string }
   | { type: 'close-tab'; path: string }
   | { type: 'reveal'; target: CodeRevealTarget }
   | { type: 'dismiss-error' };
@@ -92,6 +106,41 @@ function reducer(state: WorkspaceState, action: Action): WorkspaceState {
       }
       return { ...state, tabs: [...state.tabs, action.tab], activePath: action.tab.path };
     }
+    case 'edit-tab':
+      return {
+        ...state,
+        tabs: state.tabs.map((tab) =>
+          tab.path === action.path && tab.status === 'ready'
+            ? { ...tab, buffer: action.buffer, dirty: action.buffer !== tab.content }
+            : tab,
+        ),
+      };
+    case 'write-tab':
+      return {
+        ...state,
+        tabs: state.tabs.map((tab) =>
+          tab.path === action.path && tab.status === 'ready'
+            ? {
+                ...tab,
+                content: action.file.content,
+                buffer: action.file.content,
+                dirty: false,
+                size: action.file.size,
+                mtimeMs: action.file.mtimeMs,
+                externalChange: false,
+              }
+            : tab,
+        ),
+      };
+    case 'external-tab':
+      return {
+        ...state,
+        tabs: state.tabs.map((tab) =>
+          tab.path === action.path && tab.status === 'ready'
+            ? { ...tab, externalChange: true }
+            : tab,
+        ),
+      };
     case 'close-tab': {
       const closingIndex = state.tabs.findIndex((tab) => tab.path === action.path);
       if (closingIndex === -1) {
@@ -118,6 +167,27 @@ function fileNameForPath(filePath: string): string {
   return segments[segments.length - 1] ?? filePath;
 }
 
+function readyTab(path: string, name: string, file: FileContent): OpenTab {
+  return {
+    path,
+    name,
+    status: 'ready',
+    content: file.content,
+    buffer: file.content,
+    dirty: false,
+    size: file.size,
+    mtimeMs: file.mtimeMs,
+    externalChange: false,
+  };
+}
+
+type ReadyTab = Extract<OpenTab, { status: 'ready' }>;
+
+function readyTabAt(tabs: readonly OpenTab[], path: string): ReadyTab | null {
+  const tab = tabs.find((item) => item.path === path);
+  return tab !== undefined && tab.status === 'ready' ? tab : null;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -128,6 +198,9 @@ export interface WorkspaceContextValue {
   openFile(node: FileNode): Promise<void>;
   activateTab(path: string): void;
   closeTab(path: string): void;
+  editTab(path: string, buffer: string): void;
+  saveTab(path: string, force?: boolean): Promise<boolean>;
+  reloadTab(path: string): Promise<void>;
   revealCode(path: string, line: number, endLine: number | null): Promise<void>;
   dismissError(): void;
 }
@@ -137,6 +210,26 @@ const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
 export function WorkspaceProvider({ children }: { children: ReactNode }): ReactNode {
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   const revealNonce = useRef(0);
+  const tabsRef = useRef<OpenTab[]>([]);
+  tabsRef.current = state.tabs;
+
+  // El aviso del watcher no dice qué archivo cambió: se relee solo lo que ya está abierto.
+  // Una pestaña sucia nunca se pisa; se marca el cambio externo para que decida el usuario.
+  const syncOpenTabs = useCallback(async (): Promise<void> => {
+    const paths = tabsRef.current.filter((tab) => tab.status === 'ready').map((tab) => tab.path);
+    for (const path of paths) {
+      if (readyTabAt(tabsRef.current, path) === null) continue;
+      const result = await bdt.readFile(path);
+      if (!result.ok) continue;
+      const current = readyTabAt(tabsRef.current, path);
+      if (current === null || result.value.mtimeMs === current.mtimeMs) continue;
+      if (current.dirty) {
+        dispatch({ type: 'external-tab', path });
+        continue;
+      }
+      dispatch({ type: 'write-tab', path, file: result.value });
+    }
+  }, []);
 
   const refresh = useCallback(async (): Promise<void> => {
     try {
@@ -155,8 +248,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }): ReactN
     void refresh();
     return bdt.onWorkspaceChanged(() => {
       void refresh();
+      void syncOpenTabs();
     });
-  }, [refresh]);
+  }, [refresh, syncOpenTabs]);
 
   const openWorkspace = useCallback(async (): Promise<void> => {
     dispatch({ type: 'loading' });
@@ -193,13 +287,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }): ReactN
       }
       dispatch({
         type: 'add-tab',
-        tab: {
-          path: result.value.path,
-          name: node.name,
-          status: 'ready',
-          content: result.value.content,
-          size: result.value.size,
-        },
+        tab: readyTab(result.value.path, node.name, result.value),
       });
     } catch (error) {
       dispatch({ type: 'error', message: errorMessage(error) });
@@ -224,13 +312,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }): ReactN
       }
       dispatch({
         type: 'add-tab',
-        tab: {
-          path: result.value.path,
-          name,
-          status: 'ready',
-          content: result.value.content,
-          size: result.value.size,
-        },
+        tab: readyTab(result.value.path, name, result.value),
       });
       revealNonce.current += 1;
       dispatch({
@@ -280,13 +362,81 @@ export function WorkspaceProvider({ children }: { children: ReactNode }): ReactN
     dispatch({ type: 'close-tab', path });
   }, []);
 
+  const editTab = useCallback((path: string, buffer: string): void => {
+    dispatch({ type: 'edit-tab', path, buffer });
+  }, []);
+
+  const reloadTab = useCallback(async (path: string): Promise<void> => {
+    const result = await bdt.readFile(path);
+    if (!result.ok) {
+      dispatch({ type: 'error', message: result.error.message });
+      return;
+    }
+    dispatch({ type: 'write-tab', path, file: result.value });
+  }, []);
+
+  const saveTab = useCallback(async (path: string, force = false): Promise<boolean> => {
+    const tab = readyTabAt(tabsRef.current, path);
+    if (tab === null) return false;
+    let baseMtimeMs = tab.mtimeMs;
+    if (force) {
+      const read = await bdt.readFile(path);
+      if (!read.ok) {
+        dispatch({ type: 'error', message: read.error.message });
+        return false;
+      }
+      baseMtimeMs = read.value.mtimeMs;
+    }
+    const result = await bdt.saveFile({ path, content: tab.buffer, baseMtimeMs });
+    if (!result.ok) {
+      if (result.error.code === ERROR_CODES.FILE_CONFLICT) {
+        dispatch({ type: 'external-tab', path });
+      }
+      dispatch({ type: 'error', message: result.error.message });
+      return false;
+    }
+    dispatch({
+      type: 'write-tab',
+      path,
+      file: {
+        path,
+        content: tab.buffer,
+        size: result.value.size,
+        mtimeMs: result.value.mtimeMs,
+      },
+    });
+    return true;
+  }, []);
+
   const dismissError = useCallback((): void => {
     dispatch({ type: 'dismiss-error' });
   }, []);
 
   const value = useMemo<WorkspaceContextValue>(
-    () => ({ state, openWorkspace, openFile, activateTab, closeTab, revealCode, dismissError }),
-    [state, openWorkspace, openFile, activateTab, closeTab, revealCode, dismissError],
+    () => ({
+      state,
+      openWorkspace,
+      openFile,
+      activateTab,
+      closeTab,
+      editTab,
+      saveTab,
+      reloadTab,
+      revealCode,
+      dismissError,
+    }),
+    [
+      state,
+      openWorkspace,
+      openFile,
+      activateTab,
+      closeTab,
+      editTab,
+      saveTab,
+      reloadTab,
+      revealCode,
+      dismissError,
+    ],
   );
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;

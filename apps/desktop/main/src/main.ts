@@ -66,6 +66,7 @@ if (!app.requestSingleInstanceLock()) {
   const browser = new BrowserController(() => mainWindow, createLogger('browser'), {
     getWorkspaceRoot: () => workspace.getRootPath(),
     getWorkspaceFiles: () => workspace.getFilePaths(),
+    revealCode,
     chromePreloadPath: fileURLToPath(new URL('../preload/browser-chrome.cjs', import.meta.url)),
     panelPreloadPath: fileURLToPath(new URL('../preload/inspection-panel.cjs', import.meta.url)),
     unifiedPreloadPath: fileURLToPath(new URL('../preload/unified.cjs', import.meta.url)),

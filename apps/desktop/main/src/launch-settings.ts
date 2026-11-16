@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { app } from 'electron';
 import { STORED_LAUNCH_SETUP_SCHEMA, type StoredLaunchSetup } from '@bdt/protocol';
+import { writeTextAtomic } from './fs/atomic-write';
 import { createLogger, type Logger } from './logger';
 
 const FILE_NAME = 'launch-setups.json';
@@ -101,15 +102,12 @@ export class LaunchSettingsStore {
 
   private async persist(file: SettingsFile): Promise<void> {
     const target = this.filePath();
-    const temp = `${target}.tmp`;
-    await fs.mkdir(path.dirname(target), { recursive: true });
     const payload: SettingsFile = {
       version: FILE_VERSION,
       setups: file.setups,
       lastWorkspace: file.lastWorkspace,
     };
-    await fs.writeFile(temp, JSON.stringify(payload, null, 2), 'utf8');
-    await fs.rename(temp, target);
+    await writeTextAtomic(target, JSON.stringify(payload, null, 2));
   }
 
   async get(workspaceId: string): Promise<StoredLaunchSetup | null> {

@@ -6,10 +6,13 @@ import {
   ERROR_CODES,
   type FileContent,
   type FileNode,
+  type FileSaveRequest,
+  type FileSaveResult,
   type WorkspaceInfo,
   type WorkspaceSnapshot,
 } from '@bdt/protocol';
 import { isIgnoredName } from './config';
+import { saveTextFile } from './fs/atomic-write';
 import { buildFileTree, type BuiltTree } from './fs/file-tree';
 import { readTextFile } from './fs/read-file';
 import { createRootScope, type RootScope } from './fs/root-guard';
@@ -120,6 +123,13 @@ export class WorkspaceService {
       throw new BdtError(ERROR_CODES.WORKSPACE_NONE, 'No hay ninguna carpeta de proyecto abierta.');
     }
     return readTextFile(this.current.scope, relativePath);
+  }
+
+  async saveFile(request: FileSaveRequest): Promise<FileSaveResult> {
+    if (!this.current) {
+      throw new BdtError(ERROR_CODES.WORKSPACE_NONE, 'No hay ninguna carpeta de proyecto abierta.');
+    }
+    return saveTextFile(this.current.scope, request.path, request.content, request.baseMtimeMs);
   }
 
   dispose(): void {
