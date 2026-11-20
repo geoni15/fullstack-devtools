@@ -8,6 +8,8 @@ La aplicación se llama **Backend DevTools Desktop** en la interfaz; el reposito
 
 Licencia MIT · v0.6.0 · Desarrollado y probado en Windows
 
+**Sitio web:** [Fullstack DevTools](https://geoni15.github.io/fullstack-devtools-web/) — presentación, modos de inspección, mapa de flujo y descarga.
+
 ## Demostración
 
 [![Vista previa animada de la inspección](media/demo-preview.gif)](media/demo.mp4)
